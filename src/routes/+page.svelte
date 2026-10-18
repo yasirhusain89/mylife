@@ -10,6 +10,8 @@
     eventAssets,
     renameEvent,
     exportHighlight,
+    exportBundle,
+    type ExportSummary,
     type HighlightResult,
     faceThumb,
     facesInCluster,
@@ -171,6 +173,24 @@
   let highlightBusy = $state<number | null>(null);
   let highlightResult = $state<HighlightResult | null>(null);
   let highlightEventId = $state<number | null>(null);
+
+  let exportBusy = $state<string | null>(null);
+  let exportResult = $state<ExportSummary | null>(null);
+
+  async function runExport(event: EventRow, mode: "drive" | "whatsapp") {
+    const dest = await open({ directory: true, multiple: false, title: "Choose export folder" });
+    if (typeof dest !== "string" || dest === "") return;
+    exportBusy = `${event.id}-${mode}`;
+    exportResult = null;
+    try {
+      exportResult = await exportBundle(event.id, event.name, mode, dest);
+      toast = `Exported ${exportResult.exported} photos for ${mode === "drive" ? "Drive" : "WhatsApp"}`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      exportBusy = null;
+    }
+  }
 
   async function makeHighlight(event: EventRow) {
     highlightBusy = event.id;

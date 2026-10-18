@@ -579,6 +579,38 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     ]
 }
 
+
+// MARK: - Distribution compression
+
+/// Recodes one image to a bounded JPEG (WhatsApp-friendly: 1280px, q0.72).
+func compressImage(path: String, output: String, maxPx: Int, quality: Double) throws -> [String: Any] {
+    let src = CGImageSourceCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    guard let src else { throw EngineError(message: "not an image: \(path)") }
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: max(64, min(maxPx, 4096)),
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+        throw EngineError(message: "cannot decode image: \(path)")
+    }
+    let outURL = URL(fileURLWithPath: output) as CFURL
+    guard
+        let dest = CGImageDestinationCreateWithURL(outURL, "public.jpeg" as CFString, 1, nil)
+    else { throw EngineError(message: "cannot write: \(output)") }
+    CGImageDestinationAddImage(
+        dest, cg, [kCGImageDestinationLossyCompressionQuality: min(max(quality, 0.1), 1.0)] as CFDictionary)
+    guard CGImageDestinationFinalize(dest) else {
+        throw EngineError(message: "cannot finalize: \(output)")
+    }
+    let attrs = try FileManager.default.attributesOfItem(atPath: output)
+    return [
+        "output": output,
+        "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
+    ]
+}
+
 // MARK: - Batch hashing
 
 /// Hashes many files in one call so the Rust side pays a single round-trip
@@ -809,6 +841,11 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let path = str("path") else { throw EngineError(message: "thumb requires 'path'") }
         return try thumbnail(
             path: path, maxPx: int("maxPx", 512), quality: dbl("quality", 0.72))
+
+    case "compress":
+        guard let path = str("path") else { throw EngineError(message: "compress requires 'path'") }
+        guard let output = str("output") else { throw EngineError(message: "compress requires 'output'") }
+        return try compressImage(path: path, output: output, maxPx: int("maxPx", 1280), quality: dbl("quality", 0.72))
 
     case "make_highlight":
         guard let paths = params["paths"] as? [String], !paths.isEmpty else {

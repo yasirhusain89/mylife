@@ -248,6 +248,22 @@ export type HighlightResult = {
   videosSkipped: number;
 };
 
+export type ExportSummary = {
+  dir: string;
+  exported: number;
+  skipped: number;
+  bytes: number;
+};
+
+export function exportBundle(
+  eventId: number,
+  eventName: string,
+  mode: "drive" | "whatsapp",
+  destDir: string,
+): Promise<ExportSummary> {
+  return invoke("export_bundle", { eventId, eventName, mode, destDir });
+}
+
 export function exportHighlight(
   eventId: number,
   name?: string,

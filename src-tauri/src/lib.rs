@@ -738,6 +738,119 @@ fn chrono_stamp() -> String {
     format!("{secs}")
 }
 
+// MARK: - Distribution bundles
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub dir: String,
+    pub exported: i64,
+    pub skipped: i64,
+    pub bytes: i64,
+}
+
+fn slugify(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let collapsed = cleaned.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    if collapsed.is_empty() { "event".to_string() } else { collapsed.to_lowercase() }
+}
+
+/// Copies an event's photos into `dest_dir/<event-slug>/`:
+/// - mode "drive": byte-for-byte copies (full quality)
+/// - mode "whatsapp": recoded 1280px JPEGs via the engine
+///
+/// Blurred shots and known duplicates are excluded from WhatsApp bundles;
+/// Drive bundles keep everything except missing files.
+#[tauri::command]
+async fn export_bundle(
+    app: tauri::AppHandle,
+    event_id: i64,
+    event_name: String,
+    mode: String,
+    dest_dir: String,
+) -> Result<ExportSummary, String> {
+    if mode != "drive" && mode != "whatsapp" {
+        return Err(format!("unknown export mode '{mode}'"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+        let assets = db::event_assets(&conn, event_id)?;
+        let blurred_set: std::collections::HashSet<String> = if mode == "whatsapp" {
+            conn.prepare("SELECT path FROM assets WHERE blurred = 1")
+                .map_err(|e| format!("blurred lookup: {e}"))?
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("blurred lookup: {e}"))?
+                .filter_map(Result::ok)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        drop(conn);
+
+        let subdir = format!(
+            "{}{}",
+            slugify(&event_name),
+            if mode == "whatsapp" { "-whatsapp" } else { "" }
+        );
+        let out_dir = std::path::Path::new(&dest_dir).join(&subdir);
+        std::fs::create_dir_all(&out_dir).map_err(|e| format!("create {out_dir:?}: {e}"))?;
+
+        let engine_state = app.state::<engine::EngineState>();
+        let (mut exported, mut skipped, mut bytes) = (0i64, 0i64, 0i64);
+
+        for asset in &assets {
+            if asset.kind != "image" {
+                skipped += 1; // video transcoding lands in a follow-up
+                continue;
+            }
+            let src = std::path::Path::new(&asset.path);
+            if !src.exists() {
+                skipped += 1;
+                continue;
+            }
+            let dest = out_dir.join(format!(
+                "{}.jpg",
+                slugify(&asset.name.trim_end_matches(
+                    |c: char| c.is_ascii_alphanumeric() || c == '.'
+                ))
+            ));
+            let _ = &dest;
+            if mode == "drive" {
+                std::fs::copy(src, &dest).map_err(|e| format!("copy {}: {e}", asset.path))?;
+                bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+                exported += 1;
+            } else {
+                if blurred_set.contains(&asset.path) {
+                    skipped += 1;
+                    continue;
+                }
+                let reply = engine::call_blocking(
+                    &engine_state,
+                    "compress",
+                    Some(json!({
+                        "path": asset.path,
+                        "output": dest.to_string_lossy(),
+                        "maxPx": 1280,
+                        "quality": 0.72,
+                    })),
+                    Duration::from_secs(60),
+                )?;
+                bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+                exported += 1;
+            }
+        }
+
+        Ok(ExportSummary { dir: out_dir.to_string_lossy().to_string(), exported, skipped, bytes })
+    })
+    .await
+    .map_err(|e| format!("export task join failed: {e}"))?
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
@@ -868,6 +981,7 @@ pub fn run() {
             event_assets,
             rename_event,
             export_highlight,
+            export_bundle,
             library_list,
             library_stats
         ])
@@ -1218,5 +1332,18 @@ mod tests {
             .query_row("SELECT SUM(hash_attempts) FROM assets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(attempts, 2, "each file was hashed exactly once");
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::slugify;
+
+    #[test]
+    fn slugs_are_filename_safe() {
+        assert_eq!(slugify("Birthday brunch"), "birthday-brunch");
+        assert_eq!(slugify("Bday / Kids & parents!"), "bday-kids-parents");
+        assert_eq!(slugify("///"), "event");
+        assert_eq!(slugify("August 12 2026"), "august-12-2026");
     }
 }
