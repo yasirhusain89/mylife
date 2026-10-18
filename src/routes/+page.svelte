@@ -9,6 +9,8 @@
     eventsList,
     eventAssets,
     renameEvent,
+    exportHighlight,
+    type HighlightResult,
     faceThumb,
     facesInCluster,
     duplicatesList,
@@ -163,6 +165,24 @@
     void loadThumbs(blurred);
     for (const g of groups) {
       for (const m of g.members) void loadThumbs([{ path: m.path } as AssetRow]);
+    }
+  }
+
+  let highlightBusy = $state<number | null>(null);
+  let highlightResult = $state<HighlightResult | null>(null);
+  let highlightEventId = $state<number | null>(null);
+
+  async function makeHighlight(event: EventRow) {
+    highlightBusy = event.id;
+    highlightResult = null;
+    highlightEventId = event.id;
+    try {
+      highlightResult = await exportHighlight(event.id, event.name.replace(/\s+/g, "-").toLowerCase());
+      toast = "Highlight video exported";
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      highlightBusy = null;
     }
   }
 

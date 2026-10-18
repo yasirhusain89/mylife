@@ -240,6 +240,21 @@ export function renameEvent(eventId: number, name: string): Promise<void> {
   return invoke("rename_event", { event_id: eventId, name });
 }
 
+export type HighlightResult = {
+  output: string;
+  bytes: number;
+  seconds: number;
+  photos: number;
+  videosSkipped: number;
+};
+
+export function exportHighlight(
+  eventId: number,
+  name?: string,
+): Promise<HighlightResult> {
+  return invoke("export_highlight", { eventId, name });
+}
+
 export function onHashProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
   return listen<CleanupProgress>("hash-progress", (e) => cb(e.payload));
 }

@@ -461,6 +461,124 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
     return data.base64EncodedString()
 }
 
+
+// MARK: - Highlight video
+
+/// Builds a highlight slideshow MP4 from photos with AVAssetWriter.
+///
+/// Still images expose zero AVAssetTrack instances on the macOS 26 SDK, so a
+/// composition-based export cannot include them; frames are synthesized
+/// directly instead (3s per photo at 30fps, H.264). Video clips are counted and
+/// skipped for now — mixing their compressed samples with synthesized frames
+/// needs format-normalization work that lands in a follow-up.
+func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -> [String: Any] {
+    var photos: [CGImage] = []
+    var videosSkipped = 0
+    for path in paths {
+        let url = URL(fileURLWithPath: path)
+        if let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            photos.append(cg)
+        } else {
+            videosSkipped += 1
+        }
+    }
+    guard !photos.isEmpty else { throw EngineError(message: "no decodable photos for highlight") }
+
+    // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
+    let outW = 1920, outH = 1080
+    let fps = 30
+    let secondsPerPhoto = 3.0
+    let framesPerPhoto = Int(secondsPerPhoto * Double(fps))
+
+    let outURL = URL(fileURLWithPath: output)
+    try? FileManager.default.removeItem(atPath: output)
+    let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
+    let videoSettings: [String: Any] = [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: outW,
+        AVVideoHeightKey: outH,
+    ]
+    let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+    vInput.expectsMediaDataInRealTime = false
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: vInput,
+        sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: outW,
+            kCVPixelBufferHeightKey as String: outH,
+        ])
+    guard writer.canAdd(vInput) else { throw EngineError(message: "cannot add video input") }
+    writer.add(vInput)
+
+    guard writer.startWriting() else {
+        throw EngineError(message: "writer start failed: \(writer.error.map(String.init(describing:)) ?? "unknown")")
+    }
+    writer.startSession(atSourceTime: .zero)
+
+    func makePixelBuffer(_ image: CGImage, index: Int64) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(
+            nil, adaptor.pixelBufferPool!, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else {
+            throw EngineError(message: "pixel buffer pool unavailable")
+        }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else {
+            throw EngineError(message: "pixel buffer base unavailable")
+        }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(
+            data: base, width: outW, height: outH, bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue)
+        guard let ctx else { throw EngineError(message: "cannot create buffer context") }
+        ctx.setFillColor(CGColor(gray: 0.05, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: outW, height: outH))
+        // Aspect-fill
+        let scale = max(CGFloat(outW) / CGFloat(image.width), CGFloat(outH) / CGFloat(image.height))
+        let drawW = CGFloat(image.width) * scale
+        let drawH = CGFloat(image.height) * scale
+        ctx.draw(image, in: CGRect(
+            x: (CGFloat(outW) - drawW) / 2, y: (CGFloat(outH) - drawH) / 2,
+            width: drawW, height: drawH))
+        _ = index
+        return pb
+    }
+
+    var frame: Int64 = 0
+    var appended = 0
+    for image in photos {
+        for _ in 0..<framesPerPhoto {
+            while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+            let pb = try makePixelBuffer(image, index: frame)
+            let time = CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps))
+            if adaptor.append(pb, withPresentationTime: time) {
+                appended += 1
+            }
+            frame += 1
+        }
+    }
+    vInput.markAsFinished()
+    let sem = DispatchSemaphore(value: 0)
+    writer.finishWriting { sem.signal() }
+    sem.wait()
+    guard writer.status == .completed else {
+        throw EngineError(message: "highlight export failed: \(writer.error.map(String.init(describing:)) ?? "unknown")")
+    }
+    let attrs = try FileManager.default.attributesOfItem(atPath: output)
+    return [
+        "output": output,
+        "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
+        "seconds": Double(appended) / Double(fps),
+        "photos": photos.count,
+        "videosSkipped": videosSkipped,
+    ]
+}
+
 // MARK: - Batch hashing
 
 /// Hashes many files in one call so the Rust side pays a single round-trip
@@ -691,6 +809,13 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let path = str("path") else { throw EngineError(message: "thumb requires 'path'") }
         return try thumbnail(
             path: path, maxPx: int("maxPx", 512), quality: dbl("quality", 0.72))
+
+    case "make_highlight":
+        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
+            throw EngineError(message: "make_highlight requires a non-empty 'paths' array")
+        }
+        guard let output = str("output") else { throw EngineError(message: "make_highlight requires 'output'") }
+        return try makeHighlight(paths: paths, output: output, maxSeconds: dbl("maxSeconds", 60))
 
     case "face_thumb":
         guard let path = str("path") else { throw EngineError(message: "face_thumb requires 'path'") }

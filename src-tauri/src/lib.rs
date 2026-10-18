@@ -652,6 +652,92 @@ fn rename_event(
     db::rename_event(&conn, event_id, &name)
 }
 
+// MARK: - Highlight export
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightResult {
+    pub output: String,
+    pub bytes: i64,
+    pub seconds: f64,
+    pub photos: i64,
+    pub videos_skipped: i64,
+}
+
+/// Exports a highlight slideshow for an event (or an explicit path list) into
+/// the app's exports directory.
+#[tauri::command]
+async fn export_highlight(
+    app: tauri::AppHandle,
+    event_id: Option<i64>,
+    paths: Option<Vec<String>>,
+    name: Option<String>,
+) -> Result<HighlightResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+        let asset_paths: Vec<String> = match (paths, event_id) {
+            (Some(p), _) => p,
+            (None, Some(eid)) => db::event_assets(&conn, eid)?
+                .into_iter()
+                .filter(|a| a.kind == "image")
+                .map(|a| a.path)
+                .collect(),
+            (None, None) => return Err("export_highlight needs paths or event_id".into()),
+        };
+        drop(conn);
+
+        if asset_paths.is_empty() {
+            return Err("no photos in this event for a highlight video".into());
+        }
+
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("exports");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create exports dir: {e}"))?;
+        let base = name.unwrap_or_else(|| format!("highlight-{}", chrono_stamp()));
+        let mut output = dir.join(format!("{base}.mp4"));
+        let mut n = 1;
+        while output.exists() {
+            output = dir.join(format!("{base}-{n}.mp4"));
+            n += 1;
+        }
+
+        let engine_state = app.state::<engine::EngineState>();
+        let reply = engine::call_blocking(
+            &engine_state,
+            "make_highlight",
+            Some(json!({
+                "paths": asset_paths,
+                "output": output.to_string_lossy(),
+                "maxSeconds": 60,
+            })),
+            Duration::from_secs(600),
+        )?;
+
+        Ok(HighlightResult {
+            output: output.to_string_lossy().to_string(),
+            bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
+            seconds: reply.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
+            photos: reply.get("photos").and_then(Value::as_i64).unwrap_or(0),
+            videos_skipped: reply.get("videosSkipped").and_then(Value::as_i64).unwrap_or(0),
+        })
+    })
+    .await
+    .map_err(|e| format!("highlight task join failed: {e}"))?
+}
+
+fn chrono_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
@@ -781,6 +867,7 @@ pub fn run() {
             events_list,
             event_assets,
             rename_event,
+            export_highlight,
             library_list,
             library_stats
         ])
