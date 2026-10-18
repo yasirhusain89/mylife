@@ -5,6 +5,10 @@
     blurredAssets,
     cleanupStats,
     clustersList,
+    clusterEvents,
+    eventsList,
+    eventAssets,
+    renameEvent,
     faceThumb,
     facesInCluster,
     duplicatesList,
@@ -26,6 +30,8 @@
     type CleanupProgress,
     type CleanupStats,
     type FaceClusterRow,
+    type EventRow,
+    type EventAssetRow,
     type FaceRow,
     type DuplicateGroup,
     type EnrichProgress,
@@ -65,9 +71,11 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup" | "people">("library");
+  let tab = $state<"library" | "cleanup" | "people" | "events">("library");
   let flagged = $state<Set<number>>(new Set());
   let peopleLoading = $state(false);
+  let events = $state<EventRow[]>([]);
+  let eventsLoading = $state(false);
   let toast = $state<string | null>(null);
 
   async function checkEngine() {
@@ -304,6 +312,9 @@
     </button>
     <button class="tab" class:on={tab === "people"} onclick={() => (tab = "people")}>
       People{#if people.length > 0}&nbsp;{people.length}{/if}
+    </button>
+    <button class="tab" class:on={tab === "events"} onclick={() => (tab = "events")}>
+      Events{#if events.length > 0}&nbsp;{events.length}{/if}
     </button>
   </nav>
 

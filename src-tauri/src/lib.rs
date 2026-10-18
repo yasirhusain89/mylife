@@ -600,6 +600,58 @@ struct ClusterSummary {
     clusters: i64,
 }
 
+// MARK: - Events
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterEventsSummary {
+    pub events: i64,
+    pub assets: i64,
+}
+
+#[tauri::command]
+async fn cluster_events(
+    app: tauri::AppHandle,
+    gap_hours: Option<f64>,
+    max_distance_m: Option<f64>,
+) -> Result<ClusterEventsSummary, String> {
+    let gap_hours = gap_hours.unwrap_or(4.0);
+    let max_distance_m = max_distance_m.unwrap_or(500.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let (events, assets) = db::cluster_events(&conn, gap_hours, max_distance_m)?;
+        Ok(ClusterEventsSummary { events, assets })
+    })
+    .await
+    .map_err(|e| format!("cluster task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn events_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::EventRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::events_list(&conn)
+}
+
+#[tauri::command]
+fn event_assets(
+    conn: tauri::State<'_, DbState>,
+    event_id: i64,
+) -> Result<Vec<db::EventAssetRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::event_assets(&conn, event_id)
+}
+
+#[tauri::command]
+fn rename_event(
+    conn: tauri::State<'_, DbState>,
+    event_id: i64,
+    name: String,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::rename_event(&conn, event_id, &name)
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
@@ -725,6 +777,10 @@ pub fn run() {
             clusters_list,
             faces_in_cluster,
             faces_count,
+            cluster_events,
+            events_list,
+            event_assets,
+            rename_event,
             library_list,
             library_stats
         ])

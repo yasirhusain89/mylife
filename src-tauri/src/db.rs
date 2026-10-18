@@ -11,6 +11,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/002_stat_attempts.sql")),
     (3, include_str!("../migrations/003_cleanup.sql")),
     (4, include_str!("../migrations/004_faces.sql")),
+    (5, include_str!("../migrations/005_events.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -322,6 +323,267 @@ pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRo
 pub fn faces_count(conn: &Connection) -> Result<i64, String> {
     conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
         .map_err(|e| format!("faces_count: {e}"))
+}
+
+// MARK: - Queries
+
+
+// MARK: - Events
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventRow {
+    pub id: i64,
+    pub name: String,
+    pub started_at: f64,
+    pub ended_at: f64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub place: Option<String>,
+    pub asset_count: i64,
+    pub face_count: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventAssetRow {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0;
+    let p1 = lat1.to_radians();
+    let p2 = lat2.to_radians();
+    let dp = (lat2 - lat1).to_radians();
+    let dl = (lon2 - lon1).to_radians();
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * R * (a.sqrt() * (1.0 - a).max(0.0).sqrt()).asin()
+}
+
+#[derive(Clone)]
+struct EventCandidate {
+    id: i64,
+    path: String,
+    name: String,
+    kind: String,
+    taken_at: f64,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+/// Sequential clustering: ordered by capture time; a new event starts when
+/// the gap exceeds gap_hours, or when consecutive photos are far apart.
+pub fn cluster_events(
+    conn: &Connection,
+    gap_hours: f64,
+    max_distance_m: f64,
+) -> Result<(i64, i64), String> {
+    let mut candidates: Vec<EventCandidate> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, path, name, kind, COALESCE(captured_at, modified), latitude, longitude
+             FROM assets WHERE missing = 0 ORDER BY COALESCE(captured_at, modified), id",
+        )
+        .map_err(|e| format!("prepare candidates: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(EventCandidate {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    name: r.get(2)?,
+                    kind: r.get(3)?,
+                    taken_at: r.get(4)?,
+                    latitude: r.get(5)?,
+                    longitude: r.get(6)?,
+                })
+            })
+            .map_err(|e| format!("query candidates: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("candidate row: {e}"))?);
+        }
+        v
+    };
+
+    let tx = conn.unchecked_transaction().map_err(|e| format!("events tx: {e}"))?;
+    tx.execute("DELETE FROM event_assets", [])
+        .map_err(|e| format!("clear event_assets: {e}"))?;
+    tx.execute("DELETE FROM events", [])
+        .map_err(|e| format!("clear events: {e}"))?;
+
+    let gap_seconds = gap_hours * 3600.0;
+    let mut event_count = 0i64;
+    let mut current: Option<i64> = None;
+    let mut last_time: Option<f64> = None;
+    let mut last_lat: Option<f64> = None;
+    let mut last_lon: Option<f64> = None;
+
+    for c in &candidates {
+        let same_event = match last_time {
+            Some(t) => {
+                let time_ok = (c.taken_at - t) <= gap_seconds;
+                let dist_ok = match (last_lat, last_lon, c.latitude, c.longitude) {
+                    (Some(a), Some(b), Some(x), Some(y)) => haversine_m(a, b, x, y) <= max_distance_m,
+                    _ => true,
+                };
+                time_ok && dist_ok
+            }
+            None => true,
+        };
+        if !same_event {
+            current = None;
+        }
+        if current.is_none() {
+            let stamp = format_event_time(c.taken_at);
+            tx.execute(
+                "INSERT INTO events (name, started_at, ended_at, latitude, longitude, asset_count, face_count, created_at)
+                 VALUES (?1, ?2, ?2, ?3, ?4, 0, 0, ?5)",
+                params![stamp, c.taken_at, c.latitude, c.longitude, now()],
+            )
+            .map_err(|e| format!("insert event: {e}"))?;
+            current = Some(tx.last_insert_rowid());
+            event_count += 1;
+        }
+        let eid = current.unwrap();
+        tx.execute(
+            "INSERT INTO event_assets (event_id, asset_id) VALUES (?1, ?2)",
+            params![eid, c.id],
+        )
+        .map_err(|e| format!("insert event_asset: {e}"))?;
+        last_time = Some(c.taken_at);
+        last_lat = c.latitude;
+        last_lon = c.longitude;
+    }
+
+    let rows: Vec<(i64, i64)> = {
+        let mut stmt = tx.prepare("SELECT event_id, COUNT(*) FROM event_assets GROUP BY event_id")
+            .map_err(|e| format!("prepare counts: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("query counts: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("count row: {e}"))?);
+        }
+        v
+    };
+    for (eid, n) in &rows {
+        tx.execute(
+            "UPDATE events SET asset_count = ?2 WHERE id = ?1",
+            params![eid, n],
+        )
+        .map_err(|e| format!("update count: {e}"))?;
+    }
+    for (eid, _) in &rows {
+        let fc: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM faces f
+             WHERE f.path IN (SELECT a.path FROM assets a JOIN event_assets ea ON ea.asset_id = a.id WHERE ea.event_id = ?1)",
+            params![eid], |r| r.get(0),
+        ).unwrap_or(0);
+        tx.execute(
+            "UPDATE events SET face_count = ?2 WHERE id = ?1",
+            params![eid, fc],
+        )
+        .map_err(|e| format!("update face count: {e}"))?;
+    }
+
+    tx.commit().map_err(|e| format!("events commit: {e}"))?;
+    Ok((event_count, candidates.len() as i64))
+}
+
+/// Formats a unix timestamp as "Mon DD" without any external crate.
+fn format_event_time(secs: f64) -> String {
+    let days = (secs / 86400.0).floor() as i64;
+    let mut d = days;
+    let mut y = 1970;
+    if d >= 0 {
+        while d >= 365 + leap(y) as i64 { d -= 365 + leap(y) as i64; y += 1; }
+    } else {
+        while d < 0 { y -= 1; d += 365 + leap(y) as i64; }
+    }
+    let mut m = 0;
+    for dim in month_days(y) {
+        if d < dim { break; }
+        d -= dim; m += 1;
+    }
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m];
+    format!("{} {}", mon, d + 1)
+}
+
+fn leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn month_days(y: i64) -> [i64; 12] {
+    [
+        31,
+        if leap(y) { 29i64 } else { 28i64 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ]
+}
+
+// MARK: - Events queries
+pub fn events_list(conn: &Connection) -> Result<Vec<EventRow>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, started_at, ended_at, latitude, longitude, place, asset_count, face_count
+         FROM events ORDER BY started_at DESC",
+    ).map_err(|e| format!("prepare events: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(EventRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                started_at: r.get(2)?,
+                ended_at: r.get(3)?,
+                latitude: r.get(4)?,
+                longitude: r.get(5)?,
+                place: r.get(6)?,
+                asset_count: r.get(7)?,
+                face_count: r.get(8)?,
+            })
+        })
+        .map_err(|e| format!("query events: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("event row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn event_assets(conn: &Connection, event_id: i64) -> Result<Vec<EventAssetRow>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.path, a.name, a.kind FROM assets a
+         JOIN event_assets ea ON ea.asset_id = a.id
+         WHERE ea.event_id = ?1 ORDER BY a.path",
+    ).map_err(|e| format!("prepare event assets: {e}"))?;
+    let rows = stmt
+        .query_map(params![event_id], |r| {
+            Ok(EventAssetRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query event assets: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("event asset row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), String> {
+    let changed = conn
+        .execute("UPDATE events SET name = ?2 WHERE id = ?1", params![event_id, name])
+        .map_err(|e| format!("rename event: {e}"))?;
+    if changed == 0 {
+        return Err(format!("event {event_id} not found"));
+    }
+    Ok(())
 }
 
 // MARK: - Queries
@@ -812,10 +1074,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4, "user_version tracks the highest applied migration");
+        assert_eq!(v, 5, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -929,6 +1191,57 @@ mod tests {
 
         let stats = faces_count(&conn).unwrap();
         assert_eq!(stats, 1);
+    }
+
+    #[test]
+    fn cluster_events_groups_by_time_and_distance() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let now_ts = 1_700_000_000.0;
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // same event: close in time
+        upsert_asset(&conn, &asset("/a.jpg", 1, now_ts), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, now_ts + 1800.0), scan).unwrap();
+        // new event: 10 hours later (> 4h gap)
+        upsert_asset(&conn, &asset("/c.jpg", 1, now_ts + 40_000.0), scan).unwrap();
+
+        let (events, assets) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 2, "two events by time gap");
+        assert_eq!(assets, 3, "all three assets assigned");
+
+        let rows = events_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].asset_count, 1, "second event (later) listed first");
+        assert_eq!(rows[1].asset_count, 2, "first event has two assets");
+
+        // rename sticks
+        rename_event(&conn, rows[1].id, "Birthday brunch").unwrap();
+        let rows = events_list(&conn).unwrap();
+        assert_eq!(rows.iter().find(|r| r.id == rows[1].id).unwrap().name, "Birthday brunch");
+
+        let ea = event_assets(&conn, rows[1].id).unwrap();
+        assert_eq!(ea.len(), 2);
+    }
+
+    #[test]
+    fn cluster_events_groups_by_location_proximity() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // same place, 50m apart, 1 hour apart -> one event
+        upsert_asset(&conn, &asset("/near1.jpg", 1, 1_700_000_000.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/near2.jpg", 1, 1_700_000_000.0 + 3600.0), scan).unwrap();
+        // set lat/lon: near1 ~ SF, near2 ~ 50m away
+        conn.execute("UPDATE assets SET latitude=37.7749, longitude=-122.4194 WHERE path='/near1.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET latitude=37.77495, longitude=-122.4194 WHERE path='/near2.jpg'", []).unwrap();
+
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 1, "nearby photos stay in one event");
+
+        // 5 km apart -> separate events
+        conn.execute("UPDATE assets SET latitude=37.8249 WHERE path='/near2.jpg'", []).unwrap();
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 2, "distant photos split events");
     }
 
     #[test]

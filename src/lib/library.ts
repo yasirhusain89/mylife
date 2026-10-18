@@ -197,6 +197,49 @@ export function facesCount(): Promise<number> {
   return invoke("faces_count");
 }
 
+export type EventRow = {
+  id: number;
+  name: string;
+  startedAt: number;
+  endedAt: number;
+  latitude: number | null;
+  longitude: number | null;
+  place: string | null;
+  assetCount: number;
+  faceCount: number;
+};
+
+export type EventAssetRow = {
+  id: number;
+  path: string;
+  name: string;
+  kind: string;
+};
+
+export type ClusterEventsSummary = {
+  events: number;
+  assets: number;
+};
+
+export function clusterEvents(
+  gapHours = 4,
+  maxDistanceM = 500,
+): Promise<ClusterEventsSummary> {
+  return invoke("cluster_events", { gapHours, maxDistanceM });
+}
+
+export function eventsList(): Promise<EventRow[]> {
+  return invoke("events_list");
+}
+
+export function eventAssets(eventId: number): Promise<EventAssetRow[]> {
+  return invoke("event_assets", { eventId });
+}
+
+export function renameEvent(eventId: number, name: string): Promise<void> {
+  return invoke("rename_event", { event_id: eventId, name });
+}
+
 export function onHashProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
   return listen<CleanupProgress>("hash-progress", (e) => cb(e.payload));
 }
