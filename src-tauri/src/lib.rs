@@ -868,6 +868,23 @@ pub struct ExportSummary {
     pub bytes: i64,
 }
 
+/// Bundle filename that doesn't collide: `stem.jpg`, then `stem-2.jpg`, …
+/// `exists` covers files already on disk from an earlier export into the same folder.
+fn unique_bundle_name(
+    used: &mut std::collections::HashSet<String>,
+    exists: &dyn Fn(&str) -> bool,
+    stem: &str,
+) -> String {
+    let mut candidate = format!("{stem}.jpg");
+    let mut n = 2;
+    while used.contains(&candidate) || exists(&candidate) {
+        candidate = format!("{stem}-{n}.jpg");
+        n += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
+}
+
 fn slugify(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -926,6 +943,7 @@ async fn export_bundle(
 
         let engine_state = app.state::<engine::EngineState>();
         let (mut exported, mut skipped, mut bytes) = (0i64, 0i64, 0i64);
+        let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for asset in &assets {
             if asset.kind != "image" {
@@ -937,13 +955,14 @@ async fn export_bundle(
                 skipped += 1;
                 continue;
             }
-            let dest = out_dir.join(format!(
-                "{}.jpg",
-                slugify(&asset.name.trim_end_matches(
-                    |c: char| c.is_ascii_alphanumeric() || c == '.'
-                ))
+            // Same-named photos from different folders must not overwrite each
+            // other in the bundle: first wins the slug, later ones get -2, -3…
+            let stem = slugify(&asset.name.trim_end_matches(
+                |c: char| c.is_ascii_alphanumeric() || c == '.'
             ));
-            let _ = &dest;
+            let dest = out_dir.join(unique_bundle_name(&mut used_names, &|c| {
+                out_dir.join(c).exists()
+            }, &stem));
             if mode == "drive" {
                 std::fs::copy(src, &dest).map_err(|e| format!("copy {}: {e}", asset.path))?;
                 bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
@@ -1149,6 +1168,19 @@ mod tests {
         assert!(path.exists(), "engine binary missing; run pnpm build:engine");
         unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
         engine::new_state()
+    }
+
+    #[test]
+    fn bundle_names_dedupe_within_and_across_exports() {
+        let mut used = std::collections::HashSet::new();
+        let none = |_: &str| false;
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001-2.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001-3.jpg");
+        // A file left on disk by an earlier export into the same folder is skipped too.
+        let on_disk = |c: &str| c == "img-0002.jpg";
+        assert_eq!(unique_bundle_name(&mut used, &on_disk, "img-0002"), "img-0002-2.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "other"), "other.jpg");
     }
 
     #[test]

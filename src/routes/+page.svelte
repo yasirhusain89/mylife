@@ -136,6 +136,28 @@
     void loadThumbs(assets);
   }
 
+  function libraryTotal(): number {
+    if (!stats) return 0;
+    if (filter === "image") return stats.photos;
+    if (filter === "video") return stats.videos;
+    return stats.photos + stats.videos;
+  }
+
+  async function loadMore() {
+    try {
+      const next = await libraryList({
+        kind: filter === "all" ? undefined : filter,
+        limit: PAGE,
+        offset: assets.length
+      });
+      if (next.length === 0) return;
+      assets = [...assets, ...next];
+      void loadThumbs(next);
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
   async function loadThumbs(rows: AssetRow[]) {
     for (const a of rows) {
       if (thumbs[a.path]) continue;
@@ -815,6 +837,15 @@
       </div>
     {:else if !importing}
       <p class="hint">No assets yet — add a folder to build the index.</p>
+    {/if}
+
+    {#if stats && assets.length > 0}
+      <div class="enrich">
+        <span class="hint">Showing {assets.length} of {libraryTotal()}</span>
+        {#if assets.length < libraryTotal()}
+          <button class="ghost" onclick={() => void loadMore()}>Load more</button>
+        {/if}
+      </div>
     {/if}
   </section>
 
