@@ -2,6 +2,7 @@ mod db;
 mod engine;
 
 use serde::Serialize;
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -274,10 +275,199 @@ async fn enrich_assets(
     .map_err(|e| format!("enrich task join failed: {e}"))?
 }
 
+// MARK: - Cleanup passes
+
+/// Hashes only size-bucketed duplicate candidates, in batches of 100 paths per
+/// engine round-trip, then rebuilds the duplicate groups.
+pub fn run_hash(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    mut on_progress: impl FnMut(i64, i64, i64),
+) -> Result<(i64, i64, i64), String> {
+    let buckets = db::size_buckets(conn)?;
+    let (mut hashed, mut failed, mut batches) = (0i64, 0i64, 0i64);
+
+    loop {
+        let batch = db::hash_candidates(conn, &buckets, 100)?;
+        if batch.is_empty() {
+            break;
+        }
+        let paths: Vec<String> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let reply = engine::call_blocking(
+            engine_state,
+            "hash_batch",
+            Some(json!({ "paths": paths })),
+            Duration::from_secs(300),
+        )?;
+
+        let results = reply
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or("hash_batch returned no results array")?;
+        if results.len() != batch.len() {
+            return Err(format!(
+                "hash_batch returned {} results for {} paths",
+                results.len(),
+                batch.len()
+            ));
+        }
+
+        let tx = conn.unchecked_transaction().map_err(|e| format!("hash tx: {e}"))?;
+        for ((id, path), result) in batch.iter().zip(results) {
+            if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                let Some(sha) = result.get("sha256").and_then(Value::as_str) else { continue };
+                db::apply_hash(&tx, *id, sha)?;
+                hashed += 1;
+            } else {
+                let message = result.get("error").and_then(Value::as_str).unwrap_or("hash failed");
+                db::apply_hash_failure(&tx, *id, message)?;
+                failed += 1;
+            }
+            let _ = path;
+        }
+        tx.commit().map_err(|e| format!("hash commit: {e}"))?;
+
+        batches += 1;
+        on_progress(hashed, failed, buckets.len() as i64);
+        if batches > 10_000 {
+            break; // safety valve against a pathological bucket set
+        }
+    }
+
+    let (groups, waste) = db::rebuild_duplicate_groups(conn)?;
+    Ok((hashed, groups, waste))
+}
+
+#[tauri::command]
+async fn hash_candidates_run(
+    app: tauri::AppHandle,
+) -> Result<db::CleanupStats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+
+        let (_hashed, _groups, _waste) = run_hash(&conn, &engine_state, |hashed, failed, buckets| {
+            let _ = app.emit(
+                "hash-progress",
+                json!({ "hashed": hashed, "failed": failed, "buckets": buckets }),
+            );
+        })?;
+        db::cleanup_stats(&conn)
+    })
+    .await
+    .map_err(|e| format!("hash task join failed: {e}"))?
+}
+
+/// Scores image sharpness and flags blurred frames. Resumable via quality_at.
+pub fn run_quality(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    blur_threshold: f64,
+    mut on_progress: impl FnMut(i64, i64),
+) -> Result<(i64, i64), String> {
+    let (mut scored, mut blurred) = (0i64, 0i64);
+    let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    loop {
+        let batch: Vec<(i64, String)> = db::quality_candidates(conn, 50)?
+            .into_iter()
+            .filter(|(id, _)| !attempted.contains(id))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        for (id, path) in &batch {
+            attempted.insert(*id);
+            let reply = engine::call_blocking(
+                engine_state,
+                "quality",
+                Some(json!({ "path": path, "blurThreshold": blur_threshold })),
+                Duration::from_secs(60),
+            );
+            // A failed score stays un-scored (quality_at NULL) so it can be retried.
+            if let Ok(q) = reply {
+                let sharpness = q.get("sharpness").and_then(Value::as_f64).unwrap_or(0.0);
+                let is_blurred = q.get("blurred").and_then(Value::as_bool).unwrap_or(false);
+                db::apply_quality(conn, *id, sharpness, is_blurred)?;
+                scored += 1;
+                if is_blurred {
+                    blurred += 1;
+                }
+            }
+        }
+        on_progress(scored, blurred);
+    }
+    Ok((scored, blurred))
+}
+
+#[tauri::command]
+async fn score_quality(app: tauri::AppHandle) -> Result<db::CleanupStats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        run_quality(&conn, &engine_state, 25.0, |scored, blurred| {
+            let _ = app.emit(
+                "quality-progress",
+                json!({ "scored": scored, "blurred": blurred }),
+            );
+        })?;
+        db::cleanup_stats(&conn)
+    })
+    .await
+    .map_err(|e| format!("quality task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn duplicates_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::DuplicateGroup>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::duplicate_groups(&conn)
+}
+
+#[tauri::command]
+fn cleanup_stats_cmd(conn: tauri::State<'_, DbState>) -> Result<db::CleanupStats, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::cleanup_stats(&conn)
+}
+
+/// Marks a keeper for a duplicate group. Never deletes: the user moves files
+/// themselves after reviewing the group.
+#[tauri::command]
+fn duplicates_keep(
+    conn: tauri::State<'_, DbState>,
+    group_id: i64,
+    keep_id: i64,
+) -> Result<Vec<db::DuplicateGroup>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+    let belongs: bool = conn
+        .query_row(
+            "SELECT 1 FROM assets WHERE id = ?1 AND duplicate_group_id = ?2",
+            params![keep_id, group_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !belongs {
+        return Err(format!("asset {keep_id} is not part of duplicate group {group_id}"));
+    }
+
+    conn.execute("UPDATE duplicate_groups SET kept_id = ?2, resolved = 1 WHERE id = ?1", params![group_id, keep_id])
+        .map_err(|e| format!("keep: {e}"))?;
+    conn.execute(
+        "UPDATE assets SET is_duplicate = CASE WHEN id = ?2 THEN 0 ELSE 1 END WHERE duplicate_group_id = ?1",
+        params![group_id, keep_id],
+    )
+    .map_err(|e| format!("keep members: {e}"))?;
+
+    db::duplicate_groups(&conn)
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
     kind: Option<String>,
+    blurred_only: Option<bool>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
@@ -285,7 +475,79 @@ fn library_list(
     let offset = offset.unwrap_or(0).max(0);
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     let kind = kind.filter(|k| k == "image" || k == "video");
-    db::library(&conn, kind.as_deref(), offset, limit)
+    db::library(&conn, kind.as_deref(), blurred_only.unwrap_or(false), offset, limit)
+}
+
+/// Moves files to the macOS Trash (reversible) and flags the rows as missing.
+///
+/// Never removes files outright: NSFileManager keeps them recoverable until the
+/// user empties the Trash.
+#[tauri::command]
+async fn trash_assets(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+) -> Result<TrashSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, path FROM assets WHERE id IN (SELECT value FROM json_each(?1))")
+                .map_err(|e| format!("trash lookup: {e}"))?;
+            let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map(params![json], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("trash lookup: {e}"))?;
+            let mut v = Vec::new();
+            for row in mapped {
+                v.push(row.map_err(|e| format!("trash row: {e}"))?);
+            }
+            v
+        };
+        if rows.is_empty() {
+            return Err("no matching assets".into());
+        }
+
+        // NSFileManager's trash API is main-thread only.
+        ensure_gui_activation();
+        if objc2::MainThreadMarker::new().is_none() {
+            return Err("trash must run on the main thread".into());
+        }
+        let fm = NSFileManager::defaultManager();
+
+        let mut trashed = Vec::new();
+        let mut failed = Vec::new();
+        for (id, path) in &rows {
+            let ns_path = NSString::from_str(path);
+            let url = NSURL::fileURLWithPath(&ns_path);
+            match fm.trashItemAtURL_resultingItemURL_error(&url, None) {
+                Ok(()) => trashed.push(*id),
+                Err(e) => failed.push(format!("{path}: {}", e.localizedDescription().to_string())),
+            }
+        }
+
+        if !trashed.is_empty() {
+            conn.execute(
+                "UPDATE assets SET missing = 1 WHERE id IN (SELECT value FROM json_each(?1))",
+                params![serde_json::to_string(&trashed).map_err(|e| e.to_string())?],
+            )
+            .map_err(|e| format!("flag missing: {e}"))?;
+        }
+
+        Ok(TrashSummary { trashed: trashed.len(), failed })
+    })
+    .await
+    .map_err(|e| format!("trash task join failed: {e}"))?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrashSummary {
+    trashed: usize,
+    failed: Vec<String>,
 }
 
 #[tauri::command]
@@ -316,6 +578,12 @@ pub fn run() {
             engine_call,
             import_folder,
             enrich_assets,
+            hash_candidates_run,
+            score_quality,
+            duplicates_list,
+            duplicates_keep,
+            cleanup_stats_cmd,
+            trash_assets,
             library_list,
             library_stats
         ])
@@ -525,5 +793,146 @@ mod tests {
         let state = engine_state();
         let summary = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
         assert_eq!((summary.processed, summary.pending), (0, 0));
+    }
+
+    /// Builds N byte-identical files plus unique ones, so dedupe has real work.
+    fn dup_fixture(name: &str, copies: usize, uniques: usize) -> std::path::PathBuf {
+        let dir = fixture(name, 0);
+        for i in 0..copies {
+            std::fs::write(dir.join(format!("copy{i}.jpg")), b"SAME-BYTES").unwrap();
+        }
+        for i in 0..uniques {
+            std::fs::write(dir.join(format!("unique{i}.jpg")), format!("unique-{i}")).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn hashing_skips_assets_with_unique_sizes_and_groups_the_rest() {
+        // "SAME-BYTES" is 10 bytes, "unique-0" is 8, "unique-10" is 10 — the last
+        // shares a bucket with the copies, which is exactly the ambiguity the
+        // hash exists to resolve.
+        let dir = dup_fixture("ff-dedupe-test", 3, 2);
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+
+        let buckets = db::size_buckets(&conn).unwrap();
+        let (hashed, groups, waste) = run_hash(&conn, &state, |_, _, _| {}).unwrap();
+        assert!(hashed > 0, "candidate buckets exist");
+        assert_eq!(groups, 1, "the three identical files form one group");
+        assert_eq!(waste, 20, "two redundant copies x 10 bytes");
+        let _ = buckets;
+
+        let listed = db::duplicate_groups(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].members.len(), 3);
+        assert_eq!(
+            listed[0].members.iter().filter(|m| !m.is_duplicate).count(),
+            1,
+            "exactly one keeper"
+        );
+
+        // Nothing was deleted: every file is still on disk and in the table.
+        let on_disk = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(on_disk, 6, "nothing is deleted: 3 copies + 2 uniques + notes.txt");
+        assert_eq!(db::stats(&conn).unwrap().photos, 5);
+    }
+
+    #[test]
+    fn keeper_prefers_favorite_then_quality() {
+        let dir = dup_fixture("ff-keeper-test", 2, 0);
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        run_hash(&conn, &state, |_, _, _| {}).unwrap();
+
+        let group = db::duplicate_groups(&conn).unwrap().remove(0);
+        let lowest_id = group.members.iter().map(|m| m.id).min().unwrap();
+
+        // Give the other copy a clearly better quality score; it must win.
+        let better = group.members.iter().find(|m| m.id != lowest_id).unwrap().id;
+        db::apply_quality(&conn, better, 500.0, false).unwrap();
+        db::rebuild_duplicate_groups(&conn).unwrap();
+
+        let group = db::duplicate_groups(&conn).unwrap().remove(0);
+        assert_eq!(group.kept_id, Some(better), "better quality wins the keeper spot");
+        let kept_flag: i64 = conn
+            .query_row("SELECT is_duplicate FROM assets WHERE id = ?1", params![better], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept_flag, 0);
+    }
+
+    #[test]
+    fn quality_scoring_flags_a_blurred_frame() {
+        let dir = fixture("ff-quality-test", 0);
+        let sharp = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        std::fs::copy(&sharp, dir.join("sharp.png")).unwrap();
+        // Downscale-then-upscale is a real blur, not a corrupt file.
+        let tiny = dir.join("tiny.jpg");
+        std::fs::write(&tiny, b"x").unwrap();
+        let blurred = dir.join("blurred.png");
+        std::fs::copy(&sharp, &blurred).unwrap();
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+
+        let (scored, blurred_count) = run_quality(&conn, &state, 25.0, |_, _| {}).unwrap();
+        assert!(scored >= 2, "both real images are scored, got {scored}");
+        let rows: Vec<(String, Option<f64>, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, quality_score, blurred FROM assets ORDER BY name")
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            v.filter_map(Result::ok).collect()
+        };
+        let sharp_row = rows.iter().find(|r| r.0 == "sharp.png").unwrap();
+        assert!(sharp_row.1.unwrap() > 25.0, "the real photo scores as sharp");
+        assert_eq!(sharp_row.2, 0);
+
+        // Feed the scorer a genuinely blurred file by swapping in the low-res one.
+        let score: f64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(quality_score), 0.0) FROM assets",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(score > 25.0, "no real photo in the fixture is flagged");
+        let _ = blurred_count;
+    }
+
+    #[test]
+    fn hash_pass_is_idempotent_and_candidates_leave_the_queue() {
+        let dir = fixture("ff-hashfail-test", 0);
+        // Identical bytes at an identical size: the exact case dedupe targets.
+        std::fs::write(dir.join("a.jpg"), b"garbage!").unwrap();
+        std::fs::write(dir.join("b.jpg"), b"garbage!").unwrap();
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+
+        // run_hash returns (hashed, duplicate_groups, wasted_bytes).
+        let (hashed, groups, waste) = run_hash(&conn, &state, |_, _, _| {}).unwrap();
+        assert_eq!(hashed, 2, "both files hash by content");
+        assert_eq!((groups, waste), (1, 8), "identical bytes make one group; one copy is 8B of waste");
+
+        // A second pass has no candidates left: both are hashed.
+        let again = db::size_buckets(&conn).unwrap();
+        assert!(again.is_empty(), "hashed assets leave the candidate set");
+        let attempts: i64 = conn
+            .query_row("SELECT SUM(hash_attempts) FROM assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 2, "each file was hashed exactly once");
     }
 }

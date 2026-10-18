@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Builds the fotoflow engine sidecar and places it where Tauri expects it.
 #
-# This machine: CLT ships swiftc 6.2.4 but the MacOSX26.2 SDK was built with
-# Swift 6.2.3 (swiftlang-6.2.3.3.2) — the 6.2.4 compiler rejects it. The
-# matched 6.2.3 toolchain from swift.org is installed at ~/toolchains/swift-6.2.3;
-# SWIFTC env overrides, plain `swiftc` used only as a last resort (may mismatch).
+# Toolchain selection. CLT ships a swiftc whose version matches the macOS SDK it
+# ships with; older CLT builds (swiftc 6.2.4 vs an SDK built by 6.2.3) reject the
+# SDK outright. A local swift.org toolchain at ~/toolchains/swift-* was used to
+# work around that; it is no longer needed now that CLT matches the SDK.
+#
+# Order: $SWIFTC > system swiftc (xcrun) > ~/toolchains fallback.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,13 +19,17 @@ esac
 
 if [[ -n "${SWIFTC:-}" ]]; then
   SWIFTC_BIN="$SWIFTC"
+elif SWIFTC_SYSTEM="$(xcrun --find swiftc 2>/dev/null)" && [[ -x "$SWIFTC_SYSTEM" ]]; then
+  SWIFTC_BIN="$SWIFTC_SYSTEM"
 elif [[ -x "$HOME/toolchains/swift-6.2.3/usr/bin/swiftc" ]]; then
+  echo "warning: no system swiftc found; falling back to ~/toolchains/swift-6.2.3" >&2
   SWIFTC_BIN="$HOME/toolchains/swift-6.2.3/usr/bin/swiftc"
 else
-  echo "warning: matched Swift 6.2.3 toolchain not found at ~/toolchains/swift-6.2.3;" \
-       "falling back to PATH swiftc (compiler/SDK skew may fail the build)" >&2
-  SWIFTC_BIN="swiftc"
+  echo "error: no Swift compiler found (set SWIFTC=/path/to/swiftc)" >&2
+  exit 1
 fi
+
+echo "swiftc: $SWIFTC_BIN ($("$SWIFTC_BIN" --version 2>&1 | head -1))"
 
 SDK="$(xcrun --show-sdk-path)"
 mkdir -p src-tauri/binaries

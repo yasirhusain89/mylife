@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_stat_attempts.sql")),
+    (3, include_str!("../migrations/003_cleanup.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -287,11 +288,310 @@ pub fn enrich_counts(conn: &Connection, max_attempts: i64) -> Result<(i64, i64),
     Ok(row)
 }
 
+
+// MARK: - Deduplication
+
+/// Size buckets: a duplicate must have identical size, so only assets sharing a
+/// size with someone else can possibly be a duplicate. Hashing is the expensive
+/// step, so it runs only on assets in a populated bucket (rounded to 4 KiB so
+/// near-identical exports still land together).
+pub fn size_buckets(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT (size_bytes / 4096) * 4096 AS bucket
+             FROM assets
+             WHERE missing = 0 AND size_bytes > 0 AND sha256 IS NULL
+             GROUP BY bucket
+             HAVING COUNT(*) > 1
+             ORDER BY bucket",
+        )
+        .map_err(|e| format!("prepare size_buckets: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("query size_buckets: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("size_buckets row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Unhashed assets whose size falls in a candidate bucket.
+pub fn hash_candidates(conn: &Connection, buckets: &[i64], limit: i64) -> Result<Vec<(i64, String)>, String> {
+    if buckets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = buckets.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, path FROM assets
+         WHERE sha256 IS NULL AND missing = 0 AND hash_attempts < 3
+           AND (size_bytes / 4096) * 4096 IN ({list})
+         ORDER BY size_bytes, id
+         LIMIT {limit}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare hash_candidates: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query hash_candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("hash_candidates row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn apply_hash(conn: &Connection, id: i64, sha256: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE assets SET sha256 = ?2, hash_at = ?3, hash_error = NULL,
+                hash_attempts = hash_attempts + 1
+         WHERE id = ?1",
+        params![id, sha256, now()],
+    )
+    .map_err(|e| format!("apply_hash: {e}"))?;
+    Ok(())
+}
+
+pub fn apply_hash_failure(conn: &Connection, id: i64, error: &str) -> Result<(), String> {
+    let message: String = error.chars().take(200).collect();
+    conn.execute(
+        "UPDATE assets SET hash_error = ?2, hash_attempts = hash_attempts + 1 WHERE id = ?1",
+        params![id, message],
+    )
+    .map_err(|e| format!("apply_hash_failure: {e}"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub id: i64,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub waste_bytes: i64,
+    pub kept_id: Option<i64>,
+    pub members: Vec<DuplicateMember>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateMember {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub is_duplicate: bool,
+    pub captured_at: Option<f64>,
+    pub quality_score: Option<f64>,
+}
+
+/// Rebuilds duplicate groups from hashed assets.
+///
+/// The keeper is chosen deterministically: a favourite wins, then the best
+/// quality score, then the earliest capture date, then the lowest id. Nothing is
+/// deleted here — grouping only records which copies are redundant.
+pub fn rebuild_duplicate_groups(conn: &Connection) -> Result<(i64, i64), String> {
+    let groups: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sha256, size_bytes FROM assets
+                 WHERE sha256 IS NOT NULL AND missing = 0
+                 GROUP BY sha256, size_bytes HAVING COUNT(*) > 1",
+            )
+            .map_err(|e| format!("prepare dup groups: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("query dup groups: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("dup group row: {e}"))?);
+        }
+        v
+    };
+
+    let tx = conn.unchecked_transaction().map_err(|e| format!("dup tx: {e}"))?;
+    // Groups are derived state: clear flags and rows together so repeated runs
+    // stay idempotent (the unique index on sha256+size_bytes would otherwise
+    // reject a second rebuild).
+    tx.execute("UPDATE assets SET duplicate_group_id = NULL, is_duplicate = 0", [])
+        .map_err(|e| format!("reset duplicate flags: {e}"))?;
+    tx.execute("DELETE FROM duplicate_groups", [])
+        .map_err(|e| format!("clear duplicate groups: {e}"))?;
+
+    let mut group_count = 0i64;
+    let mut waste_total = 0i64;
+
+    for (sha, size) in groups {
+        let members: Vec<i64> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM assets WHERE sha256 = ?1 AND size_bytes = ?2 AND missing = 0
+                     ORDER BY favorite DESC, COALESCE(quality_score, -1.0) DESC,
+                              captured_at ASC, id ASC",
+                )
+                .map_err(|e| format!("prepare members: {e}"))?;
+            let rows = stmt
+                .query_map(params![sha, size], |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("query members: {e}"))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(|e| format!("member row: {e}"))?);
+            }
+            v
+        };
+        if members.len() < 2 {
+            continue;
+        }
+
+        let kept = members[0];
+        let waste = size * (members.len() as i64 - 1);
+        tx.execute(
+            "INSERT INTO duplicate_groups (sha256, size_bytes, kept_id, waste_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sha, size, kept, waste, now()],
+        )
+        .map_err(|e| format!("insert dup group: {e}"))?;
+        let group_id = tx.last_insert_rowid();
+
+        for id in &members {
+            let is_dup = i64::from(*id != kept);
+            tx.execute(
+                "UPDATE assets SET duplicate_group_id = ?2, is_duplicate = ?3 WHERE id = ?1",
+                params![id, group_id, is_dup],
+            )
+            .map_err(|e| format!("mark member: {e}"))?;
+        }
+
+        group_count += 1;
+        waste_total += waste;
+    }
+
+    tx.commit().map_err(|e| format!("dup commit: {e}"))?;
+    Ok((group_count, waste_total))
+}
+
+pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>, String> {
+    let groups: Vec<DuplicateGroup> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, sha256, size_bytes, waste_bytes, kept_id FROM duplicate_groups
+                 ORDER BY waste_bytes DESC, id",
+            )
+            .map_err(|e| format!("prepare list dup groups: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DuplicateGroup {
+                    id: r.get(0)?,
+                    sha256: r.get(1)?,
+                    size_bytes: r.get(2)?,
+                    waste_bytes: r.get(3)?,
+                    kept_id: r.get(4)?,
+                    members: Vec::new(),
+                })
+            })
+            .map_err(|e| format!("list dup groups: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("dup group row: {e}"))?);
+        }
+        v
+    };
+
+    let mut out = Vec::new();
+    for mut g in groups {
+        let members: Vec<DuplicateMember> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, path, name, is_duplicate, captured_at, quality_score FROM assets
+                     WHERE duplicate_group_id = ?1 ORDER BY is_duplicate ASC, captured_at ASC, id",
+                )
+                .map_err(|e| format!("prepare members: {e}"))?;
+            let rows = stmt
+                .query_map(params![g.id], |r| {
+                    Ok(DuplicateMember {
+                        id: r.get(0)?,
+                        path: r.get(1)?,
+                        name: r.get(2)?,
+                        is_duplicate: r.get::<_, i64>(3)? == 1,
+                        captured_at: r.get(4)?,
+                        quality_score: r.get(5)?,
+                    })
+                })
+                .map_err(|e| format!("query members: {e}"))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(|e| format!("member row: {e}"))?);
+            }
+            v
+        };
+        g.members = members;
+        out.push(g);
+    }
+    Ok(out)
+}
+
+// MARK: - Quality
+
+pub fn quality_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path FROM assets
+             WHERE kind = 'image' AND missing = 0 AND quality_at IS NULL
+               AND width IS NOT NULL AND height IS NOT NULL
+             ORDER BY id LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare quality_candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query quality_candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("quality row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn apply_quality(conn: &Connection, id: i64, sharpness: f64, blurred: bool) -> Result<(), String> {
+    conn.execute(
+        "UPDATE assets SET quality_score = ?2, blurred = ?3, quality_at = ?4 WHERE id = ?1",
+        params![id, sharpness, i64::from(blurred), now()],
+    )
+    .map_err(|e| format!("apply_quality: {e}"))?;
+    Ok(())
+}
+
+pub fn cleanup_stats(conn: &Connection) -> Result<CleanupStats, String> {
+    let row = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM duplicate_groups),
+                (SELECT COALESCE(SUM(waste_bytes), 0) FROM duplicate_groups),
+                (SELECT COUNT(*) FROM assets WHERE blurred = 1)",
+            [],
+            |r| {
+                Ok(CleanupStats {
+                    duplicate_groups: r.get(0)?,
+                    waste_bytes: r.get(1)?,
+                    blurred: r.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| format!("cleanup_stats: {e}"))?;
+    Ok(row)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupStats {
+    pub duplicate_groups: i64,
+    pub waste_bytes: i64,
+    pub blurred: i64,
+}
+
 // MARK: - Queries
 
 pub fn library(
     conn: &Connection,
     kind: Option<&str>,
+    blurred_only: bool,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<AssetRow>, String> {
@@ -299,11 +599,12 @@ pub fn library(
                       width, height, duration, favorite, missing, sha256
                FROM assets
                WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
+                 AND (?2 = 0 OR blurred = 1)
                ORDER BY COALESCE(captured_at, modified) DESC, id DESC
-               LIMIT ?2 OFFSET ?3";
+               LIMIT ?3 OFFSET ?4";
     let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
-        .query_map(params![kind, limit, offset], |r| {
+        .query_map(params![kind, i64::from(blurred_only), limit, offset], |r| {
             Ok(AssetRow {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -375,10 +676,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2, "user_version tracks the highest applied migration");
+        assert_eq!(v, 3, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -419,21 +720,46 @@ mod tests {
         conn.execute("UPDATE assets SET captured_at = 50.0 WHERE path = '/new.jpg'", []).unwrap();
         conn.execute("UPDATE assets SET captured_at = 900.0 WHERE path = '/old.jpg'", []).unwrap();
 
-        let all = library(&conn, None, 0, 10).unwrap();
+        let all = library(&conn, None, false, 0, 10).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].path, "/old.jpg", "newest capture first");
 
-        let paged = library(&conn, None, 1, 10).unwrap();
+        let paged = library(&conn, None, false, 1, 10).unwrap();
         assert_eq!(paged.len(), 1);
         assert_eq!(paged[0].path, "/new.jpg", "offset skips the newest");
 
-        let videos = library(&conn, Some("video"), 0, 10).unwrap();
+        let videos = library(&conn, Some("video"), false, 0, 10).unwrap();
         assert!(videos.is_empty(), "kind filter excludes images");
 
         let s = stats(&conn).unwrap();
         assert_eq!(s.photos, 2);
         assert_eq!(s.videos, 0);
         assert_eq!(s.bytes, 2);
+    }
+
+    #[test]
+    fn library_blurred_filter_binds_the_right_parameters() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/soft.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/sharp.jpg", 1, 2.0), scan).unwrap();
+        conn.execute(
+            "UPDATE assets SET quality_score = 3.0, blurred = 1 WHERE path = '/soft.jpg'",
+            [],
+        )
+        .unwrap();
+
+        let blurred_rows = library(&conn, None, true, 0, 10).unwrap();
+        assert_eq!(blurred_rows.len(), 1, "only the flagged photo");
+        assert_eq!(blurred_rows[0].path, "/soft.jpg");
+
+        let all_rows = library(&conn, Some("image"), false, 0, 10).unwrap();
+        assert_eq!(all_rows.len(), 2, "kind + blurred filters compose");
+
+        let page = library(&conn, None, true, 0, 1).unwrap();
+        assert_eq!(page.len(), 1, "limit still applies alongside the filter");
+        assert!(library(&conn, Some("video"), true, 0, 10).unwrap().is_empty());
     }
 
     #[test]

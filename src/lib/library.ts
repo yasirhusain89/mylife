@@ -93,6 +93,74 @@ export function onEnrichProgress(cb: (p: EnrichProgress) => void): Promise<() =>
   return listen<EnrichProgress>("enrich-progress", (e) => cb(e.payload));
 }
 
+export type DuplicateMember = {
+  id: number;
+  path: string;
+  name: string;
+  isDuplicate: boolean;
+  capturedAt: number | null;
+  qualityScore: number | null;
+};
+
+export type DuplicateGroup = {
+  id: number;
+  sha256: string;
+  sizeBytes: number;
+  wasteBytes: number;
+  keptId: number | null;
+  members: DuplicateMember[];
+};
+
+export type CleanupStats = {
+  duplicateGroups: number;
+  wasteBytes: number;
+  blurred: number;
+};
+
+export type CleanupProgress = {
+  hashed?: number;
+  failed?: number;
+  buckets?: number;
+  scored?: number;
+  blurred?: number;
+};
+
+export function findDuplicates(): Promise<CleanupStats> {
+  return invoke("hash_candidates_run");
+}
+
+export function scoreQuality(): Promise<CleanupStats> {
+  return invoke("score_quality");
+}
+
+export function duplicatesList(): Promise<DuplicateGroup[]> {
+  return invoke("duplicates_list");
+}
+
+export function keepCopy(groupId: number, keepId: number): Promise<DuplicateGroup[]> {
+  return invoke("duplicates_keep", { groupId, keepId });
+}
+
+export function cleanupStats(): Promise<CleanupStats> {
+  return invoke("cleanup_stats_cmd");
+}
+
+export function blurredAssets(limit = 60): Promise<AssetRow[]> {
+  return invoke("library_list", { kind: "image", blurredOnly: true, limit, offset: 0 });
+}
+
+export function trashAssets(ids: number[]): Promise<{ trashed: number; failed: string[] }> {
+  return invoke("trash_assets", { ids });
+}
+
+export function onHashProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
+  return listen<CleanupProgress>("hash-progress", (e) => cb(e.payload));
+}
+
+export function onQualityProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
+  return listen<CleanupProgress>("quality-progress", (e) => cb(e.payload));
+}
+
 export function engineThumb(path: string, maxPx = 256): Promise<{ path: string; image: string }> {
   return invoke("engine_call", { cmd: "thumb", params: { path, maxPx } });
 }

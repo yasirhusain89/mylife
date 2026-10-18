@@ -310,6 +310,112 @@ func hashAsset(path: String) throws -> [String: Any] {
     ]
 }
 
+// MARK: - Batch hashing
+
+/// Hashes many files in one call so the Rust side pays a single round-trip
+/// per batch instead of one per asset. Individual failures are reported per
+/// item so one unreadable file cannot abort a batch.
+func hashBatch(paths: [String]) -> [String: Any] {
+    var results: [[String: Any]] = []
+    results.reserveCapacity(paths.count)
+    for path in paths {
+        do {
+            var entry = try hashAsset(path: path)
+            entry["ok"] = true
+            results.append(entry)
+        } catch {
+            results.append(["path": path, "ok": false, "error": "\(error)"])
+        }
+    }
+    return ["count": paths.count, "results": results]
+}
+
+// MARK: - Image quality
+
+/// Variance of the Laplacian over a downscaled luma image: the classic focus /
+/// sharpness measure. Cheap, camera-agnostic and good enough to separate
+/// motion-blurred shots from sharp ones.
+func sharpnessScore(path: String, maxPx: Int) throws -> Double {
+    let px = max(32, min(maxPx, 2048))
+    let srcOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    guard
+        let src = CGImageSourceCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, srcOptions as CFDictionary)
+    else { throw EngineError(message: "not an image: \(path)") }
+
+    let thumbOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: px,
+    ]
+    guard
+        let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOptions as CFDictionary)
+    else { throw EngineError(message: "cannot decode image: \(path)") }
+
+    let width = cg.width
+    let height = cg.height
+    guard width > 2, height > 2 else { throw EngineError(message: "image too small: \(path)") }
+
+    var pixels = [UInt8](repeating: 0, count: width * height)
+    let colorSpace = CGColorSpaceCreateDeviceGray()
+    guard
+        let ctx = CGContext(
+            data: &pixels, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue)
+    else { throw EngineError(message: "cannot rasterize: \(path)") }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    // Laplacian kernel, 4-neighbour cross, with wrap-around at the edges.
+    var sum = 0.0
+    var sumSquares = 0.0
+    var n = 0.0
+    for y in 1..<(height - 1) {
+        for x in 1..<(width - 1) {
+            let i = y * width + x
+            let laplacian = Double(4) * Double(pixels[i])
+                - Double(pixels[i - 1]) - Double(pixels[i + 1])
+                - Double(pixels[i - width]) - Double(pixels[i + width])
+            sum += laplacian
+            sumSquares += laplacian * laplacian
+            n += 1
+        }
+    }
+    guard n > 0 else { throw EngineError(message: "empty luma image: \(path)") }
+    let mean = sum / n
+    return sumSquares / n - mean * mean
+}
+
+/// Quality is a small vector of cheap, explainable signals. No model weights,
+/// so it runs anywhere and stays inspectable.
+func quality(path: String, blurThreshold: Double) throws -> [String: Any] {
+    var out: [String: Any] = ["path": path]
+    let sharpness = try sharpnessScore(path: path, maxPx: 512)
+    out["sharpness"] = sharpness
+    out["blurred"] = sharpness < blurThreshold
+
+    if let src = CGImageSourceCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+    {
+        let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+        let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+        out["width"] = w
+        out["height"] = h
+        if w > 0 && h > 0 {
+            out["megapixels"] = Double(w * h) / 1_000_000.0
+        }
+    }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+    out["sizeBytes"] = bytes
+    // Bytes-per-pixel separates a heavily compressed photo from a detailed one.
+    if let mp = out["megapixels"] as? Double, mp > 0 {
+        out["bytesPerPixel"] = Double(bytes) / (mp * 1_000_000.0)
+    }
+    return out
+}
+
 // MARK: - Thumbnails
 
 func thumbnail(path: String, maxPx: Int, quality: Double) throws -> [String: Any] {
@@ -403,6 +509,19 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
     case "hash":
         guard let path = str("path") else { throw EngineError(message: "hash requires 'path'") }
         return try hashAsset(path: path)
+
+    case "hash_batch":
+        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
+            throw EngineError(message: "hash_batch requires a non-empty 'paths' array")
+        }
+        if paths.count > 500 {
+            throw EngineError(message: "hash_batch accepts at most 500 paths, got \(paths.count)")
+        }
+        return hashBatch(paths: paths)
+
+    case "quality":
+        guard let path = str("path") else { throw EngineError(message: "quality requires 'path'") }
+        return try quality(path: path, blurThreshold: dbl("blurThreshold", 25.0))
 
     case "thumb":
         guard let path = str("path") else { throw EngineError(message: "thumb requires 'path'") }
