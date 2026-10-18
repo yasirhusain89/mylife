@@ -690,6 +690,79 @@ fn rename_event(
     db::rename_event(&conn, event_id, &name)
 }
 
+// MARK: - Albums
+
+#[tauri::command]
+fn albums_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::AlbumRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::albums_list(&conn)
+}
+
+#[tauri::command]
+fn album_create(conn: tauri::State<'_, DbState>, name: String) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::album_create(&conn, &name)
+}
+
+#[tauri::command]
+fn album_rename(conn: tauri::State<'_, DbState>, album_id: i64, name: String) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::album_rename(&conn, album_id, &name)
+}
+
+/// Deletes an album only (membership rows cascade; library files are untouched).
+#[tauri::command]
+fn album_delete(
+    conn: tauri::State<'_, DbState>,
+    album_id: i64,
+) -> Result<AlbumDeleteResult, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let removed = db::album_delete(&conn, album_id)?;
+    Ok(AlbumDeleteResult { removed })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumDeleteResult {
+    removed: i64,
+}
+
+#[tauri::command]
+fn album_assets(
+    conn: tauri::State<'_, DbState>,
+    album_id: i64,
+) -> Result<Vec<db::EventAssetRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::album_assets(&conn, album_id)
+}
+
+#[tauri::command]
+fn album_add(
+    conn: tauri::State<'_, DbState>,
+    album_id: i64,
+    asset_ids: Vec<i64>,
+) -> Result<AlbumAddResult, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let added = db::album_add_assets(&conn, album_id, &asset_ids)?;
+    Ok(AlbumAddResult { added })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumAddResult {
+    added: i64,
+}
+
+#[tauri::command]
+fn album_remove(
+    conn: tauri::State<'_, DbState>,
+    album_id: i64,
+    asset_id: i64,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::album_remove_asset(&conn, album_id, asset_id)
+}
+
 // MARK: - Highlight export
 
 #[derive(Serialize)]
@@ -708,6 +781,7 @@ pub struct HighlightResult {
 async fn export_highlight(
     app: tauri::AppHandle,
     event_id: Option<i64>,
+    album_id: Option<i64>,
     paths: Option<Vec<String>>,
     name: Option<String>,
 ) -> Result<HighlightResult, String> {
@@ -715,14 +789,21 @@ async fn export_highlight(
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
-        let asset_paths: Vec<String> = match (paths, event_id) {
-            (Some(p), _) => p,
-            (None, Some(eid)) => db::event_assets(&conn, eid)?
+        let asset_paths: Vec<String> = match (paths, event_id, album_id) {
+            (Some(p), _, _) => p,
+            (None, Some(eid), _) => db::event_assets(&conn, eid)?
                 .into_iter()
                 .filter(|a| a.kind == "image")
                 .map(|a| a.path)
                 .collect(),
-            (None, None) => return Err("export_highlight needs paths or event_id".into()),
+            (None, None, Some(aid)) => db::album_assets(&conn, aid)?
+                .into_iter()
+                .filter(|a| a.kind == "image")
+                .map(|a| a.path)
+                .collect(),
+            (None, None, None) => {
+                return Err("export_highlight needs paths, event_id or album_id".into())
+            }
         };
         drop(conn);
 
@@ -796,7 +877,7 @@ fn slugify(name: &str) -> String {
     if collapsed.is_empty() { "event".to_string() } else { collapsed.to_lowercase() }
 }
 
-/// Copies an event's photos into `dest_dir/<event-slug>/`:
+/// Copies an event's or album's photos into `dest_dir/<name-slug>/`:
 /// - mode "drive": byte-for-byte copies (full quality)
 /// - mode "whatsapp": recoded 1280px JPEGs via the engine
 ///
@@ -805,7 +886,8 @@ fn slugify(name: &str) -> String {
 #[tauri::command]
 async fn export_bundle(
     app: tauri::AppHandle,
-    event_id: i64,
+    event_id: Option<i64>,
+    album_id: Option<i64>,
     event_name: String,
     mode: String,
     dest_dir: String,
@@ -817,7 +899,11 @@ async fn export_bundle(
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
-        let assets = db::event_assets(&conn, event_id)?;
+        let assets = match (event_id, album_id) {
+            (Some(eid), _) => db::event_assets(&conn, eid)?,
+            (_, Some(aid)) => db::album_assets(&conn, aid)?,
+            (None, None) => return Err("export_bundle needs event_id or album_id".into()),
+        };
         let blurred_set: std::collections::HashSet<String> = if mode == "whatsapp" {
             conn.prepare("SELECT path FROM assets WHERE blurred = 1")
                 .map_err(|e| format!("blurred lookup: {e}"))?
@@ -1019,6 +1105,13 @@ pub fn run() {
             events_list,
             event_assets,
             rename_event,
+            albums_list,
+            album_create,
+            album_rename,
+            album_delete,
+            album_assets,
+            album_add,
+            album_remove,
             export_highlight,
             export_bundle,
             library_list,

@@ -9,6 +9,14 @@
     eventsList,
     eventAssets,
     renameEvent,
+    albumsList,
+    albumCreate,
+    albumRename,
+    albumDelete,
+    albumAssets,
+    albumAdd,
+    albumRemove,
+    type AlbumRow,
     exportHighlight,
     exportBundle,
     type ExportSummary,
@@ -78,7 +86,7 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup" | "people" | "events">("library");
+  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums">("library");
   let flagged = $state<Set<number>>(new Set());
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
@@ -173,22 +181,31 @@
     }
   }
 
-  let highlightBusy = $state<number | null>(null);
+  let highlightBusy = $state<string | null>(null);
   let highlightResult = $state<HighlightResult | null>(null);
-  let highlightEventId = $state<number | null>(null);
+  let highlightKey = $state<string | null>(null);
 
   let exportBusy = $state<string | null>(null);
   let exportResult = $state<ExportSummary | null>(null);
-  let exportEventId = $state<number | null>(null);
+  let exportKey = $state<string | null>(null);
 
-  async function runExport(event: EventRow, mode: "drive" | "whatsapp") {
+  function sourceKey(src: { eventId?: number; albumId?: number }): string {
+    return src.eventId != null ? `e${src.eventId}` : `a${src.albumId}`;
+  }
+
+  async function runExport(
+    src: { eventId?: number; albumId?: number },
+    name: string,
+    mode: "drive" | "whatsapp",
+  ) {
     const dest = await open({ directory: true, multiple: false, title: "Choose export folder" });
     if (typeof dest !== "string" || dest === "") return;
-    exportBusy = `${event.id}-${mode}`;
+    const key = `${sourceKey(src)}-${mode}`;
+    exportBusy = key;
     exportResult = null;
-    exportEventId = event.id;
+    exportKey = key;
     try {
-      exportResult = await exportBundle(event.id, event.name, mode, dest);
+      exportResult = await exportBundle(src, name, mode, dest);
       toast = `Exported ${exportResult.exported} photos for ${mode === "drive" ? "Drive" : "WhatsApp"}`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -197,12 +214,13 @@
     }
   }
 
-  async function makeHighlight(event: EventRow) {
-    highlightBusy = event.id;
+  async function makeHighlight(src: { eventId?: number; albumId?: number }, name: string) {
+    const key = sourceKey(src);
+    highlightBusy = key;
     highlightResult = null;
-    highlightEventId = event.id;
+    highlightKey = key;
     try {
-      highlightResult = await exportHighlight(event.id, event.name.replace(/\s+/g, "-").toLowerCase());
+      highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase());
       toast = "Highlight video exported";
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -237,6 +255,121 @@
       error = String(e).replace(/^Error: /, "");
     } finally {
       peopleLoading = false;
+    }
+  }
+
+  // MARK: - Albums
+
+  let albums = $state<AlbumRow[]>([]);
+  let albumsLoading = $state(false);
+  let openAlbumId = $state<number | null>(null);
+  let albumMembers = $state<Record<number, EventAssetRow[]>>({});
+  let picker = $state<{ albumId: number; name: string } | null>(null);
+  let pickerAssets = $state<AssetRow[]>([]);
+  let pickerSelected = $state<Set<number>>(new Set());
+
+  async function loadAlbums() {
+    albumsLoading = true;
+    try {
+      albums = await albumsList();
+      if (openAlbumId !== null && !albums.some((a) => a.id === openAlbumId)) openAlbumId = null;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      albumsLoading = false;
+    }
+  }
+
+  async function loadAlbumMembers(albumId: number) {
+    try {
+      const rows = await albumAssets(albumId);
+      albumMembers = { ...albumMembers, [albumId]: rows };
+      void loadThumbs(rows.map((m) => ({ path: m.path } as AssetRow)));
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function toggleAlbum(album: AlbumRow) {
+    openAlbumId = openAlbumId === album.id ? null : album.id;
+    if (openAlbumId !== null) void loadAlbumMembers(album.id);
+  }
+
+  async function newAlbum() {
+    const name = window.prompt("Album name");
+    if (name === null || name.trim() === "") return;
+    try {
+      await albumCreate(name.trim());
+      await loadAlbums();
+      toast = `Created “${name.trim()}”`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function renameAlbum(album: AlbumRow) {
+    const name = window.prompt("Album name", album.name);
+    if (name === null || name.trim() === "" || name === album.name) return;
+    try {
+      await albumRename(album.id, name.trim());
+      await loadAlbums();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function deleteAlbum(album: AlbumRow) {
+    if (!window.confirm(`Delete album “${album.name}”? Photos stay in the library.`)) return;
+    try {
+      await albumDelete(album.id);
+      await loadAlbums();
+      toast = "Album deleted";
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function openPicker(album: AlbumRow) {
+    picker = { albumId: album.id, name: album.name };
+    pickerSelected = new Set();
+    libraryList({ limit: 500 })
+      .then(async (rows) => {
+        pickerAssets = rows;
+        await loadThumbs(rows);
+      })
+      .catch((e) => (error = String(e).replace(/^Error: /, "")));
+  }
+
+  function togglePicker(assetId: number) {
+    const next = new Set(pickerSelected);
+    if (next.has(assetId)) next.delete(assetId);
+    else next.add(assetId);
+    pickerSelected = next;
+  }
+
+  async function addPicked() {
+    const target = picker;
+    if (!target) return;
+    const ids = [...pickerSelected];
+    picker = null;
+    if (ids.length === 0) return;
+    try {
+      const r = await albumAdd(target.albumId, ids);
+      await loadAlbums();
+      if (openAlbumId === target.albumId) void loadAlbumMembers(target.albumId);
+      toast = `Added ${r.added} photo${r.added === 1 ? "" : "s"} to “${target.name}”`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function removeFromAlbum(albumId: number, assetId: number) {
+    try {
+      await albumRemove(albumId, assetId);
+      await loadAlbums();
+      void loadAlbumMembers(albumId);
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
     }
   }
 
@@ -459,6 +592,9 @@
     </button>
     <button class="tab" class:on={tab === "events"} onclick={() => { tab = "events"; void loadEvents(); }}>
       Events{#if events.length > 0}&nbsp;{events.length}{/if}
+    </button>
+    <button class="tab" class:on={tab === "albums"} onclick={() => { tab = "albums"; void loadAlbums(); }}>
+      Albums{#if albums.length > 0}&nbsp;{albums.length}{/if}
     </button>
   </nav>
 
@@ -760,24 +896,24 @@
                 : "no location"}
             </p>
             <div class="row-actions">
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport(event, "drive")}>
-                {exportBusy === `${event.id}-drive` ? "Copying…" : "For Google Drive"}
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>
+                {exportBusy === `e${event.id}-drive` ? "Copying…" : "For Google Drive"}
               </button>
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport(event, "whatsapp")}>
-                {exportBusy === `${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "whatsapp")}>
+                {exportBusy === `e${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
               </button>
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight(event)}>
-                {highlightBusy === event.id ? "Exporting…" : "Highlight video"}
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight({ eventId: event.id }, event.name)}>
+                {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
               </button>
             </div>
-            {#if highlightResult && highlightEventId === event.id}
+            {#if highlightResult && highlightKey === `e${event.id}`}
               <p class="hint">
                 Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
                 {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} video{highlightResult.videosSkipped === 1 ? "" : "s"} skipped{/if}
                 <br />{highlightResult.output}
               </p>
             {/if}
-            {#if exportResult && exportEventId === event.id}
+            {#if exportResult && exportKey === `e${event.id}`}
               <p class="hint">
                 Exported {exportResult.exported} to {exportResult.dir}
                 {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
@@ -787,6 +923,84 @@
         {/each}
       {:else if !eventsLoading}
         <p class="hint">No events yet — cluster the library by time and place.</p>
+      {/if}
+    </section>
+  {/if}
+
+  {#if tab === "albums"}
+    <section class="card" aria-labelledby="albums-heading">
+      <div class="card-head">
+        <h2 id="albums-heading">Albums</h2>
+        <button onclick={newAlbum}>New album</button>
+      </div>
+
+      {#if albums.length}
+        {#each albums as album (album.id)}
+          <article class="group album-card">
+            <header>
+              <button class="ename" title="Click to rename" onclick={() => void renameAlbum(album)}>
+                {#if album.coverPath && thumbs[album.coverPath]}
+                  <img src={thumbs[album.coverPath]} alt="" loading="lazy" />
+                {/if}
+                {album.name}
+              </button>
+              <span class="waste">{album.assetCount} photo{album.assetCount === 1 ? "" : "s"}</span>
+            </header>
+            <div class="row-actions">
+              <button class="tiny" onclick={() => toggleAlbum(album)}>
+                {openAlbumId === album.id ? "Hide photos" : "Show photos"}
+              </button>
+              <button class="tiny" onclick={() => openPicker(album)}>Add photos</button>
+              <button class="tiny" disabled={album.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ albumId: album.id }, album.name, "drive")}>
+                {exportBusy === `a${album.id}-drive` ? "Copying…" : "For Google Drive"}
+              </button>
+              <button class="tiny" disabled={album.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ albumId: album.id }, album.name, "whatsapp")}>
+                {exportBusy === `a${album.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
+              </button>
+              <button class="tiny" disabled={album.assetCount === 0 || highlightBusy !== null} onclick={() => void makeHighlight({ albumId: album.id }, album.name)}>
+                {highlightBusy === `a${album.id}` ? "Exporting…" : "Highlight video"}
+              </button>
+              <button class="tiny danger" onclick={() => void deleteAlbum(album)}>Delete album</button>
+            </div>
+            {#if highlightResult && highlightKey === `a${album.id}`}
+              <p class="hint">
+                Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
+                <br />{highlightResult.output}
+              </p>
+            {/if}
+            {#if exportResult && exportKey?.startsWith(`a${album.id}-`)}
+              <p class="hint">
+                Exported {exportResult.exported} to {exportResult.dir}
+                {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
+              </p>
+            {/if}
+            {#if openAlbumId === album.id && albumMembers[album.id]?.length}
+              <div class="members">
+                {#each albumMembers[album.id] as member (member.id)}
+                  <figure>
+                    <div class="thumb small">
+                      {#if thumbs[member.path]}
+                        <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                      {:else}
+                        <span class="placeholder">{member.kind === "video" ? "VID" : "IMG"}</span>
+                      {/if}
+                    </div>
+                    <figcaption>
+                      <span class="name" title={member.path}>{member.name}</span>
+                      <button class="tiny danger" onclick={() => void removeFromAlbum(album.id, member.id)}>
+                        Remove
+                      </button>
+                    </figcaption>
+                  </figure>
+                {/each}
+              </div>
+            {:else if openAlbumId === album.id}
+              <p class="hint">No photos in this album yet — use “Add photos”.</p>
+            {/if}
+          </article>
+        {/each}
+      {:else if !albumsLoading}
+        <p class="hint">No albums yet — create one and hand-pick the photos for an audience.</p>
       {/if}
     </section>
   {/if}
@@ -839,6 +1053,40 @@
           <button class="ghost" onclick={() => (confirm = null)}>Cancel</button>
           <button class="danger-solid" onclick={() => void applyDeletion()}>
             {deleteMode === "trash" ? "Move to Trash" : "Flag"}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if picker}
+    <div class="scrim" role="dialog" aria-labelledby="picker-heading">
+      <div class="dialog wide">
+        <h3 id="picker-heading">Add photos to “{picker.name}”</h3>
+        <div class="members picker-grid">
+          {#each pickerAssets as asset (asset.id)}
+            <figure class:keeper={pickerSelected.has(asset.id)}>
+              <button
+                type="button"
+                class="thumb small clickable"
+                aria-pressed={pickerSelected.has(asset.id)}
+                title={asset.name}
+                onclick={() => togglePicker(asset.id)}
+              >
+                {#if thumbs[asset.path]}
+                  <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
+                {:else}
+                  <span class="placeholder">{asset.ext.toUpperCase()}</span>
+                {/if}
+              </button>
+              <figcaption><span class="name" title={asset.name}>{asset.name}</span></figcaption>
+            </figure>
+          {/each}
+        </div>
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (picker = null)}>Cancel</button>
+          <button disabled={pickerSelected.size === 0} onclick={() => void addPicked()}>
+            Add {pickerSelected.size} photo{pickerSelected.size === 1 ? "" : "s"}
           </button>
         </div>
       </div>
@@ -1163,6 +1411,30 @@
   .dialog h3 {
     margin: 0 0 0.5rem;
     font-size: 0.95rem;
+  }
+  .dialog.wide {
+    width: min(52rem, 96vw);
+    max-height: 82vh;
+    overflow: auto;
+  }
+  .picker-grid {
+    max-height: 58vh;
+    overflow: auto;
+    padding-right: 0.2rem;
+  }
+  .thumb.clickable {
+    cursor: pointer;
+  }
+  .thumb.clickable:hover {
+    outline: 2px solid #2f6bff;
+  }
+  .ename img {
+    width: 1.6rem;
+    height: 1.6rem;
+    object-fit: cover;
+    border-radius: 5px;
+    vertical-align: -0.45rem;
+    margin-right: 0.4rem;
   }
   .dialog-actions {
     display: flex;

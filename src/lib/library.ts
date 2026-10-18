@@ -263,6 +263,71 @@ export function renameEvent(eventId: number, name: string): Promise<void> {
   return invoke("rename_event", { event_id: eventId, name });
 }
 
+// MARK: - Albums (user-curated lists, usable as export sources)
+
+export type AlbumRow = {
+  id: number;
+  name: string;
+  createdAt: number;
+  assetCount: number;
+  coverPath: string | null;
+};
+
+export function albumsList(): Promise<AlbumRow[]> {
+  return invoke("albums_list");
+}
+
+export function albumCreate(name: string): Promise<number> {
+  return invoke("album_create", { name });
+}
+
+export function albumRename(albumId: number, name: string): Promise<void> {
+  return invoke("album_rename", { albumId, name });
+}
+
+export function albumDelete(albumId: number): Promise<{ removed: number }> {
+  return invoke("album_delete", { albumId });
+}
+
+export function albumAssets(albumId: number): Promise<EventAssetRow[]> {
+  return invoke("album_assets", { albumId });
+}
+
+export function albumAdd(albumId: number, assetIds: number[]): Promise<{ added: number }> {
+  return invoke("album_add", { albumId, assetIds });
+}
+
+export function albumRemove(albumId: number, assetId: number): Promise<void> {
+  return invoke("album_remove", { albumId, assetId });
+}
+
+// Highlight / bundle exports accept either source; pass exactly one id.
+export function exportBundle(
+  source: { eventId?: number; albumId?: number },
+  eventName: string,
+  mode: "drive" | "whatsapp",
+  destDir: string,
+): Promise<ExportSummary> {
+  return invoke("export_bundle", {
+    eventId: source.eventId ?? null,
+    albumId: source.albumId ?? null,
+    eventName,
+    mode,
+    destDir
+  });
+}
+
+export function exportHighlight(
+  source: { eventId?: number; albumId?: number },
+  name?: string,
+): Promise<HighlightResult> {
+  return invoke("export_highlight", {
+    eventId: source.eventId ?? null,
+    albumId: source.albumId ?? null,
+    name
+  });
+}
+
 export type HighlightResult = {
   output: string;
   bytes: number;
@@ -277,22 +342,6 @@ export type ExportSummary = {
   skipped: number;
   bytes: number;
 };
-
-export function exportBundle(
-  eventId: number,
-  eventName: string,
-  mode: "drive" | "whatsapp",
-  destDir: string,
-): Promise<ExportSummary> {
-  return invoke("export_bundle", { eventId, eventName, mode, destDir });
-}
-
-export function exportHighlight(
-  eventId: number,
-  name?: string,
-): Promise<HighlightResult> {
-  return invoke("export_highlight", { eventId, name });
-}
 
 export function onHashProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
   return listen<CleanupProgress>("hash-progress", (e) => cb(e.payload));

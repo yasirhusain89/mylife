@@ -12,6 +12,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/003_cleanup.sql")),
     (4, include_str!("../migrations/004_faces.sql")),
     (5, include_str!("../migrations/005_events.sql")),
+    (6, include_str!("../migrations/006_albums.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -640,6 +641,169 @@ pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), 
     Ok(())
 }
 
+// MARK: - Albums (user-curated lists, the "audience groups" for export)
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumRow {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub asset_count: i64,
+    // Newest-added image, so the UI can show a cover thumbnail.
+    pub cover_path: Option<String>,
+}
+
+pub fn album_create(conn: &Connection, name: &str) -> Result<i64, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("album name cannot be empty".into());
+    }
+    conn.execute(
+        "INSERT INTO albums (name, created_at) VALUES (?1, ?2)",
+        params![name, now()],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE") {
+            format!("an album named \u{201c}{name}\u{201d} already exists")
+        } else {
+            format!("create album: {e}")
+        }
+    })?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn album_rename(conn: &Connection, album_id: i64, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("album name cannot be empty".into());
+    }
+    let n = conn
+        .execute("UPDATE albums SET name = ?1 WHERE id = ?2", params![name, album_id])
+        .map_err(|e| format!("rename album: {e}"))?;
+    if n == 0 {
+        return Err("no such album".into());
+    }
+    Ok(())
+}
+
+/// Deletes the album and its membership rows (assets themselves are untouched).
+/// Returns the number of membership links removed.
+pub fn album_delete(conn: &Connection, album_id: i64) -> Result<i64, String> {
+    let removed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM album_assets WHERE album_id = ?1",
+            params![album_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("album count: {e}"))?;
+    conn.execute("DELETE FROM albums WHERE id = ?1", params![album_id])
+        .map_err(|e| format!("delete album: {e}"))?;
+    Ok(removed)
+}
+
+pub fn albums_list(conn: &Connection) -> Result<Vec<AlbumRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT al.id, al.name, al.created_at,
+                    COUNT(aa.asset_id),
+                    (SELECT a.path FROM album_assets aa2 JOIN assets a ON a.id = aa2.asset_id
+                     WHERE aa2.album_id = al.id AND a.kind = 'image' AND a.missing = 0
+                     ORDER BY aa2.added_at DESC LIMIT 1)
+             FROM albums al
+             LEFT JOIN album_assets aa ON aa.album_id = al.id
+             GROUP BY al.id ORDER BY al.name",
+        )
+        .map_err(|e| format!("prepare albums: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AlbumRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                created_at: r.get(2)?,
+                asset_count: r.get(3)?,
+                cover_path: r.get(4)?,
+            })
+        })
+        .map_err(|e| format!("query albums: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("album row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Adds assets to an album; existing memberships are left alone.
+/// Returns how many rows were actually added.
+pub fn album_add_assets(
+    conn: &Connection,
+    album_id: i64,
+    asset_ids: &[i64],
+) -> Result<i64, String> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM albums WHERE id = ?1",
+            params![album_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("album lookup: {e}"))?;
+    if exists == 0 {
+        return Err("no such album".into());
+    }
+    let mut added = 0i64;
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|e| format!("prepare album add: {e}"))?;
+    for id in asset_ids {
+        added += stmt
+            .execute(params![album_id, id, now()])
+            .map_err(|e| format!("album add: {e}"))? as i64;
+    }
+    Ok(added)
+}
+
+/// Removes one asset from an album (but never from the library).
+pub fn album_remove_asset(
+    conn: &Connection,
+    album_id: i64,
+    asset_id: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM album_assets WHERE album_id = ?1 AND asset_id = ?2",
+        params![album_id, asset_id],
+    )
+    .map_err(|e| format!("album remove: {e}"))?;
+    Ok(())
+}
+
+pub fn album_assets(conn: &Connection, album_id: i64) -> Result<Vec<EventAssetRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.path, a.name, a.kind FROM assets a
+             JOIN album_assets aa ON aa.asset_id = a.id
+             WHERE aa.album_id = ?1
+             ORDER BY aa.added_at DESC, a.name",
+        )
+        .map_err(|e| format!("prepare album assets: {e}"))?;
+    let rows = stmt
+        .query_map(params![album_id], |r| {
+            Ok(EventAssetRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query album assets: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("album asset row: {e}"))?);
+    }
+    Ok(out)
+}
+
 // MARK: - Queries
 
 // MARK: - Metadata enrichment
@@ -1128,10 +1292,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5, "user_version tracks the highest applied migration");
+        assert_eq!(v, 6, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -1245,6 +1409,54 @@ mod tests {
 
         let stats = faces_count(&conn).unwrap();
         assert_eq!(stats, 1);
+    }
+
+    #[test]
+    fn album_crud_and_membership() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let a = asset("/a.jpg", 1, 1.0);
+        upsert_asset(&conn, &a, scan).unwrap();
+        let b = asset("/b.jpg", 1, 2.0);
+        upsert_asset(&conn, &b, scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let aid = id_for("/a.jpg");
+        let bid = id_for("/b.jpg");
+
+        let id = album_create(&conn, "For Drive").unwrap();
+        assert!(album_create(&conn, "For Drive").is_err(), "names are unique");
+
+        // Add both assets; re-adding the first must not duplicate it.
+        assert_eq!(album_add_assets(&conn, id, &[aid, bid, aid]).unwrap(), 2);
+        let list = albums_list(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "For Drive");
+        assert_eq!(list[0].asset_count, 2);
+
+        let members = album_assets(&conn, id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|m| m.id == aid || m.id == bid));
+
+        // Remove one; album count drops, library untouched.
+        album_remove_asset(&conn, id, bid).unwrap();
+        assert_eq!(albums_list(&conn).unwrap()[0].asset_count, 1);
+
+        // Renaming keeps the row.
+        album_rename(&conn, id, "Family").unwrap();
+        assert_eq!(albums_list(&conn).unwrap()[0].name, "Family");
+
+        // Deleting drops membership rows only.
+        let removed = album_delete(&conn, id).unwrap();
+        assert_eq!(removed, 1);
+        assert!(albums_list(&conn).unwrap().is_empty());
+        let still_there: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_there, 2, "album delete never touches library rows");
     }
 
     #[test]
