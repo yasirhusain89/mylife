@@ -318,6 +318,9 @@ func hashAsset(path: String) throws -> [String: Any] {
 /// Detects faces (bounding boxes + confidence) — no descriptors, cheap, works on any image.
 func detectFaces(path: String) throws -> [String: Any] {
     let url = URL(fileURLWithPath: path)
+    guard FileManager.default.fileExists(atPath: path) else {
+        throw EngineError(message: "file not found (volume unmounted?): \(path)")
+    }
     guard
         let src = CGImageSourceCreateWithURL(
             url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
@@ -352,6 +355,7 @@ func detectFaces(path: String) throws -> [String: Any] {
 func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
     struct Face { var path: String; var box: CGRect; var confidence: Double; var desc: FeaturePrintObservation }
     var entries: [Face] = []
+    var unreadable = 0
 
     for path in paths {
         let url = URL(fileURLWithPath: path)
@@ -359,7 +363,10 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
             let src = CGImageSourceCreateWithURL(
                 url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
             let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
-        else { continue }
+        else {
+            unreadable += 1
+            continue
+        }
 
         let rectRequest = VNDetectFaceRectanglesRequest()
         let rectHandler = VNImageRequestHandler(cgImage: cg, options: [:])
@@ -419,6 +426,7 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
         "clusters": groups.count,
         "groups": groups,
         "threshold": threshold,
+        "unreadable": unreadable,
     ]
 }
 

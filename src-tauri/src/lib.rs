@@ -464,6 +464,27 @@ fn duplicates_keep(
     db::duplicate_groups(&conn)
 }
 
+/// Existence sweep over the whole index. Flags files that vanished (ejected
+/// volume) and restores flags for files that came back.
+#[tauri::command]
+async fn verify_library(app: tauri::AppHandle) -> Result<VerifyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let (missing, restored) = db::verify_missing(&conn)?;
+        Ok(VerifyResult { missing, restored })
+    })
+    .await
+    .map_err(|e| format!("verify task join failed: {e}"))?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyResult {
+    missing: i64,
+    restored: i64,
+}
+
 // MARK: - People clustering
 
 /// Runs the engine's face detector + feature-print clusterer over every
@@ -495,14 +516,29 @@ async fn cluster_faces(
             }
         };
         if all_paths.is_empty() {
-            return Ok(ClusterSummary { images: 0, faces: 0, clusters: 0 });
+            return Ok(ClusterSummary { images: 0, faces: 0, clusters: 0, missing: 0 });
+        }
+
+        // Files on an ejected volume cannot be read; say so instead of
+        // reporting a silent zero.
+        let readable: Vec<String> = all_paths
+            .iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .cloned()
+            .collect();
+        let missing = (all_paths.len() - readable.len()) as i64;
+        if readable.is_empty() {
+            return Err(format!(
+                "None of the {} images are readable — the volume they live on may be ejected. Reconnect it, then press \u{201c}Check files\u{201d} in the Library tab.",
+                all_paths.len()
+            ));
         }
 
         let mut total_faces = 0i64;
         let mut total_clusters = 0i64;
         let mut processed = 0i64;
 
-        for chunk in all_paths.chunks(200) {
+        for chunk in readable.chunks(200) {
             let reply = engine::call_with_events(
                 &engine_state,
                 "cluster_faces",
@@ -555,16 +591,17 @@ async fn cluster_faces(
                 "cluster-progress",
                 json!({
                     "processed": processed,
-                    "total": all_paths.len() as i64,
+                    "total": readable.len() as i64,
                     "faces": total_faces,
                 }),
             );
         }
 
         Ok(ClusterSummary {
-            images: all_paths.len() as i64,
+            images: readable.len() as i64,
             faces: total_faces,
             clusters: total_clusters,
+            missing,
         })
     })
     .await
@@ -598,6 +635,7 @@ struct ClusterSummary {
     images: i64,
     faces: i64,
     clusters: i64,
+    missing: i64,
 }
 
 // MARK: - Events
@@ -973,6 +1011,7 @@ pub fn run() {
             cleanup_stats_cmd,
             trash_assets,
             cluster_faces,
+            verify_library,
             clusters_list,
             faces_in_cluster,
             faces_count,

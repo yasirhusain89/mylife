@@ -328,6 +328,60 @@ pub fn faces_count(conn: &Connection) -> Result<i64, String> {
 // MARK: - Queries
 
 
+
+/// Existence check: flags rows whose file is gone (ejected volume, deleted
+/// file) and un-flags rows that came back. Never deletes rows — remounting the
+/// volume and re-running this restores everything.
+pub fn verify_missing(conn: &Connection) -> Result<(i64, i64), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("verify tx: {e}"))?;
+    // Row-by-row existence check (stat per row); batched in one transaction.
+    let paths: Vec<(i64, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, path FROM assets WHERE missing = 0")
+            .map_err(|e| format!("verify select: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("verify query: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("verify row: {e}"))?);
+        }
+        v
+    };
+    let mut missing = 0i64;
+    for (id, path) in &paths {
+        if !std::path::Path::new(path).exists() {
+            tx.execute("UPDATE assets SET missing = 1 WHERE id = ?1", params![id])
+                .map_err(|e| format!("verify update: {e}"))?;
+            missing += 1;
+        }
+    }
+    // Files that returned (e.g. volume remounted) clear the flag.
+    let back: Vec<(i64, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, path FROM assets WHERE missing = 1")
+            .map_err(|e| format!("verify select2: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("verify query2: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("verify row2: {e}"))?);
+        }
+        v
+    };
+    let mut restored = 0i64;
+    for (id, path) in &back {
+        if std::path::Path::new(path).exists() {
+            tx.execute("UPDATE assets SET missing = 0 WHERE id = ?1", params![id])
+                .map_err(|e| format!("verify restore: {e}"))?;
+            restored += 1;
+        }
+    }
+    tx.commit().map_err(|e| format!("verify commit: {e}"))?;
+    Ok((missing, restored))
+}
+
 // MARK: - Events
 
 #[derive(Serialize)]
@@ -1252,5 +1306,56 @@ mod tests {
         let mut bad = asset("/x.jpg", 1, 1.0);
         bad.kind = "other".into();
         assert!(upsert_asset(&conn, &bad, scan).is_err(), "kind must be image or video");
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    #[test]
+    fn verify_flags_missing_files_and_restores_them() {
+        let dir = std::env::temp_dir().join("ff-verify-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, dir.to_str().unwrap(), true).unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            upsert_asset(
+                &conn,
+                &Value2 {
+                    path: dir.join(name).to_string_lossy().to_string(),
+                    name: name.to_string(),
+                    ext: "jpg".into(),
+                    kind: "image".into(),
+                    mime: None,
+                    size_bytes: 1,
+                    modified: 1.0,
+                },
+                scan,
+            )
+            .unwrap();
+        }
+
+        // Everything present: nothing changes.
+        assert_eq!(verify_missing(&conn).unwrap(), (0, 0));
+
+        // "Eject" one file: flagged missing and hidden from library queries.
+        std::fs::remove_file(dir.join("b.jpg")).unwrap();
+        assert_eq!(verify_missing(&conn).unwrap(), (1, 0));
+        assert_eq!(library(&conn, None, false, 0, 10).unwrap().len(), 2);
+        let still_indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_indexed, 3, "missing files are flagged, never deleted");
+
+        // "Remount": the flag clears and the file reappears.
+        std::fs::write(dir.join("b.jpg"), b"x").unwrap();
+        assert_eq!(verify_missing(&conn).unwrap(), (0, 1));
+        assert_eq!(library(&conn, None, false, 0, 10).unwrap().len(), 3);
     }
 }

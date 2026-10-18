@@ -32,6 +32,7 @@
     onImportProgress,
     onClusterProgress,
     runFaceClustering,
+    verifyLibrary,
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
@@ -212,6 +213,19 @@
 
   let peopleFaces = $state<Record<number, FaceRow[]>>({});
   let clusterState = $state<{ processed: number; total: number } | null>(null);
+
+  async function runVerify() {
+    try {
+      const r = await verifyLibrary();
+      await refresh();
+      toast =
+        r.missing === 0 && r.restored === 0
+          ? "All indexed files are present"
+          : `${r.missing} missing · ${r.restored} restored`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
 
   async function loadPeople() {
     peopleLoading = true;
@@ -614,6 +628,18 @@
         <span class="total">{fmtBytes(stats.bytes)} indexed</span>
       </div>
 
+      {#if stats.missing > 0}
+        <p class="error">
+          {stats.missing} file{stats.missing === 1 ? "" : "s"} unreachable (ejected volume or deleted) —
+          <button class="tiny" onclick={() => void runVerify()}>Check files</button>
+        </p>
+      {:else}
+        <p class="hint">
+          <button class="tiny" onclick={() => void runVerify()}>Check files</button>
+          <span> verify that indexed files still exist on disk</span>
+        </p>
+      {/if}
+
       {#if (stats.photos + stats.videos) > 0}
         <div class="enrich">
           <button class="ghost" onclick={() => void runEnrich()} disabled={enriching}>
@@ -668,6 +694,12 @@
       </div>
       {#if clusterState}
         <p class="hint">{clusterState.processed}/{clusterState.total} images scanned…</p>
+      {/if}
+      {#if stats && stats.missing > 0}
+        <p class="error">
+          {stats.missing} indexed file{stats.missing === 1 ? " is" : "s are"} unreadable —
+          the volume may be ejected. Reconnect it, then press “Check files” in the Library tab.
+        </p>
       {/if}
       {#if people.length}
         {#each people as cluster (cluster.id)}

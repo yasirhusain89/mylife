@@ -195,8 +195,13 @@ export function runFaceClustering(): Promise<{
   images: number;
   faces: number;
   clusters: number;
+  missing: number;
 }> {
   return invoke("cluster_faces", {});
+}
+
+export function verifyLibrary(): Promise<{ missing: number; restored: number }> {
+  return invoke("verify_library");
 }
 
 export function onClusterProgress(cb: (p: ClusterProgress) => void): Promise<() => void> {
