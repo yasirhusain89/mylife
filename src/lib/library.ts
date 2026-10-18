@@ -185,6 +185,24 @@ export function faceThumb(
   });
 }
 
+export type ClusterProgress = {
+  processed: number;
+  total: number;
+  faces: number;
+};
+
+export function runFaceClustering(): Promise<{
+  images: number;
+  faces: number;
+  clusters: number;
+}> {
+  return invoke("cluster_faces", {});
+}
+
+export function onClusterProgress(cb: (p: ClusterProgress) => void): Promise<() => void> {
+  return listen<ClusterProgress>("cluster-progress", (e) => cb(e.payload));
+}
+
 export function clustersList(): Promise<FaceClusterRow[]> {
   return invoke("clusters_list");
 }

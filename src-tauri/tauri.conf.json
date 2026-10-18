@@ -13,8 +13,10 @@
     "windows": [
       {
         "title": "fotoflow",
-        "width": 800,
-        "height": 600
+        "width": 1280,
+        "height": 860,
+        "minWidth": 520,
+        "minHeight": 400
       }
     ],
     "security": {

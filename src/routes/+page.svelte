@@ -30,6 +30,8 @@
     libraryStats,
     onImportError,
     onImportProgress,
+    onClusterProgress,
+    runFaceClustering,
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
@@ -176,12 +178,14 @@
 
   let exportBusy = $state<string | null>(null);
   let exportResult = $state<ExportSummary | null>(null);
+  let exportEventId = $state<number | null>(null);
 
   async function runExport(event: EventRow, mode: "drive" | "whatsapp") {
     const dest = await open({ directory: true, multiple: false, title: "Choose export folder" });
     if (typeof dest !== "string" || dest === "") return;
     exportBusy = `${event.id}-${mode}`;
     exportResult = null;
+    exportEventId = event.id;
     try {
       exportResult = await exportBundle(event.id, event.name, mode, dest);
       toast = `Exported ${exportResult.exported} photos for ${mode === "drive" ? "Drive" : "WhatsApp"}`;
@@ -206,15 +210,96 @@
     }
   }
 
+  let peopleFaces = $state<Record<number, FaceRow[]>>({});
+  let clusterState = $state<{ processed: number; total: number } | null>(null);
+
   async function loadPeople() {
     peopleLoading = true;
     people = [];
     try {
       people = await clustersList();
+      void loadClusterFaces();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       peopleLoading = false;
+    }
+  }
+
+  /// Runs the engine's face detector + clusterer over the whole library.
+  async function findPeople() {
+    peopleLoading = true;
+    clusterState = { processed: 0, total: 0 };
+    try {
+      await runFaceClustering();
+      people = await clustersList();
+      void loadClusterFaces();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      peopleLoading = false;
+      clusterState = null;
+    }
+  }
+
+  async function loadClusterFaces() {
+    const next: Record<number, FaceRow[]> = {};
+    for (const c of people) {
+      try {
+        next[c.id] = (await facesInCluster(c.id)).slice(0, 8);
+      } catch {
+        /* cluster listing is best-effort */
+      }
+    }
+    peopleFaces = next;
+    for (const faces of Object.values(next)) {
+      for (const f of faces) void loadFaceThumb(f);
+    }
+  }
+
+  async function loadFaceThumb(f: FaceRow) {
+    const key = `face:${f.id}`;
+    if (thumbs[key]) return;
+    try {
+      const { image } = await faceThumb(f.path, f.x, f.y, f.width, f.height, 160);
+      if (image) thumbs[key] = `data:image/jpeg;base64,${image}`;
+    } catch {
+      /* unreadable face crop */
+    }
+  }
+
+  async function loadEvents() {
+    eventsLoading = true;
+    try {
+      events = await eventsList();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      eventsLoading = false;
+    }
+  }
+
+  async function runClusterEvents() {
+    eventsLoading = true;
+    try {
+      await clusterEvents(4, 500);
+      events = await eventsList();
+      toast = `Grouped into ${events.length} event${events.length === 1 ? "" : "s"}`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      eventsLoading = false;
+    }
+  }
+
+  async function doRename(event: EventRow) {
+    const name = window.prompt("Event name", event.name);
+    if (name === null || name.trim() === "" || name === event.name) return;
+    try {
+      await renameEvent(event.id, name.trim());
+      events = await eventsList();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
     }
   }
 
@@ -330,6 +415,11 @@
       }),
       onQualityProgress((p) => {
         if (scoring) qualityState = p;
+      }),
+      onClusterProgress((p) => {
+        if (peopleLoading && clusterState) {
+          clusterState = { processed: p.processed, total: p.total };
+        }
       })
     ];
     void refresh();
@@ -346,14 +436,14 @@
   </header>
 
   <nav class="tabs">
-    <button class="tab" class:on={tab === "library"} onclick={() => (tab = "library")}>Library</button>
-    <button class="tab" class:on={tab === "cleanup"} onclick={() => (tab = "cleanup")}>
+    <button class="tab" class:on={tab === "library"} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
+    <button class="tab" class:on={tab === "cleanup"} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
     </button>
-    <button class="tab" class:on={tab === "people"} onclick={() => (tab = "people")}>
+    <button class="tab" class:on={tab === "people"} onclick={() => { tab = "people"; void loadPeople(); }}>
       People{#if people.length > 0}&nbsp;{people.length}{/if}
     </button>
-    <button class="tab" class:on={tab === "events"} onclick={() => (tab = "events")}>
+    <button class="tab" class:on={tab === "events"} onclick={() => { tab = "events"; void loadEvents(); }}>
       Events{#if events.length > 0}&nbsp;{events.length}{/if}
     </button>
   </nav>
@@ -467,7 +557,7 @@
         </div>
       {/if}
     </section>
-  {:else}
+  {:else if tab === "library"}
   <section class="card" aria-labelledby="library-heading">
     <div class="card-head">
       <h2 id="library-heading">Library</h2>
@@ -572,18 +662,99 @@
     <section class="card" aria-labelledby="people-heading">
       <div class="card-head">
         <h2 id="people-heading">People</h2>
-        <button onclick={loadPeople} disabled={peopleLoading}>
+        <button onclick={findPeople} disabled={peopleLoading}>
           {peopleLoading ? "Scanning faces…" : "Find people in library"}
         </button>
       </div>
+      {#if clusterState}
+        <p class="hint">{clusterState.processed}/{clusterState.total} images scanned…</p>
+      {/if}
       {#if people.length}
-        <div class="stats">
-          {#each people as cluster (cluster.id)}
-            <span class="chip static">Cluster {cluster.id} · {cluster.faceCount} face{cluster.faceCount === 1 ? "" : "s"}</span>
-          {/each}
-        </div>
+        {#each people as cluster (cluster.id)}
+          <article class="group">
+            <header>
+              <span>Cluster {cluster.id}</span>
+              <span class="waste">{cluster.faceCount} face{cluster.faceCount === 1 ? "" : "s"}</span>
+            </header>
+            {#if peopleFaces[cluster.id]?.length}
+              <div class="members">
+                {#each peopleFaces[cluster.id] as face (face.id)}
+                  <figure>
+                    <div class="thumb small">
+                      {#if thumbs[`face:${face.id}`]}
+                        <img src={thumbs[`face:${face.id}`]} alt="detected face" loading="lazy" />
+                      {:else}
+                        <span class="placeholder">…</span>
+                      {/if}
+                    </div>
+                    <figcaption>
+                      <span class="name" title={face.path}>{face.path.split("/").pop()}</span>
+                    </figcaption>
+                  </figure>
+                {/each}
+              </div>
+            {/if}
+          </article>
+        {/each}
       {:else if !peopleLoading}
         <p class="hint">No people clusters yet — scan the library to detect faces.</p>
+      {/if}
+    </section>
+  {/if}
+
+  {#if tab === "events"}
+    <section class="card" aria-labelledby="events-heading">
+      <div class="card-head">
+        <h2 id="events-heading">Events</h2>
+        <button onclick={runClusterEvents} disabled={eventsLoading}>
+          {eventsLoading ? "Clustering…" : "Cluster events by time & place"}
+        </button>
+      </div>
+      {#if events.length}
+        {#each events as event (event.id)}
+          <article class="group event-card">
+            <header>
+              <button class="ename" title="Click to rename" onclick={() => void doRename(event)}>{event.name}</button>
+              <span class="waste">
+                {new Date(event.startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                – {new Date(event.endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+              </span>
+            </header>
+            <p class="meta">
+              {event.assetCount} asset{event.assetCount === 1 ? "" : "s"} ·
+              {event.faceCount} face{event.faceCount === 1 ? "" : "s"} ·
+              {event.latitude !== null && event.longitude !== null
+                ? `${event.latitude.toFixed(4)}, ${event.longitude.toFixed(4)}`
+                : "no location"}
+            </p>
+            <div class="row-actions">
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport(event, "drive")}>
+                {exportBusy === `${event.id}-drive` ? "Copying…" : "For Google Drive"}
+              </button>
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport(event, "whatsapp")}>
+                {exportBusy === `${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
+              </button>
+              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight(event)}>
+                {highlightBusy === event.id ? "Exporting…" : "Highlight video"}
+              </button>
+            </div>
+            {#if highlightResult && highlightEventId === event.id}
+              <p class="hint">
+                Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
+                {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} video{highlightResult.videosSkipped === 1 ? "" : "s"} skipped{/if}
+                <br />{highlightResult.output}
+              </p>
+            {/if}
+            {#if exportResult && exportEventId === event.id}
+              <p class="hint">
+                Exported {exportResult.exported} to {exportResult.dir}
+                {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
+              </p>
+            {/if}
+          </article>
+        {/each}
+      {:else if !eventsLoading}
+        <p class="hint">No events yet — cluster the library by time and place.</p>
       {/if}
     </section>
   {/if}
@@ -656,9 +827,10 @@
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   }
   .container {
-    max-width: 42rem;
+    max-width: 120rem;
     width: 100%;
-    padding: 2rem 1rem 3rem;
+    margin: 0 auto;
+    padding: 1.5rem clamp(1rem, 4vw, 3rem) 3rem;
   }
   header h1 {
     font-size: 2rem;
@@ -680,6 +852,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
     margin-bottom: 0.75rem;
   }
   h2 {
@@ -803,6 +977,7 @@
   }
   .tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.3rem;
     margin-bottom: 0.8rem;
   }
@@ -870,7 +1045,7 @@
   }
   .members {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(6rem, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(6rem, 100%), 1fr));
     gap: 0.5rem;
     margin-bottom: 0.5rem;
   }
@@ -886,6 +1061,21 @@
   .thumb.small {
     aspect-ratio: 1;
   }
+  .event-card .meta {
+    margin: 0 0 0.5rem;
+  }
+  .ename {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: #e7eaf0;
+    font-size: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ename:hover {
+    text-decoration: underline;
+  }
   .badge.keep {
     display: inline-block;
     font-size: 0.65rem;
@@ -895,6 +1085,7 @@
   }
   .row-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.3rem;
     margin-top: 0.2rem;
   }
@@ -926,7 +1117,7 @@
     border: 1px solid #232733;
     border-radius: 12px;
     padding: 1rem 1.2rem;
-    max-width: 24rem;
+    width: min(24rem, 92vw);
   }
   .dialog h3 {
     margin: 0 0 0.5rem;
@@ -952,7 +1143,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(8.5rem, 100%), 1fr));
     gap: 0.6rem;
     margin-top: 0.6rem;
   }
