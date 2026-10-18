@@ -196,6 +196,84 @@ async fn import_folder(
     .map_err(|e| format!("import task join failed: {e}"))?
 }
 
+/// Resumable metadata enrichment: pulls batches of assets with no `stat_at` and
+/// asks the engine for EXIF/dimension data. Completed rows are never revisited,
+/// so a stopped pass can simply be run again.
+pub fn run_enrich(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    max_attempts: i64,
+    mut on_progress: impl FnMut(i64, i64, i64, i64),
+) -> Result<db::EnrichSummary, String> {
+    let started = std::time::Instant::now();
+    let (mut processed, mut enriched, mut failed) = (0i64, 0i64, 0i64);
+    // One attempt per asset per invocation. A failure leaves stat_at NULL so the
+    // row stays eligible later, but retrying it in this same loop would burn the
+    // whole attempt budget instantly (an iCloud placeholder fails every time).
+    let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    loop {
+        let batch: Vec<(i64, String)> = db::pending_stat(conn, 100, max_attempts)?
+            .into_iter()
+            .filter(|(id, _)| !attempted.contains(id))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        for (id, path) in &batch {
+            attempted.insert(*id);
+            match engine::call_blocking(
+                engine_state,
+                "stat",
+                Some(json!({ "path": path })),
+                Duration::from_secs(30),
+            ) {
+                Ok(stat) => {
+                    db::apply_stat(conn, *id, &stat)?;
+                    enriched += 1;
+                }
+                Err(e) => {
+                    db::apply_stat_failure(conn, *id, &e)?;
+                    failed += 1;
+                }
+            }
+            processed += 1;
+        }
+        let (pending, _) = db::enrich_counts(conn, max_attempts)?;
+        on_progress(processed, enriched, failed, pending);
+    }
+
+    let (pending, _) = db::enrich_counts(conn, max_attempts)?;
+    Ok(db::EnrichSummary {
+        processed,
+        enriched,
+        failed,
+        pending,
+        elapsed: started.elapsed().as_secs_f64(),
+    })
+}
+
+#[tauri::command]
+async fn enrich_assets(
+    app: tauri::AppHandle,
+    max_attempts: Option<i64>,
+) -> Result<db::EnrichSummary, String> {
+    let max_attempts = max_attempts.unwrap_or(3).clamp(1, 20);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        run_enrich(&conn, &engine_state, max_attempts, |processed, enriched, failed, pending| {
+            let _ = app.emit(
+                "enrich-progress",
+                json!({ "processed": processed, "enriched": enriched, "failed": failed, "pending": pending }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("enrich task join failed: {e}"))?
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
@@ -237,6 +315,7 @@ pub fn run() {
             greet,
             engine_call,
             import_folder,
+            enrich_assets,
             library_list,
             library_stats
         ])
@@ -368,5 +447,83 @@ mod tests {
             .query_row("SELECT size_bytes FROM assets WHERE path LIKE '%p0001.jpg'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(size, 9999);
+    }
+
+    #[test]
+    fn enrichment_fills_dimensions_and_stops_retrying_failures() {
+        let dir = fixture("ff-enrich-test", 0);
+        let real_png = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        std::fs::copy(&real_png, dir.join("good.png")).unwrap();
+        std::fs::write(dir.join("corrupt-a.jpg"), b"not a jpeg").unwrap();
+        std::fs::write(dir.join("corrupt-b.jpg"), b"also not a jpeg").unwrap();
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        let rows: Vec<String> = {
+            let mut st = conn.prepare("SELECT path FROM assets ORDER BY path").unwrap();
+            let v = st.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            v.filter_map(Result::ok).collect()
+        };
+        assert_eq!(rows.len(), 3, "exactly the three fixture files are indexed");
+        assert_eq!(db::stats(&conn).unwrap().photos, 3);
+
+        // First pass: the PNG decodes, both JPEGs fail.
+        let first = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!(first.processed, 3);
+        assert_eq!(first.enriched, 1, "the real PNG decodes");
+        assert_eq!(first.failed, 2);
+        assert_eq!(first.pending, 2, "failures stay pending for a later retry");
+
+        let (width, height, stat_at): (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT width, height, stat_at FROM assets WHERE name = 'good.png'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((width, height), (Some(128), Some(128)), "dimensions come from ImageIO");
+        assert!(stat_at.is_some(), "enriched rows are stamped");
+
+        let failed_rows: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(stat_attempts) FROM assets WHERE stat_at IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(failed_rows.0, 2, "failures stay unenriched");
+        assert_eq!(failed_rows.1, 2, "each was attempted once");
+        let err: String = conn
+            .query_row("SELECT stat_error FROM assets WHERE name = 'corrupt-a.jpg'", [], |r| r.get(0))
+            .unwrap();
+        let good_err: Option<String> = conn
+            .query_row("SELECT stat_error FROM assets WHERE name = 'good.png'", [], |r| r.get(0))
+            .unwrap();
+        assert!(good_err.is_none(), "a decoded asset carries no error");
+        assert!(!err.is_empty(), "the failure reason is retained for the UI");
+
+        // Retrying with a higher ceiling revisits the failures, then stops.
+        let second = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!(second.processed, 2, "unreadable rows are retried");
+        let third = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!(third.processed, 2);
+        let fourth = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!(fourth.processed, 0, "the attempt ceiling stops the spin");
+
+        // Fresh import of the same folder must re-open enrichment for new rows.
+        let fifth = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!(fifth.processed, 0);
+    }
+
+    #[test]
+    fn enrichment_is_a_noop_on_an_empty_library() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        let summary = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
+        assert_eq!((summary.processed, summary.pending), (0, 0));
     }
 }

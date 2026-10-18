@@ -177,7 +177,7 @@ func parseExifDate(_ s: String) -> Double? {
     return fmt.date(from: s)?.timeIntervalSince1970
 }
 
-func imageStat(path: String) -> [String: Any] {
+func imageStat(path: String) throws -> [String: Any] {
     var out: [String: Any] = ["path": path, "kind": "image"]
     let url = URL(fileURLWithPath: path)
     guard
@@ -185,8 +185,20 @@ func imageStat(path: String) -> [String: Any] {
             kCGImageSourceShouldCache: false,
         ] as CFDictionary)
     else {
-        out["error"] = "unreadable image"
-        return out
+        throw EngineError(message: "not an image container: \(path)")
+    }
+
+    // Creating a source succeeds for arbitrary bytes; the verdict is in the
+    // status. A complete source is trustworthy without paying for a full decode.
+    let status = CGImageSourceGetStatus(src)
+    if status != .statusComplete {
+        // statusUnknown covers formats ImageIO probes lazily, so fall back to an
+        // actual decode before declaring the file unreadable.
+        guard CGImageSourceCreateImageAtIndex(src, 0, nil) != nil else {
+            // Must fail the call rather than embed an error key: callers use this
+            // outcome to tell "permanently corrupt" from "not downloaded yet".
+            throw EngineError(message: "unreadable image (\(status)): \(path)")
+        }
     }
 
     let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] ?? [:]
@@ -263,7 +275,7 @@ func stat(path: String) throws -> [String: Any] {
     let kind = kindOf(ext: ext)
     var out: [String: Any]
     switch kind {
-    case "image": out = imageStat(path: path)
+    case "image": out = try imageStat(path: path)
     case "video": out = videoStat(path: path)
     default: throw EngineError(message: "unsupported kind for stat: \(ext)")
     }

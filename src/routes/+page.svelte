@@ -3,12 +3,15 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import {
     engineThumb,
+    enrichAssets,
     importFolder,
+    onEnrichProgress,
     libraryList,
     libraryStats,
     onImportError,
     onImportProgress,
     type AssetRow,
+    type EnrichProgress,
     type ImportProgress,
     type LibraryStats
   } from "$lib/library";
@@ -33,6 +36,8 @@
   let error = $state<string | null>(null);
   let thumbs = $state<Record<string, string>>({});
   let typedPath = $state("");
+  let enriching = $state(false);
+  let enrichState = $state<EnrichProgress | null>(null);
 
   async function checkEngine() {
     status = { state: "checking" };
@@ -104,10 +109,31 @@
         bytes: summary.bytes
       };
       await refresh();
+      void runEnrich();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       importing = false;
+    }
+  }
+
+  async function runEnrich() {
+    if (enriching) return;
+    enriching = true;
+    enrichState = { processed: 0, enriched: 0, failed: 0, pending: 0 };
+    try {
+      const summary = await enrichAssets(3);
+      enrichState = {
+        processed: summary.processed,
+        enriched: summary.enriched,
+        failed: summary.failed,
+        pending: summary.pending
+      };
+      await refresh();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      enriching = false;
     }
   }
 
@@ -142,6 +168,9 @@
       }),
       onImportError((m) => {
         error = m;
+      }),
+      onEnrichProgress((p) => {
+        if (enriching) enrichState = p;
       })
     ];
     void refresh();
@@ -212,6 +241,20 @@
         </button>
         <span class="total">{fmtBytes(stats.bytes)} indexed</span>
       </div>
+
+      {#if (stats.photos + stats.videos) > 0}
+        <div class="enrich">
+          <button class="ghost" onclick={() => void runEnrich()} disabled={enriching}>
+            {enriching ? "Reading metadata…" : "Refresh metadata"}
+          </button>
+          {#if enrichState && enrichState.processed > 0}
+            <span class="hint">
+              {enrichState.enriched} enriched · {enrichState.failed} unreadable
+              {#if enrichState.pending > 0}· {enrichState.pending} pending{/if}
+            </span>
+          {/if}
+        </div>
+      {/if}
     {/if}
 
     {#if assets.length}
@@ -408,6 +451,25 @@
     color: #8a93a5;
     font-size: 0.8rem;
     font-variant-numeric: tabular-nums;
+  }
+  .enrich {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.2rem 0 0.4rem;
+  }
+  .enrich .hint {
+    margin: 0;
+  }
+  button.ghost {
+    background: transparent;
+    color: #b6bdc9;
+    border: 1px solid #232733;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.7rem;
+  }
+  button.ghost:hover:not(:disabled) {
+    border-color: #3a445c;
   }
   .grid {
     display: grid;

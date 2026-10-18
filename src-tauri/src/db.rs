@@ -6,7 +6,10 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/001_init.sql")),
+    (2, include_str!("../migrations/002_stat_attempts.sql")),
+];
 
 pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -186,6 +189,104 @@ pub fn asset_from_json(v: &serde_json::Value) -> Result<Value2, String> {
     })
 }
 
+// MARK: - Metadata enrichment
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrichSummary {
+    pub processed: i64,
+    pub enriched: i64,
+    pub failed: i64,
+    pub pending: i64,
+    pub elapsed: f64,
+}
+
+/// Assets that have never been successfully enriched. Rows that exhausted
+/// `max_attempts` are skipped so a resumable pass cannot spin on them.
+pub fn pending_stat(conn: &Connection, limit: i64, max_attempts: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path FROM assets
+             WHERE stat_at IS NULL AND missing = 0 AND stat_attempts < ?1
+             ORDER BY (captured_at IS NULL), captured_at DESC, id
+             LIMIT ?2",
+        )
+        .map_err(|e| format!("prepare pending_stat: {e}"))?;
+    let rows = stmt
+        .query_map(params![max_attempts, limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query pending_stat: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("pending_stat row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn apply_stat(conn: &Connection, id: i64, stat: &serde_json::Value) -> Result<(), String> {
+    let n = |k: &str| stat.get(k).and_then(|v| v.as_i64());
+    let f = |k: &str| stat.get(k).and_then(|v| v.as_f64());
+    let s = |k: &str| stat.get(k).and_then(|v| v.as_str());
+
+    conn.execute(
+        "UPDATE assets SET
+            captured_at  = COALESCE(?2, captured_at),
+            width        = COALESCE(?3, width),
+            height       = COALESCE(?4, height),
+            duration     = COALESCE(?5, duration),
+            camera_make  = COALESCE(?6, camera_make),
+            camera_model = COALESCE(?7, camera_model),
+            lens         = COALESCE(?8, lens),
+            latitude     = COALESCE(?9, latitude),
+            longitude    = COALESCE(?10, longitude),
+            stat_at      = ?11,
+            stat_error   = NULL,
+            stat_attempts = stat_attempts + 1
+         WHERE id = ?1",
+        params![
+            id,
+            f("capturedAt"),
+            n("width"),
+            n("height"),
+            f("duration"),
+            s("cameraMake"),
+            s("cameraModel"),
+            s("lens"),
+            f("latitude"),
+            f("longitude"),
+            now(),
+        ],
+    )
+    .map_err(|e| format!("apply_stat: {e}"))?;
+    Ok(())
+}
+
+/// Records a failed attempt. The row keeps `stat_at IS NULL` so it stays
+/// eligible for a later retry until `max_attempts` is reached.
+pub fn apply_stat_failure(conn: &Connection, id: i64, error: &str) -> Result<(), String> {
+    let message: String = error.chars().take(200).collect();
+    conn.execute(
+        "UPDATE assets SET stat_error = ?2, stat_attempts = stat_attempts + 1 WHERE id = ?1",
+        params![id, message],
+    )
+    .map_err(|e| format!("apply_stat_failure: {e}"))?;
+    Ok(())
+}
+
+pub fn enrich_counts(conn: &Connection, max_attempts: i64) -> Result<(i64, i64), String> {
+    let row = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(stat_at IS NULL AND missing = 0 AND stat_attempts < ?1), 0),
+                COALESCE(SUM(stat_at IS NULL AND stat_attempts >= ?1), 0)
+             FROM assets",
+            params![max_attempts],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("enrich_counts: {e}"))?;
+    Ok(row)
+}
+
 // MARK: - Queries
 
 pub fn library(
@@ -274,10 +375,20 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1]);
-        assert!(migrate(&conn).unwrap().is_empty());
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2]);
+        assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2, "user_version tracks the highest applied migration");
+
+        // A database already at the latest version stays untouched.
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets WHERE stat_attempts = 0", [], |r| r.get(0))
+            .unwrap();
+        migrate(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets WHERE stat_attempts = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
