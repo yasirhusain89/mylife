@@ -462,6 +462,10 @@
     </button>
   </nav>
 
+  {#if error}
+    <p class="error global-error">{error}</p>
+  {/if}
+
   {#if tab === "cleanup"}
     <section class="card" aria-labelledby="cleanup-heading">
       <div class="card-head">
@@ -608,10 +612,6 @@
           {fmtBytes(progress.bytes)}
         </p>
       </div>
-    {/if}
-
-    {#if error}
-      <p class="error">{error}</p>
     {/if}
 
     {#if stats}
@@ -1262,5 +1262,12 @@
     margin: 0;
     color: #e5484d;
     font-size: 0.85rem;
+  }
+  .global-error {
+    background: rgba(229, 72, 77, 0.08);
+    border: 1px solid rgba(229, 72, 77, 0.35);
+    border-radius: 8px;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 0.8rem;
   }
 </style>

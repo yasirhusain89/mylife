@@ -356,6 +356,7 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
     struct Face { var path: String; var box: CGRect; var confidence: Double; var desc: FeaturePrintObservation }
     var entries: [Face] = []
     var unreadable = 0
+    var descriptorFailures = 0
 
     for path in paths {
         let url = URL(fileURLWithPath: path)
@@ -381,8 +382,15 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
             fpRequest.regionOfInterest = padded
             let fpHandler = VNImageRequestHandler(cgImage: cg, options: [:])
             guard (try? fpHandler.perform([fpRequest])) != nil,
-                  let desc = fpRequest.results?.first as? FeaturePrintObservation
-            else { continue }
+                  let vnObs = fpRequest.results?.first as? VNFeaturePrintObservation
+            else {
+                descriptorFailures += 1
+                continue
+            }
+            // VNFeaturePrintObservation (ObjC) and FeaturePrintObservation
+            // (Swift struct) are distinct types; results yields the former and
+            // distance(to:) lives on the latter.
+            let desc = FeaturePrintObservation(vnObs)
             entries.append(Face(path: path, box: b, confidence: Double(obs.confidence), desc: desc))
         }
     }
@@ -427,6 +435,7 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
         "groups": groups,
         "threshold": threshold,
         "unreadable": unreadable,
+        "descriptorFailures": descriptorFailures,
     ]
 }
 
