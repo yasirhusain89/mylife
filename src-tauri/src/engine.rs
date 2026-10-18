@@ -22,6 +22,12 @@ fn engine_path() -> Option<PathBuf> {
     #[cfg(target_arch = "x86_64")]
     let triple = "x86_64-apple-darwin";
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    // Dev and bundles strip the target triple; `engine-{triple}` covers the
+    // layout produced before tauri-cli flattens external bins.
+    let plain = exe_dir.join("engine");
+    if plain.exists() {
+        return Some(plain);
+    }
     let path = exe_dir.join(format!("engine-{triple}"));
     if path.exists() { Some(path) } else { None }
 }
