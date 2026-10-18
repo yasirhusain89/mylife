@@ -10,6 +10,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_stat_attempts.sql")),
     (3, include_str!("../migrations/003_cleanup.sql")),
+    (4, include_str!("../migrations/004_faces.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -189,6 +190,141 @@ pub fn asset_from_json(v: &serde_json::Value) -> Result<Value2, String> {
         name,
     })
 }
+
+
+// MARK: - Faces & clusters
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceRow {
+    pub id: i64,
+    pub path: String,
+    pub cluster_id: Option<i64>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub confidence: f64,
+    pub detected_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceClusterRow {
+    pub id: i64,
+    pub face_count: i64,
+    pub representative_path: Option<String>,
+}
+
+pub fn save_faces(conn: &Connection, path: &str, faces: &[serde_json::Value]) -> Result<Vec<i64>, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("faces tx: {e}"))?;
+    let mut ids = Vec::new();
+    for (i, f) in faces.iter().enumerate() {
+        tx.execute(
+                "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    f.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    f.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    f.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    f.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    f.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    now(),
+                ],
+            )
+            .map_err(|e| format!("insert face: {e}"))?;
+        let id: i64 = tx.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .map_err(|e| format!("last row id: {e}"))?;
+        ids.push(id);
+    }
+    tx.commit().map_err(|e| format!("faces commit: {e}"))?;
+    Ok(ids)
+}
+
+pub fn save_cluster(
+    conn: &Connection,
+    member_ids: &[i64],
+) -> Result<i64, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("cluster tx: {e}"))?;
+    let cluster_id = tx
+        .execute(
+            "INSERT INTO face_clusters (face_count, created_at) VALUES (?1, ?2)",
+            params![member_ids.len() as i64, now()],
+        )
+        .map_err(|e| format!("insert cluster: {e}"))?;
+    let cluster_id = tx.last_insert_rowid();
+    for id in member_ids {
+        tx.execute(
+            "UPDATE faces SET cluster_id = ?2 WHERE id = ?1",
+            params![id, cluster_id],
+        )
+        .map_err(|e| format!("link face: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("cluster commit: {e}"))?;
+    Ok(cluster_id)
+}
+
+pub fn clusters_list(conn: &Connection) -> Result<Vec<FaceClusterRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT fc.id, fc.face_count,
+                    (SELECT path FROM faces WHERE cluster_id = fc.id ORDER BY confidence DESC LIMIT 1)
+             FROM face_clusters fc
+             ORDER BY fc.face_count DESC, fc.id",
+        )
+        .map_err(|e| format!("prepare clusters: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(FaceClusterRow {
+                id: r.get(0)?,
+                face_count: r.get(1)?,
+                representative_path: r.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query clusters: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("cluster row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path, cluster_id, x, y, width, height, confidence, detected_at
+             FROM faces WHERE cluster_id = ?1 ORDER BY confidence DESC",
+        )
+        .map_err(|e| format!("prepare faces: {e}"))?;
+    let rows = stmt
+        .query_map(params![cluster_id], |r| {
+            Ok(FaceRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                cluster_id: r.get(2)?,
+                x: r.get(3)?,
+                y: r.get(4)?,
+                width: r.get(5)?,
+                height: r.get(6)?,
+                confidence: r.get(7)?,
+                detected_at: r.get(8)?,
+            })
+        })
+        .map_err(|e| format!("query faces: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("face row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn faces_count(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+        .map_err(|e| format!("faces_count: {e}"))
+}
+
+// MARK: - Queries
 
 // MARK: - Metadata enrichment
 
@@ -676,10 +812,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3, "user_version tracks the highest applied migration");
+        assert_eq!(v, 4, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -760,6 +896,39 @@ mod tests {
         let page = library(&conn, None, true, 0, 1).unwrap();
         assert_eq!(page.len(), 1, "limit still applies alongside the filter");
         assert!(library(&conn, Some("video"), true, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn faces_and_clusters_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+
+        let face_ids = save_faces(
+            &conn,
+            "/a.jpg",
+            &[serde_json::json!({
+                "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.95
+            })],
+        )
+        .unwrap();
+        assert_eq!(face_ids.len(), 1);
+
+        let cluster_id = save_cluster(&conn, &face_ids).unwrap();
+        let cs = cleanup_stats(&conn).unwrap(); // sanity: no cleanup tables conflict
+        let _ = cs.duplicate_groups;
+
+        let clusters = clusters_list(&conn).unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].face_count, 1);
+
+        let members = faces_in_cluster(&conn, cluster_id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].path, "/a.jpg");
+        assert!((members[0].confidence - 0.95).abs() < 0.001);
+
+        let stats = faces_count(&conn).unwrap();
+        assert_eq!(stats, 1);
     }
 
     #[test]

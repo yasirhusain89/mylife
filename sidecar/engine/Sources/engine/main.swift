@@ -4,6 +4,8 @@ import CryptoKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import Vision
+import VisionKit
 
 // fotoflow engine — JSON-lines over stdio (protocol v1).
 //
@@ -310,6 +312,155 @@ func hashAsset(path: String) throws -> [String: Any] {
     ]
 }
 
+
+// MARK: - Faces
+
+/// Detects faces (bounding boxes + confidence) — no descriptors, cheap, works on any image.
+func detectFaces(path: String) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: path)
+    guard
+        let src = CGImageSourceCreateWithURL(
+            url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    else { throw EngineError(message: "not an image: \(path)") }
+    guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        throw EngineError(message: "cannot decode image: \(path)")
+    }
+
+    let rectRequest = VNDetectFaceRectanglesRequest()
+    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+    try handler.perform([rectRequest])
+
+    var faces: [[String: Any]] = []
+    for (index, obs) in (rectRequest.results ?? []).enumerated() {
+        let b = obs.boundingBox
+        faces.append([
+            "index": index,
+            "x": Double(b.origin.x),
+            "y": Double(1.0 - b.origin.y - b.height),
+            "width": Double(b.width),
+            "height": Double(b.height),
+            "confidence": Double(obs.confidence),
+        ])
+    }
+    return ["path": path, "count": faces.count, "faces": faces]
+}
+
+/// Clusters faces across a set of images into "people" using Vision's own
+/// feature-print distance. Needs no downloaded model weights: VNGenerateImageFeaturePrintRequest
+/// is part of the OS. Returns one cluster per detected person; singletons are
+/// groups of size 1.
+func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
+    struct Face { var path: String; var box: CGRect; var confidence: Double; var desc: FeaturePrintObservation }
+    var entries: [Face] = []
+
+    for path in paths {
+        let url = URL(fileURLWithPath: path)
+        guard
+            let src = CGImageSourceCreateWithURL(
+                url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+            let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+        else { continue }
+
+        let rectRequest = VNDetectFaceRectanglesRequest()
+        let rectHandler = VNImageRequestHandler(cgImage: cg, options: [:])
+        try rectHandler.perform([rectRequest])
+        guard let observations = rectRequest.results, !observations.isEmpty else { continue }
+
+        for obs in observations {
+            let b = obs.boundingBox
+            let padded = b.insetBy(dx: -b.width * 0.2, dy: -b.height * 0.2)
+                .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+            let fpRequest = VNGenerateImageFeaturePrintRequest()
+            fpRequest.regionOfInterest = padded
+            let fpHandler = VNImageRequestHandler(cgImage: cg, options: [:])
+            guard (try? fpHandler.perform([fpRequest])) != nil,
+                  let desc = fpRequest.results?.first as? FeaturePrintObservation
+            else { continue }
+            entries.append(Face(path: path, box: b, confidence: Double(obs.confidence), desc: desc))
+        }
+    }
+
+    // Union-find agglomerative clustering on Vision's feature-print distance.
+    var parent = Array(0..<entries.count)
+    func find(_ i: Int) -> Int {
+        if parent[i] != i { parent[i] = find(parent[i]) }
+        return parent[i]
+    }
+    func union(_ a: Int, _ b: Int) {
+        let ra = find(a), rb = find(b)
+        if ra != rb { parent[rb] = ra }
+    }
+    for i in 0..<entries.count {
+        for j in (i + 1)..<entries.count {
+            if let d = try? entries[i].desc.distance(to: entries[j].desc), d < threshold {
+                union(i, j)
+            }
+        }
+    }
+
+    var roots: [Int: [Int]] = [:]
+    for i in 0..<entries.count { roots[find(i), default: []].append(i) }
+    let groups = roots.values.map { members -> [String: Any] in
+        [
+            "people": members.map { [
+                "path": entries[$0].path,
+                "x": Double(entries[$0].box.origin.x),
+                "y": Double(1.0 - entries[$0].box.origin.y - entries[$0].box.height),
+                "width": Double(entries[$0].box.width),
+                "height": Double(entries[$0].box.height),
+                "confidence": entries[$0].confidence,
+            ] },
+            "size": members.count,
+        ]
+    }.sorted { $0["size"] as! Int > $1["size"] as! Int }
+
+    return [
+        "faces": entries.count,
+        "clusters": groups.count,
+        "groups": groups,
+        "threshold": threshold,
+    ]
+}
+
+
+// MARK: - Face thumbnails
+
+/// Crops a detected face region to JPEG for UI thumbnails.
+func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Double, maxPx: Int) throws -> String {
+    let url = URL(fileURLWithPath: path)
+    guard
+        let src = CGImageSourceCreateWithURL(
+            url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+        let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+    else { throw EngineError(message: "cannot decode image: \(path)") }
+    let iw = CGFloat(cg.width), ih = CGFloat(cg.height)
+    var r = CGRect(x: x * iw, y: y * ih, width: width * iw, height: height * ih)
+    r = r.intersection(CGRect(x: 0, y: 0, width: iw, height: ih))
+    guard r.width > 0, r.height > 0 else { throw EngineError(message: "empty face crop: \(path)") }
+    guard let crop = cg.cropping(to: r) else { throw EngineError(message: "cannot crop face: \(path)") }
+    let px = CGFloat(max(32, min(maxPx, 1024)))
+    let cw = CGFloat(crop.width), ch = CGFloat(crop.height)
+    let scale = min(px / cw, px / ch)
+    let size = CGSize(width: CGFloat(crop.width) * scale, height: CGFloat(crop.height) * scale)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard
+        let ctx = CGContext(
+            data: nil, width: Int(size.width), height: Int(size.height),
+            bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { throw EngineError(message: "cannot create context: \(path)") }
+    ctx.draw(crop, in: CGRect(origin: .zero, size: size))
+    guard let rendered = ctx.makeImage() else { throw EngineError(message: "cannot render face crop: \(path)") }
+    let data = NSMutableData()
+    guard
+        let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData, "public.jpeg" as CFString, 1, nil)
+    else { throw EngineError(message: "cannot create jpeg destination: \(path)") }
+    CGImageDestinationAddImage(dest, rendered, [kCGImageDestinationLossyCompressionQuality: 0.72] as CFDictionary)
+    guard CGImageDestinationFinalize(dest) else { throw EngineError(message: "cannot finalize face thumbnail: \(path)") }
+    return data.base64EncodedString()
+}
+
 // MARK: - Batch hashing
 
 /// Hashes many files in one call so the Rust side pays a single round-trip
@@ -519,6 +670,19 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         }
         return hashBatch(paths: paths)
 
+    case "faces":
+        guard let path = str("path") else { throw EngineError(message: "faces requires 'path'") }
+        return try detectFaces(path: path)
+
+    case "cluster_faces":
+        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
+            throw EngineError(message: "cluster_faces requires a non-empty 'paths' array")
+        }
+        if paths.count > 500 {
+            throw EngineError(message: "cluster_faces accepts at most 500 paths, got \(paths.count)")
+        }
+        return try clusterFaces(paths: paths, threshold: dbl("threshold", 0.55))
+
     case "quality":
         guard let path = str("path") else { throw EngineError(message: "quality requires 'path'") }
         return try quality(path: path, blurThreshold: dbl("blurThreshold", 25.0))
@@ -527,6 +691,14 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let path = str("path") else { throw EngineError(message: "thumb requires 'path'") }
         return try thumbnail(
             path: path, maxPx: int("maxPx", 512), quality: dbl("quality", 0.72))
+
+    case "face_thumb":
+        guard let path = str("path") else { throw EngineError(message: "face_thumb requires 'path'") }
+        return ["image": try faceThumbnail(
+            path: path,
+            x: dbl("x", 0), y: dbl("y", 0),
+            width: dbl("width", 0), height: dbl("height", 0),
+            maxPx: int("maxPx", 256))]
 
     default:
         throw EngineError(message: "unknown command '\(cmd)'")

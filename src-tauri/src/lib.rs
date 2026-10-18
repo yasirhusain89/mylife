@@ -4,6 +4,7 @@ mod engine;
 use serde::Serialize;
 use rusqlite::params;
 use serde_json::{Value, json};
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
@@ -463,6 +464,142 @@ fn duplicates_keep(
     db::duplicate_groups(&conn)
 }
 
+// MARK: - People clustering
+
+/// Runs the engine's face detector + feature-print clusterer over every
+/// image in the library (or the given subset), stores every face and its
+/// cluster, and streams progress so the UI can show a live counter.
+#[tauri::command]
+async fn cluster_faces(
+    app: tauri::AppHandle,
+    paths: Option<Vec<String>>,
+    threshold: Option<f64>,
+) -> Result<ClusterSummary, String> {
+    let threshold = threshold.unwrap_or(0.55);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+
+        let all_paths: Vec<String> = match paths {
+            Some(p) => p,
+            None => {
+                let rows: Vec<String> = conn
+                    .prepare("SELECT path FROM assets WHERE kind = 'image' AND missing = 0")
+                    .map_err(|e| format!("image paths: {e}"))?
+                    .query_map([], |r| r.get(0))
+                    .map_err(|e| format!("image paths: {e}"))?
+                    .filter_map(Result::ok)
+                    .collect();
+                rows
+            }
+        };
+        if all_paths.is_empty() {
+            return Ok(ClusterSummary { images: 0, faces: 0, clusters: 0 });
+        }
+
+        let mut total_faces = 0i64;
+        let mut total_clusters = 0i64;
+        let mut processed = 0i64;
+
+        for chunk in all_paths.chunks(200) {
+            let reply = engine::call_with_events(
+                &engine_state,
+                "cluster_faces",
+                Some(json!({ "paths": chunk, "threshold": threshold })),
+                Duration::from_secs(600),
+                &mut |name, data| {
+                    if name == "progress" {
+                        let _ = app.emit(
+                            "cluster-progress",
+                            json!({
+                                "processed": processed + data.get("processed").and_then(Value::as_i64).unwrap_or(0),
+                                "total": all_paths.len() as i64,
+                                "faces": total_faces + data.get("faces").and_then(Value::as_i64).unwrap_or(0),
+                            }),
+                        );
+                    }
+                },
+            )?;
+
+            let faces = reply.get("faces").and_then(Value::as_i64).unwrap_or(0);
+            let groups: Vec<&Value> = reply
+                .get("groups")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
+
+            let mut cluster_rows: Vec<(i64, Vec<i64>)> = Vec::new();
+            for g in groups {
+                let members: Vec<&Value> = g
+                    .get("people")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().collect())
+                    .unwrap_or_default();
+                let mut face_ids = Vec::new();
+                for m in members {
+                    let path = m.get("path").and_then(Value::as_str).unwrap_or("");
+                    let faces_row = db::save_faces(&conn, path, &[m.clone()])?;
+                    face_ids.push(faces_row[0]);
+                }
+                if !face_ids.is_empty() {
+                    let cid = db::save_cluster(&conn, &face_ids)?;
+                    cluster_rows.push((cid, face_ids));
+                }
+                total_clusters += 1;
+            }
+            total_faces += faces;
+            processed += chunk.len() as i64;
+
+            let _ = app.emit(
+                "cluster-progress",
+                json!({
+                    "processed": processed,
+                    "total": all_paths.len() as i64,
+                    "faces": total_faces,
+                }),
+            );
+        }
+
+        Ok(ClusterSummary {
+            images: all_paths.len() as i64,
+            faces: total_faces,
+            clusters: total_clusters,
+        })
+    })
+    .await
+    .map_err(|e| format!("cluster task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn clusters_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::FaceClusterRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::clusters_list(&conn)
+}
+
+#[tauri::command]
+fn faces_in_cluster(
+    conn: tauri::State<'_, DbState>,
+    cluster_id: i64,
+) -> Result<Vec<db::FaceRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::faces_in_cluster(&conn, cluster_id)
+}
+
+#[tauri::command]
+fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::faces_count(&conn)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterSummary {
+    images: i64,
+    faces: i64,
+    clusters: i64,
+}
+
 #[tauri::command]
 fn library_list(
     conn: tauri::State<'_, DbState>,
@@ -584,6 +721,10 @@ pub fn run() {
             duplicates_keep,
             cleanup_stats_cmd,
             trash_assets,
+            cluster_faces,
+            clusters_list,
+            faces_in_cluster,
+            faces_count,
             library_list,
             library_stats
         ])

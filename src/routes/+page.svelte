@@ -4,6 +4,9 @@
   import {
     blurredAssets,
     cleanupStats,
+    clustersList,
+    faceThumb,
+    facesInCluster,
     duplicatesList,
     engineThumb,
     enrichAssets,
@@ -22,6 +25,8 @@
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
+    type FaceClusterRow,
+    type FaceRow,
     type DuplicateGroup,
     type EnrichProgress,
     type ImportProgress,
@@ -47,6 +52,7 @@
   let progress = $state<ImportProgress | null>(null);
   let error = $state<string | null>(null);
   let thumbs = $state<Record<string, string>>({});
+  let people = $state<FaceClusterRow[]>([]);
   let typedPath = $state("");
   let enriching = $state(false);
   let enrichState = $state<EnrichProgress | null>(null);
@@ -59,8 +65,9 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup">("library");
+  let tab = $state<"library" | "cleanup" | "people">("library");
   let flagged = $state<Set<number>>(new Set());
+  let peopleLoading = $state(false);
   let toast = $state<string | null>(null);
 
   async function checkEngine() {
@@ -148,6 +155,18 @@
     void loadThumbs(blurred);
     for (const g of groups) {
       for (const m of g.members) void loadThumbs([{ path: m.path } as AssetRow]);
+    }
+  }
+
+  async function loadPeople() {
+    peopleLoading = true;
+    people = [];
+    try {
+      people = await clustersList();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      peopleLoading = false;
     }
   }
 
@@ -282,6 +301,9 @@
     <button class="tab" class:on={tab === "library"} onclick={() => (tab = "library")}>Library</button>
     <button class="tab" class:on={tab === "cleanup"} onclick={() => (tab = "cleanup")}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
+    </button>
+    <button class="tab" class:on={tab === "people"} onclick={() => (tab = "people")}>
+      People{#if people.length > 0}&nbsp;{people.length}{/if}
     </button>
   </nav>
 
@@ -493,6 +515,26 @@
     {/if}
   </section>
 
+  {/if}
+
+  {#if tab === "people"}
+    <section class="card" aria-labelledby="people-heading">
+      <div class="card-head">
+        <h2 id="people-heading">People</h2>
+        <button onclick={loadPeople} disabled={peopleLoading}>
+          {peopleLoading ? "Scanning faces…" : "Find people in library"}
+        </button>
+      </div>
+      {#if people.length}
+        <div class="stats">
+          {#each people as cluster (cluster.id)}
+            <span class="chip static">Cluster {cluster.id} · {cluster.faceCount} face{cluster.faceCount === 1 ? "" : "s"}</span>
+          {/each}
+        </div>
+      {:else if !peopleLoading}
+        <p class="hint">No people clusters yet — scan the library to detect faces.</p>
+      {/if}
+    </section>
   {/if}
 
   <section class="card" aria-labelledby="engine-heading">

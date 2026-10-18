@@ -153,6 +153,50 @@ export function trashAssets(ids: number[]): Promise<{ trashed: number; failed: s
   return invoke("trash_assets", { ids });
 }
 
+export type FaceRow = {
+  id: number;
+  path: string;
+  clusterId: number | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+  detectedAt: number;
+};
+
+export type FaceClusterRow = {
+  id: number;
+  faceCount: number;
+  representativePath: string | null;
+};
+
+export function faceThumb(
+  path: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  maxPx = 256,
+): Promise<{ image: string }> {
+  return invoke("engine_call", {
+    cmd: "face_thumb",
+    params: { path, x, y, width, height, maxPx },
+  });
+}
+
+export function clustersList(): Promise<FaceClusterRow[]> {
+  return invoke("clusters_list");
+}
+
+export function facesInCluster(clusterId: number): Promise<FaceRow[]> {
+  return invoke("faces_in_cluster", { clusterId });
+}
+
+export function facesCount(): Promise<number> {
+  return invoke("faces_count");
+}
+
 export function onHashProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
   return listen<CleanupProgress>("hash-progress", (e) => cb(e.payload));
 }
