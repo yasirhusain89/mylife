@@ -992,6 +992,7 @@
     display: flex;
     align-items: center;
     gap: 0.6rem;
+    flex-wrap: wrap;
     margin: 0.2rem 0 0.4rem;
   }
   .enrich .hint {
@@ -1071,15 +1072,19 @@
     font-size: 0.78rem;
     color: #b6bdc9;
     margin-bottom: 0.5rem;
+    min-width: 0;
   }
   .waste {
     color: #7b8496;
   }
   .members {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(6rem, 100%), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(6rem, 100%), 1fr));
     gap: 0.5rem;
     margin-bottom: 0.5rem;
+  }
+  .members figure {
+    min-width: 0;
   }
   .members figure {
     border: 1px solid transparent;
@@ -1104,6 +1109,10 @@
     font-size: inherit;
     text-align: left;
     cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .ename:hover {
     text-decoration: underline;
@@ -1175,9 +1184,12 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(8.5rem, 100%), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(8.5rem, 100%), 1fr));
     gap: 0.6rem;
     margin-top: 0.6rem;
+  }
+  .grid > figure {
+    min-width: 0;
   }
   figure {
     margin: 0;
@@ -1250,13 +1262,18 @@
     padding: 0.35rem 0;
     border-top: 1px solid #232733;
     font-size: 0.9rem;
+    min-width: 0;
   }
   dt {
     color: #8a93a5;
   }
   dd {
     margin: 0;
+    min-width: 0;
     font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .error {
     margin: 0;
