@@ -57,7 +57,7 @@ function pickWrite<K extends keyof RealLibrary & keyof MockLibrary & keyof ApiLi
   return pick(key);
 }
 
-export const importFolder = pick("importFolder");
+export const importFolder = pickWrite("importFolder");
 export const libraryList = pickRead("libraryList");
 export const libraryCount = pickRead("libraryCount");
 export const libraryMonths = pickRead("libraryMonths");

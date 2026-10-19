@@ -10,11 +10,14 @@
 //! the Vite dev server (another loopback port) call it from a browser.
 //!
 //! Write slice (POST, additive over the GET routes): favorites, album
-//! create/add, and a synchronous tag-run summary. The tag run has no
-//! engine classifier and no progress stream over HTTP — it reports the
-//! pending total with `tagged: 0` (same summary shape as the Tauri
-//! `tag_scenes` command). Handler failures reuse the GET error envelope
-//! `{ "error": ... }` with status 500.
+//! create/add, a synchronous tag-run summary, and path-based imports.
+//! POST /api/imports runs the same db/engine import flow as the Tauri
+//! `import_folder` command (`crate::run_import`) and returns the
+//! ImportSummary shape. Paths must be visible to the server host (the
+//! desktop app's filesystem); file upload is deferred. Progress streaming
+//! is out of scope over HTTP — no `import-progress` events — the handler
+//! resolves synchronously with the final summary. Handler failures reuse
+//! the GET error envelope `{ "error": ... }` with status 500.
 
 use axum::{
     extract::{Path, Query, State},
@@ -29,6 +32,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct ApiState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
+    pub engine: crate::engine::EngineState,
 }
 
 fn cors() -> [(HeaderName, HeaderValue); 1] {
@@ -220,6 +224,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/tags", get(tags))
         .route("/api/tags/run", post(tags_run).options(preflight))
         .route("/api/favorites", post(favorite_set).options(preflight))
+        .route("/api/imports", post(imports).options(preflight))
         .with_state(state)
 }
 
@@ -321,6 +326,31 @@ async fn tags_run(State(state): State<ApiState>) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct ImportBody {
+    root: String,
+    recursive: Option<bool>,
+}
+
+/// Path-based import: same db/engine flow as the Tauri `import_folder`
+/// command (`crate::run_import`), synchronous summary with no progress
+/// stream. Paths must be visible to the server host.
+async fn imports(State(state): State<ApiState>, body: axum::Json<ImportBody>) -> Response {
+    let root = body.root.trim().to_string();
+    if root.is_empty() {
+        return err("root is required".to_string());
+    }
+    let recursive = body.recursive.unwrap_or(true);
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::run_import(&conn, &state.engine, &root, recursive, |_| {}, |_| {}) {
+        Ok(summary) => (cors(), Json(summary)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 /// Demo seed mirroring the web mock: 8 assets under /photos so the API
 /// E2E run has deterministic data without any imports. Only seeds an
 /// empty database, so reruns against the same file are stable.
@@ -376,7 +406,10 @@ pub async fn serve(db_path: &std::path::Path, port: u16, demo: bool) -> Result<(
             db_path.display()
         );
     }
-    let state = ApiState { db: Arc::new(Mutex::new(conn)) };
+    let state = ApiState {
+        db: Arc::new(Mutex::new(conn)),
+        engine: crate::engine::new_state(),
+    };
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| format!("serve bind 127.0.0.1:{port}: {e}"))?;
@@ -400,7 +433,10 @@ mod tests {
             crate::db::migrate(&conn).unwrap();
             assert!(seed_demo(&conn).unwrap(), "first seed fills the empty db");
             assert!(!seed_demo(&conn).unwrap(), "second seed is a no-op");
-            let state = ApiState { db: Arc::new(Mutex::new(conn)) };
+            let state = ApiState {
+                db: Arc::new(Mutex::new(conn)),
+                engine: crate::engine::new_state(),
+            };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
             tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
@@ -451,7 +487,10 @@ mod tests {
             let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
             crate::db::migrate(&conn).unwrap();
             assert!(seed_demo(&conn).unwrap(), "first seed fills the empty db");
-            let state = ApiState { db: Arc::new(Mutex::new(conn)) };
+            let state = ApiState {
+                db: Arc::new(Mutex::new(conn)),
+                engine: crate::engine::new_state(),
+            };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
             tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
@@ -506,6 +545,98 @@ mod tests {
             assert!(summary.get("total").and_then(|v| v.as_i64()).is_some());
             assert!(summary.get("tagged").and_then(|v| v.as_i64()).is_some());
             assert!(summary.get("failed").and_then(|v| v.as_i64()).is_some());
+        });
+    }
+
+    #[test]
+    fn imports_run_engine_flow_and_update_roots() {
+        // POST /api/imports delegates to the same db/engine flow as the
+        // Tauri `import_folder` command and returns the ImportSummary shape.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+            let bin = if cfg!(target_arch = "aarch64") {
+                "engine-aarch64-apple-darwin"
+            } else {
+                "engine-x86_64-apple-darwin"
+            };
+            let path = std::path::Path::new(&dir).join("binaries").join(bin);
+            assert!(path.exists(), "engine binary missing; run pnpm build:engine");
+            unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
+
+            let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            let state = ApiState {
+                db: Arc::new(Mutex::new(conn)),
+                engine: crate::engine::new_state(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+
+            let root = std::env::temp_dir().join(format!(
+                "ff-api-import-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            for i in 0..3 {
+                std::fs::write(root.join(format!("p{i:04}.jpg")), vec![b'x'; 1024 + i]).unwrap();
+            }
+            std::fs::write(root.join("notes.txt"), b"ignore me").unwrap();
+            let root_str = root.to_str().unwrap().to_string();
+
+            let summary: serde_json::Value = ureq::post(&format!("{base}/api/imports"))
+                .send_json(serde_json::json!({ "root": root_str, "recursive": true }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert_eq!(summary.get("root"), Some(&serde_json::json!(root_str)));
+            assert_eq!(summary.get("scanned"), Some(&serde_json::json!(3)));
+            assert_eq!(summary.get("imported"), Some(&serde_json::json!(3)));
+            assert_eq!(summary.get("skipped"), Some(&serde_json::json!(1)));
+            assert!(summary.get("scanId").and_then(|v| v.as_i64()).is_some());
+
+            let count: serde_json::Value = ureq::get(&format!("{base}/api/library/count"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert_eq!(count.get("count"), Some(&serde_json::json!(3)));
+
+            let roots: Vec<serde_json::Value> = ureq::get(&format!("{base}/api/roots"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert!(roots.iter().any(|r| r.get("root") == Some(&serde_json::json!(root_str))));
+
+            // Rescan is idempotent: same files become unchanged.
+            let second: serde_json::Value = ureq::post(&format!("{base}/api/imports"))
+                .send_json(serde_json::json!({ "root": root_str }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert_eq!(second.get("imported"), Some(&serde_json::json!(0)));
+            assert_eq!(second.get("unchanged"), Some(&serde_json::json!(3)));
+
+            // Failures reuse the `{error}` envelope with 500.
+            assert!(ureq::post(&format!("{base}/api/imports"))
+                .send_json(serde_json::json!({ "root": "", "recursive": true }))
+                .is_err());
+            assert!(ureq::post(&format!("{base}/api/imports"))
+                .send_json(serde_json::json!({ "root": "/definitely/not/a/real/folder" }))
+                .is_err());
+
+            let _ = std::fs::remove_dir_all(&root);
         });
     }
 }

@@ -106,3 +106,39 @@ test("tag-run returns a summary without error", async ({ page }) => {
   await page.getByRole("button", { name: "Tag scenes" }).click();
   await expect(page.getByText(/Tagged \d+ of \d+ photos|already has scene tags/)).toBeVisible();
 });
+
+test("path import via Scan adds a second root and grows counts", async ({ page }) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmpRoot = path.join(
+    os.tmpdir(),
+    `ff-e2e-import-${Date.now()}-${Math.floor(Math.random() * 100000)}`
+  );
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  for (let i = 0; i < 2; i++) {
+    fs.writeFileSync(path.join(tmpRoot, `e2e_${i}.jpg`), Buffer.alloc(2048 + i, 0x78));
+  }
+
+  const before = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/library/count`);
+    return ((await r.json()) as { count: number }).count;
+  }, API!);
+
+  await page.getByPlaceholder("…or paste a folder path").fill(tmpRoot);
+  await page.getByRole("button", { name: "Scan" }).click();
+  await expect(page.getByText(tmpRoot, { exact: true }).first()).toBeVisible({ timeout: 30_000 });
+
+  const after = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/library/count`);
+    return ((await r.json()) as { count: number }).count;
+  }, API!);
+  expect(after).toBeGreaterThan(before);
+  expect(after).toBeGreaterThanOrEqual(before + 2);
+
+  const roots = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/roots`);
+    return (await r.json()) as { root: string }[];
+  }, API!);
+  expect(roots.some((r) => r.root === tmpRoot)).toBe(true);
+});

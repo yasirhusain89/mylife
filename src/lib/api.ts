@@ -3,6 +3,7 @@ import type {
   AssetRow,
   EventRow,
   FaceClusterRow,
+  ImportSummary,
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
@@ -172,4 +173,8 @@ export function albumAdd(albumId: number, assetIds: number[]): Promise<{ added: 
 
 export function tagScenes(): Promise<TagScenesSummary> {
   return postJson<TagScenesSummary>("/api/tags/run");
+}
+
+export function importFolder(root: string, recursive = true): Promise<ImportSummary> {
+  return postJson<ImportSummary>("/api/imports", { root, recursive });
 }
