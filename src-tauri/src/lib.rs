@@ -749,6 +749,7 @@ pub struct PipelineSummary {
     pub events: i64,
     pub tagged: i64,
     pub embedded: i64,
+    pub faces: i64,
     pub places: i64,
     pub failed: i64,
 }
@@ -867,6 +868,20 @@ pub fn run_post_import(
         }
     };
 
+    // Faces stay incremental: images that already have descriptors skip
+    // engine calls, then every stored descriptor regroups globally so new
+    // imports join their people (names + person tags follow in
+    // run_cluster_faces). Runs after tag_scenes so scene stamps land first.
+    let faces = match run_cluster_faces(conn, engine_state, None, 0.55, |p, t, _| {
+        emit("faces", p, t);
+    }) {
+        Ok(s) => s.faces,
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
     let places = match run_fill_cached_places(conn) {
         Ok(n) => {
             emit("places", n, n);
@@ -879,7 +894,7 @@ pub fn run_post_import(
     };
 
     emit("done", 0, 0);
-    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, embedded, places, failed })
+    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, embedded, faces, places, failed })
 }
 
 #[tauri::command]
@@ -1221,7 +1236,12 @@ pub fn run_cluster_faces(
     };
     // Faces without descriptors (failed embeds) stay unassigned; they are
     // candidates again on the next run.
-    db::replace_clusters(conn, groups)?;
+    // Regroups mint fresh cluster ids, so re-stamp every surviving group:
+    // new members of a named cluster gain its `person:<name>` tag and photos
+    // that left the group lose the stamp they no longer justify.
+    for cid in db::replace_clusters(conn, groups)? {
+        db::sync_person_tags(conn, cid)?;
+    }
 
     let faces = db::faces_count(conn)?;
     let clusters = db::clusters_list(conn)?.len() as i64;
@@ -2820,7 +2840,8 @@ mod tests {
         // Positive tag storage is covered at the db level.
         assert_eq!(first.tagged, 0);
         assert_eq!(first.places, 0, "no coordinates, nothing to fill");
-        for want in ["enrich", "hash", "quality", "events", "tag", "places", "done"] {
+        assert_eq!(first.faces, 0, "the icon shows no detectable face");
+        for want in ["enrich", "hash", "quality", "events", "tag", "faces", "places", "done"] {
             assert!(stages.contains(&want.to_string()), "stage {want} reports progress");
         }
 
@@ -2843,6 +2864,116 @@ mod tests {
         let second = run_post_import(&conn, &state, 3, |_| {}).unwrap();
         assert_eq!(snapshot(), before, "rerun creates no new rows");
         assert_eq!(second.tagged, 0, "nothing newly tagged on rerun");
+    }
+
+    #[test]
+    fn pipeline_faces_join_named_cluster_with_person_tag() {
+        let dir = fixture("ff-pipeline-faces-test", 0);
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        assert!(favicon.exists(), "static/favicon.png must exist for the faces pipeline test");
+        // Two near-identical crops of the same icon.
+        std::fs::copy(&favicon, dir.join("a.png")).unwrap();
+        std::fs::copy(&favicon, dir.join("b.png")).unwrap();
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        // Stored paths, not the temp-dir spellings: the engine may report
+        // the canonicalized form (/private/var/…) and faces join on it.
+        let stored_path = |name: &str| -> String {
+            conn.query_row("SELECT path FROM assets WHERE name = ?1", params![name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let a_path = stored_path("a.png");
+        let b_path = stored_path("b.png");
+        let asset_id = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let has_person_tag = |aid: i64, name: &str| -> bool {
+            db::asset_tags(&conn, aid).unwrap().iter().any(|t| t.tag == format!("person:{name}"))
+        };
+
+        // Engine reality check: never assume the icon depicts a person —
+        // the pipeline must agree with what the sidecar actually returns.
+        let probe = engine::call_with_events(
+            &state,
+            "cluster_faces",
+            Some(json!({ "paths": [a_path.clone(), b_path.clone()], "threshold": 0.55 })),
+            Duration::from_secs(600),
+            &mut |_, _| {},
+        )
+        .expect("engine face probe");
+        assert_eq!(
+            probe.get("faces").and_then(Value::as_i64),
+            Some(0),
+            "fixture shows no detectable face per engine: {probe:?}"
+        );
+
+        // Known person, seeded with identical synthetic descriptors on the
+        // real asset paths (the icon has no detectable face, so descriptors
+        // stand in for detected faces while import + pipeline stay
+        // end-to-end). Live threshold math, not hardcoded similarity:
+        // identical vectors sit at distance 0, inside the regroup threshold.
+        assert_eq!(
+            group_faces_by_distance(
+                &[1, 2],
+                &[vec![0.0f32, 0.0], vec![0.0f32, 0.0]],
+                0.55
+            )
+            .len(),
+            1
+        );
+        let descriptor = || {
+            serde_json::json!({
+                "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9,
+                "descriptor": b64_encode(&db::floats_to_bytes(&[0.0f32, 0.0])),
+            })
+        };
+        let a_face = db::save_faces(&conn, &a_path, &[descriptor()]).unwrap();
+        let cluster = db::save_cluster(&conn, &a_face).unwrap();
+        db::rename_cluster(&conn, cluster, "Maya").unwrap();
+        let aid_a = asset_id(&a_path);
+        assert!(has_person_tag(aid_a, "Maya"), "naming stamps the known photo");
+
+        // A new image of the same person arrives after naming; its face is
+        // already stored (as detection would leave it) but still untagged.
+        db::save_faces(&conn, &b_path, &[descriptor()]).unwrap();
+        let aid_b = asset_id(&b_path);
+        assert!(!has_person_tag(aid_b, "Maya"), "new image starts untagged");
+
+        // Act: the full post-import run (faces stage detects nothing new on
+        // the icon, then globally regroups the stored descriptors).
+        let mut stages = Vec::new();
+        let summary = run_post_import(&conn, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
+        assert!(stages.contains(&"faces".to_string()), "faces stage reports progress");
+        assert_eq!(summary.faces, 2, "both stored faces regroup");
+
+        // Assert: the newcomer joined Maya's cluster WITH the stamp, and the
+        // grouping matches live threshold math rather than a fixed count.
+        let stored = db::face_descriptors(&conn).unwrap();
+        let ids: Vec<i64> = stored.iter().map(|(id, _)| *id).collect();
+        let vecs: Vec<Vec<f32>> = stored.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(group_faces_by_distance(&ids, &vecs, 0.55).len(), 1);
+        let clusters = db::clusters_list(&conn).unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].name.as_deref(), Some("Maya"));
+        assert_eq!(clusters[0].face_count, 2, "new image joins the named cluster");
+        assert!(has_person_tag(aid_b, "Maya"), "join stamps the new photo");
+        assert!(has_person_tag(aid_a, "Maya"), "known photo keeps its stamp");
+
+        // Tag-aware search surfaces the newcomer by person name.
+        let q = db::LibraryQuery { query: Some("maya"), limit: 10, ..Default::default() };
+        let paths: Vec<String> =
+            db::library(&conn, &q).unwrap().into_iter().map(|r| r.path).collect();
+        assert!(
+            paths.contains(&a_path) && paths.contains(&b_path),
+            "search finds both by person name: {paths:?}"
+        );
     }
 
     /// Builds N byte-identical files plus unique ones, so dedupe has real work.

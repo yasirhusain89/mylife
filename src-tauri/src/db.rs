@@ -615,12 +615,15 @@ pub fn rename_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<
     if name.is_empty() {
         return Err("person name cannot be empty".into());
     }
-    let changed = conn
+    let tx = conn.unchecked_transaction().map_err(|e| format!("rename tx: {e}"))?;
+    let changed = tx
         .execute("UPDATE face_clusters SET name = ?2 WHERE id = ?1", params![cluster_id, name])
         .map_err(|e| format!("rename cluster: {e}"))?;
     if changed == 0 {
         return Err(format!("cluster {cluster_id} not found"));
     }
+    sync_person_tags(&tx, cluster_id)?;
+    tx.commit().map_err(|e| format!("rename commit: {e}"))?;
     Ok(())
 }
 
@@ -665,6 +668,9 @@ pub fn merge_clusters(conn: &Connection, from_id: i64, into_id: i64) -> Result<i
         params![into_id, count],
     )
     .map_err(|e| format!("merge recount: {e}"))?;
+    // The source row is gone: re-stamp the survivor so moved photos carry
+    // its name and the source's old stamp is dropped where unjustified.
+    sync_person_tags(&tx, into_id)?;
     tx.commit().map_err(|e| format!("merge commit: {e}"))?;
     Ok(count)
 }
@@ -691,6 +697,9 @@ pub fn unassign_face(conn: &Connection, face_id: i64) -> Result<i64, String> {
         params![cluster_id],
     )
     .map_err(|e| format!("unassign recount: {e}"))?;
+    // The photo loses its stamp only when this was its last link to the
+    // named cluster; sync decides per asset, not per face.
+    sync_person_tags(&tx, cluster_id)?;
     tx.commit().map_err(|e| format!("unassign commit: {e}"))?;
     Ok(cluster_id)
 }
@@ -2557,6 +2566,121 @@ pub fn asset_tags(conn: &Connection, asset_id: i64) -> Result<Vec<SceneTag>, Str
     Ok(out)
 }
 
+// MARK: - Person tags (named-cluster stamps on photos)
+
+/// Canonical asset tag for a named person cluster: `person:<name>`.
+/// None for blank names so unnamed clusters stamp nothing.
+pub fn person_tag(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("person:{trimmed}"))
+    }
+}
+
+/// Full reconcile for one cluster: every asset holding a face in the cluster
+/// carries the cluster's current `person:<name>` tag (confidence 1.0), and
+/// any `person:*` tag on an affected asset that no linked named cluster
+/// justifies is removed. Affected = current members plus holders of the
+/// desired tag, so unassign-last and merge-away clean up without knowing
+/// old names, and renames replace instead of stacking. Scene tags and other
+/// `person:*` stamps from sibling clusters sharing the photo are untouched.
+pub fn sync_person_tags(conn: &Connection, cluster_id: i64) -> Result<(), String> {
+    let name: Option<String> = conn
+        .query_row("SELECT name FROM face_clusters WHERE id = ?1", params![cluster_id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("person sync lookup: {e}"))?;
+    let desired = name.as_deref().and_then(person_tag);
+
+    let members: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT a.id, a.path FROM assets a
+                 WHERE EXISTS (SELECT 1 FROM faces f WHERE f.cluster_id = ?1 AND f.path = a.path)",
+            )
+            .map_err(|e| format!("person sync members: {e}"))?;
+        let rows = stmt
+            .query_map(params![cluster_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("person sync members: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("person sync member row: {e}"))?);
+        }
+        out
+    };
+
+    let mut affected: std::collections::HashMap<i64, String> =
+        members.iter().cloned().collect();
+    if let Some(tag) = desired.as_deref() {
+        let mut stmt = conn
+            .prepare("SELECT asset_id FROM asset_tags WHERE tag = ?1")
+            .map_err(|e| format!("person sync holders: {e}"))?;
+        let rows = stmt
+            .query_map(params![tag], |r| r.get::<_, i64>(0))
+            .map_err(|e| format!("person sync holders: {e}"))?;
+        for row in rows {
+            let aid = row.map_err(|e| format!("person sync holder row: {e}"))?;
+            if !affected.contains_key(&aid) {
+                let path: Option<String> = conn
+                    .query_row("SELECT path FROM assets WHERE id = ?1", params![aid], |r| {
+                        r.get(0)
+                    })
+                    .optional()
+                    .map_err(|e| format!("person sync holder path: {e}"))?;
+                if let Some(p) = path {
+                    affected.insert(aid, p);
+                }
+            }
+        }
+    }
+
+    for (aid, path) in &affected {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT fc.name FROM faces f
+                 JOIN face_clusters fc ON fc.id = f.cluster_id
+                 WHERE f.path = ?1 AND fc.name IS NOT NULL AND TRIM(fc.name) <> ''",
+            )
+            .map_err(|e| format!("person sync linked: {e}"))?;
+        let linked: Vec<String> = stmt
+            .query_map(params![path], |r| r.get(0))
+            .map_err(|e| format!("person sync linked: {e}"))?
+            .filter_map(|r| r.map_err(|e| format!("person sync linked row: {e}")).transpose())
+            .collect::<Result<Vec<String>, String>>()?;
+        let justified: std::collections::HashSet<String> =
+            linked.iter().filter_map(|n| person_tag(n)).collect();
+
+        let mut stmt = conn
+            .prepare("SELECT tag FROM asset_tags WHERE asset_id = ?1 AND tag LIKE 'person:%'")
+            .map_err(|e| format!("person sync current: {e}"))?;
+        let current: Vec<String> = stmt
+            .query_map(params![aid], |r| r.get(0))
+            .map_err(|e| format!("person sync current: {e}"))?
+            .filter_map(|r| r.map_err(|e| format!("person sync current row: {e}")).transpose())
+            .collect::<Result<Vec<String>, String>>()?;
+        for tag in &current {
+            if !justified.contains(tag) {
+                conn.execute(
+                    "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag = ?2",
+                    params![aid, tag],
+                )
+                .map_err(|e| format!("person sync remove: {e}"))?;
+            }
+        }
+        for tag in &justified {
+            conn.execute(
+                "INSERT INTO asset_tags (asset_id, tag, confidence) VALUES (?1, ?2, 1.0)
+                 ON CONFLICT (asset_id, tag) DO UPDATE SET confidence = excluded.confidence",
+                params![aid, tag],
+            )
+            .map_err(|e| format!("person sync stamp: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryMonth {
@@ -2963,6 +3087,145 @@ mod tests {
         assert!(unassign_face(&conn, 9999).is_err(), "unknown face errors");
     }
 
+    fn person_tags(conn: &Connection, asset_id: i64) -> Vec<String> {
+        asset_tags(conn, asset_id).unwrap().into_iter().map(|t| t.tag).collect()
+    }
+
+    #[test]
+    fn person_tags_stamp_on_rename_and_replace_on_rerename() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/p1.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/p2.jpg", 1, 2.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let (a1, a2) = (id_for("/p1.jpg"), id_for("/p2.jpg"));
+
+        // A scene tag proves person sync never touches sibling tags.
+        store_tags(&conn, a1, &[("mountain".to_string(), 0.9)]).unwrap();
+
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()
+        };
+        let cid = save_cluster(&conn, &[mk("/p1.jpg")[0], mk("/p2.jpg")[0]]).unwrap();
+
+        rename_cluster(&conn, cid, "Maya").unwrap();
+        for aid in [a1, a2] {
+            assert!(
+                person_tags(&conn, aid).contains(&"person:Maya".to_string()),
+                "rename stamps asset {aid}: {:?}",
+                person_tags(&conn, aid)
+            );
+        }
+        assert!(person_tags(&conn, a1).contains(&"mountain".to_string()), "scene tag survives");
+
+        // A second name replaces the old stamp instead of stacking it.
+        rename_cluster(&conn, cid, "Noor").unwrap();
+        for aid in [a1, a2] {
+            let tags = person_tags(&conn, aid);
+            assert!(tags.contains(&"person:Noor".to_string()), "new stamp on {aid}: {tags:?}");
+            assert!(!tags.contains(&"person:Maya".to_string()), "old stamp replaced on {aid}: {tags:?}");
+        }
+        assert!(person_tags(&conn, a1).contains(&"mountain".to_string()), "scene tag still intact");
+    }
+
+    #[test]
+    fn person_tags_follow_merge_and_drop_source_stamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        for p in ["/a.jpg", "/b.jpg", "/c.jpg", "/d.jpg"] {
+            upsert_asset(&conn, &asset(p, 1, 1.0), scan).unwrap();
+        }
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()[0]
+        };
+
+        // Both sides named: the survivor keeps its own name, the source
+        // stamp is dropped from every moved photo.
+        let a = save_cluster(&conn, &[mk("/a.jpg")]).unwrap();
+        let b = save_cluster(&conn, &[mk("/b.jpg")]).unwrap();
+        rename_cluster(&conn, a, "Maya").unwrap();
+        rename_cluster(&conn, b, "Leo").unwrap();
+        merge_clusters(&conn, a, b).unwrap();
+        for path in ["/a.jpg", "/b.jpg"] {
+            let tags = person_tags(&conn, id_for(path));
+            assert!(tags.contains(&"person:Leo".to_string()), "{path} carries survivor: {tags:?}");
+            assert!(!tags.contains(&"person:Maya".to_string()), "{path} drops source: {tags:?}");
+        }
+        assert!(clusters_list(&conn).unwrap().iter().all(|c| c.id != a), "source row is gone");
+
+        // Unnamed survivor inherits the source name onto every moved photo.
+        let c = save_cluster(&conn, &[mk("/c.jpg")]).unwrap();
+        let d = save_cluster(&conn, &[mk("/d.jpg")]).unwrap();
+        rename_cluster(&conn, c, "Asha").unwrap();
+        merge_clusters(&conn, c, d).unwrap();
+        for path in ["/c.jpg", "/d.jpg"] {
+            assert!(
+                person_tags(&conn, id_for(path)).contains(&"person:Asha".to_string()),
+                "{path} inherits the carried name"
+            );
+        }
+    }
+
+    #[test]
+    fn person_tags_unassign_last_removes_but_sibling_keeps() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/solo.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/lone.jpg", 1, 2.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let (solo, lone) = (id_for("/solo.jpg"), id_for("/lone.jpg"));
+
+        let mk = |path: &str, x: f64| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": x, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()[0]
+        };
+        // /solo.jpg shows the person twice; /lone.jpg once.
+        let (s1, s2, l1) = (mk("/solo.jpg", 0.1), mk("/solo.jpg", 0.5), mk("/lone.jpg", 0.2));
+        let cid = save_cluster(&conn, &[s1, s2, l1]).unwrap();
+        rename_cluster(&conn, cid, "Maya").unwrap();
+        assert!(person_tags(&conn, solo).contains(&"person:Maya".to_string()));
+        assert!(person_tags(&conn, lone).contains(&"person:Maya".to_string()));
+
+        // Detaching one of two links keeps the photo's stamp.
+        unassign_face(&conn, s1).unwrap();
+        assert!(person_tags(&conn, solo).contains(&"person:Maya".to_string()), "sibling face keeps the stamp");
+
+        // Detaching the last link drops it; the other photo is untouched.
+        unassign_face(&conn, s2).unwrap();
+        assert!(!person_tags(&conn, solo).contains(&"person:Maya".to_string()), "last link drops the stamp");
+        assert!(person_tags(&conn, lone).contains(&"person:Maya".to_string()), "other photo keeps its stamp");
+
+        unassign_face(&conn, l1).unwrap();
+        assert!(!person_tags(&conn, lone).contains(&"person:Maya".to_string()), "empty cluster stamps nothing");
+    }
+
     fn b64_encode_test(bytes: &[u8]) -> String {
         const ALPH: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3315,15 +3578,18 @@ mod tests {
         }
         let rows = library(&conn, &q("brunch")).unwrap();
         let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        // The named cluster stamps `person:Brunch Club` on the portrait, so
+        // it now matches at tag tier (tier 1) instead of person tier (3);
+        // within the tier, recency still orders lake morning first.
         assert_eq!(
             paths,
             vec![
                 "/photos/brunch spread.jpg",
                 "/photos/lake morning.jpg",
-                "/photos/hike.jpg",
-                "/photos/portrait.jpg"
+                "/photos/portrait.jpg",
+                "/photos/hike.jpg"
             ],
-            "name > tag > event > person"
+            "name > tag > event; person stamp ranks at tag tier"
         );
         assert_eq!(library_count(&conn, &q("brunch")).unwrap(), 4);
     }
