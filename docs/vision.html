@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>fotoflow — product vision</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#f4f5f7, #0d0f14);
+    --card: light-dark(#ffffff, #151820);
+    --line: light-dark(#dfe2e8, #232733);
+    --ink: light-dark(#16181d, #e7eaf0);
+    --mut: light-dark(#5b6270, #8a93a5);
+    --acc: #2f6bff;
+    --ok: light-dark(#1a7f4b, #4ade80);
+    --soon: light-dark(#9a6b12, #f5b83d);
+    --later: light-dark(#6b7280, #6b7280);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  }
+  main { max-width: 62rem; margin: 0 auto; padding: 2rem clamp(1rem, 4vw, 3rem) 4rem; }
+  h1 { font-size: 2rem; margin: 0; letter-spacing: -0.02em; }
+  .takeaway { font-size: 1.1rem; color: var(--mut); max-width: 60ch; }
+  h2 { font-size: 1.25rem; margin: 2.5rem 0 0.75rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .flow { width: 100%; height: auto; }
+  .flow text { font-size: 12px; fill: var(--ink); }
+  .flow .sub { font-size: 10.5px; fill: var(--mut); }
+  .tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr)); gap: 0.75rem; }
+  .tab h3 { margin: 0 0 0.4rem; font-size: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .tab ul { margin: 0.4rem 0 0; padding-left: 1.1rem; font-size: 0.9rem; color: var(--mut); }
+  .tab li { margin: 0.15rem 0; }
+  .pill {
+    font-size: 0.7rem; font-weight: 600; border-radius: 999px; padding: 0.1rem 0.55rem;
+    border: 1px solid var(--line); white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.soon { color: var(--soon); border-color: var(--soon); }
+  .pill.later { color: var(--later); border-color: var(--later); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--mut); }
+  .size { font-weight: 700; }
+  footer { color: var(--mut); font-size: 0.85rem; margin-top: 2.5rem; }
+  @media print {
+    main { max-width: none; }
+    .card { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>fotoflow — product vision</h1>
+    <p class="takeaway">An on-device photo and video library: import once, and the app organizes, understands, and shares — nothing ever leaves the machine except reverse-geocode lookups.</p>
+  </header>
+
+  <h2>User workflow</h2>
+  <div class="card">
+    <svg class="flow" viewBox="0 0 900 190" role="img" aria-labelledby="flowTitle flowDesc">
+      <title id="flowTitle">fotoflow user workflow</title>
+      <desc id="flowDesc">Six stages left to right: Import, Auto-organize, Find, Understand, Curate, Share. All six shipped.</desc>
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 1 L 9 5 L 0 9" fill="none" stroke="#8a93a5" stroke-width="1.5"/>
+        </marker>
+      </defs>
+      <g font-family="inherit">
+        <rect x="8" y="55" width="128" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="72" y="88" text-anchor="middle">Import</text>
+        <text x="72" y="106" text-anchor="middle" class="sub">folders, verify</text>
+        <rect x="162" y="55" width="128" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="226" y="88" text-anchor="middle">Auto-organize</text>
+        <text x="226" y="106" text-anchor="middle" class="sub">pipeline: enrich,</text>
+        <text x="226" y="120" text-anchor="middle" class="sub">hash, tags, events</text>
+        <rect x="316" y="55" width="128" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="380" y="88" text-anchor="middle">Find</text>
+        <text x="380" y="106" text-anchor="middle" class="sub">search, filters,</text>
+        <text x="380" y="120" text-anchor="middle" class="sub">viewer, favorites</text>
+        <rect x="470" y="55" width="128" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="534" y="88" text-anchor="middle">Understand</text>
+        <text x="534" y="106" text-anchor="middle" class="sub">people, events,</text>
+        <text x="534" y="120" text-anchor="middle" class="sub">scenes, places</text>
+        <rect x="624" y="55" width="128" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="688" y="88" text-anchor="middle">Curate</text>
+        <text x="688" y="106" text-anchor="middle" class="sub">albums, cleanup,</text>
+        <text x="688" y="120" text-anchor="middle" class="sub">multi-select</text>
+        <rect x="778" y="55" width="114" height="80" rx="10" fill="none" stroke="#4ade80" stroke-width="2"/>
+        <text x="835" y="88" text-anchor="middle">Share</text>
+        <text x="835" y="106" text-anchor="middle" class="sub">Drive, WhatsApp,</text>
+        <text x="835" y="120" text-anchor="middle" class="sub">highlights</text>
+        <line x1="136" y1="95" x2="158" y2="95" stroke="#8a93a5" stroke-width="1.5" marker-end="url(#arr)"/>
+        <line x1="290" y1="95" x2="312" y2="95" stroke="#8a93a5" stroke-width="1.5" marker-end="url(#arr)"/>
+        <line x1="444" y1="95" x2="466" y2="95" stroke="#8a93a5" stroke-width="1.5" marker-end="url(#arr)"/>
+        <line x1="598" y1="95" x2="620" y2="95" stroke="#8a93a5" stroke-width="1.5" marker-end="url(#arr)"/>
+        <line x1="752" y1="95" x2="774" y2="95" stroke="#8a93a5" stroke-width="1.5" marker-end="url(#arr)"/>
+      </g>
+    </svg>
+  </div>
+
+  <h2>App today — the six tabs</h2>
+  <div class="tabs">
+    <div class="card tab">
+      <h3>Library <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>Grid, lightbox viewer, video playback</li>
+        <li>Search: names, tags, people, places</li>
+        <li>Favorites, multi-select, indexed folders</li>
+      </ul>
+    </div>
+    <div class="card tab">
+      <h3>Cleanup <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>Exact-duplicate groups, keeper picking</li>
+        <li>Blur scoring, Trash-based delete</li>
+      </ul>
+    </div>
+    <div class="card tab">
+      <h3>People <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>On-device face clustering</li>
+        <li>Naming, cluster merge</li>
+      </ul>
+    </div>
+    <div class="card tab">
+      <h3>Events <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>Time + GPS clustering, timeline view</li>
+        <li>Offline fences + cached place names</li>
+      </ul>
+    </div>
+    <div class="card tab">
+      <h3>Albums <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>Audience lists, picker add/remove</li>
+        <li>Drive + WhatsApp bundles, highlights</li>
+      </ul>
+    </div>
+    <div class="card tab">
+      <h3>Settings <span class="pill ok">shipped</span></h3>
+      <ul>
+        <li>Engine health check</li>
+        <li>On-device privacy note</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Roadmap</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th scope="col">Item</th><th scope="col">Why</th><th scope="col">Size</th></tr></thead>
+      <tbody id="roadmap-body"></tbody>
+    </table>
+  </div>
+
+  <footer>Verified 2026-10-18: 40 Rust tests, svelte-check clean, 21 Playwright specs green. Statuses mirror README + docs/ROADMAP.md.</footer>
+</main>
+
+<script type="application/json" id="roadmap-data">
+[
+  {"item": "CI workflow", "why": "Nothing runs automatically today; stops silent regressions", "size": "S", "when": "Next"},
+  {"item": "Disk-health verify", "why": "Read-probe headers; a USB disk already has unreadable files", "size": "S/M", "when": "Next"},
+  {"item": "Sidecar watchdog", "why": "One bad file stalls all engine traffic until timeout", "size": "S/M", "when": "Next"},
+  {"item": "Thumb disk cache", "why": "Grid rebuilds re-render every thumbnail today", "size": "M", "when": "Next"},
+  {"item": "Background scheduling", "why": "Resume stranded passes after interrupt or eject", "size": "M", "when": "Next"},
+  {"item": "Near-duplicate detection", "why": "Exact-hash exists; near-dups are the real space hogs", "size": "M/L", "when": "Next"},
+  {"item": "Vector semantic search", "why": "Natural-language queries over a CLIP index", "size": "M/L", "when": "Next"},
+  {"item": "Narrated recaps + redaction", "why": "LLM scripts with TTS; privacy-preserving export", "size": "L", "when": "Next"},
+  {"item": "Memory movies + recap sharing", "why": "Apple/Google-style chapters and souvenirs", "size": "L", "when": "Later"},
+  {"item": "Conversational search", "why": "Follow-ups over the embedding index; needs vectors first", "size": "L", "when": "Later"},
+  {"item": "Video depth: Auto Trim + reframe", "why": "Fit-to-length highlights, subject tracking", "size": "L", "when": "Later"}
+]
+</script>
+<script>
+  var data = JSON.parse(document.getElementById("roadmap-data").textContent);
+  var body = document.getElementById("roadmap-body");
+  data.forEach(function (r) {
+    var tr = document.createElement("tr");
+    var pill = r.when === "Next" ? "soon" : "later";
+    tr.innerHTML =
+      "<td><strong></strong> <span class='pill " + pill + "'></span></td>" +
+      "<td></td><td class='size'></td>";
+    tr.children[0].querySelector("strong").textContent = r.item;
+    tr.children[0].querySelector("span").textContent = r.when;
+    tr.children[1].textContent = r.why;
+    tr.children[2].textContent = r.size;
+    body.appendChild(tr);
+  });
+</script>
+</body>
+</html>

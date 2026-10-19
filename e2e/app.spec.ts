@@ -107,6 +107,18 @@ test("filename search narrows and clears", async ({ page }) => {
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
 });
 
+test("concept search finds tags and places", async ({ page }) => {
+  await page.getByRole("searchbox", { name: "Search library" }).fill("mountain");
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await page.getByRole("button", { name: "Clear" }).click();
+  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Resolve place names" }).click();
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("searchbox", { name: "Search library" }).fill("san francisco");
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+});
+
 test("event place names resolve from coordinates", async ({ page }) => {
   await page.getByRole("button", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();

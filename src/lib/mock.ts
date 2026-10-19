@@ -175,8 +175,18 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
   if (opts.query !== undefined) {
     const needle = opts.query.trim().toLowerCase();
     if (needle !== "") {
+      const eventHit = events.some(
+        (e) => e.name.toLowerCase().includes(needle) || (e.place ?? "").toLowerCase().includes(needle),
+      );
       out = out.filter(
-        (a) => a.name.toLowerCase().includes(needle) || a.path.toLowerCase().includes(needle)
+        (a) =>
+          a.name.toLowerCase().includes(needle) ||
+          a.path.toLowerCase().includes(needle) ||
+          (assetTagMap.get(a.id) ?? []).some((t) => t.tag.includes(needle)) ||
+          eventHit ||
+          [...clusterMembers.entries()].some(
+            ([cid, ids]) => ids.has(a.id) && (clusterNames.get(cid) ?? "").toLowerCase().includes(needle),
+          ),
       );
     }
   }

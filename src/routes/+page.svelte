@@ -1271,7 +1271,7 @@
     <div class="path-entry" role="search">
       <input
         type="search"
-        placeholder="Search file names…"
+        placeholder="Search names, tags, people, places…"
         aria-label="Search library"
         bind:value={searchText}
         oninput={queueSearch}

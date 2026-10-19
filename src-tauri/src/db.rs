@@ -1593,7 +1593,23 @@ const LIBRARY_WHERE: &str = "WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
   AND (?6 IS NULL OR COALESCE(captured_at, modified) < ?6)
   AND (?7 IS NULL OR favorite = ?7)
   AND (?8 IS NULL OR EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag = ?8))
-  AND (?9 IS NULL OR a.name LIKE ?9 ESCAPE '\\' OR a.path LIKE ?9 ESCAPE '\\')";
+  AND (?9 IS NULL OR a.name LIKE ?9 ESCAPE '\\' OR a.path LIKE ?9 ESCAPE '\\'
+    OR EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag LIKE ?9 ESCAPE '\\')
+    OR EXISTS (SELECT 1 FROM event_assets ea JOIN events e ON e.id = ea.event_id
+               WHERE ea.asset_id = a.id AND (e.name LIKE ?9 ESCAPE '\\' OR e.place LIKE ?9 ESCAPE '\\'))
+    OR EXISTS (SELECT 1 FROM faces f JOIN face_clusters fc ON fc.id = f.cluster_id
+               WHERE f.path = a.path AND fc.name LIKE ?9 ESCAPE '\\'))";
+
+/// Relevance tier for search results; inert (all zero) without a query.
+/// Name/path hits outrank tag, event, and person hits; recency breaks ties.
+const LIBRARY_RANK: &str = "CASE WHEN ?9 IS NULL THEN 0
+  WHEN a.name LIKE ?9 ESCAPE '\\' OR a.path LIKE ?9 ESCAPE '\\' THEN 0
+  WHEN EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag LIKE ?9 ESCAPE '\\') THEN 1
+  WHEN EXISTS (SELECT 1 FROM event_assets ea JOIN events e ON e.id = ea.event_id
+               WHERE ea.asset_id = a.id AND (e.name LIKE ?9 ESCAPE '\\' OR e.place LIKE ?9 ESCAPE '\\')) THEN 2
+  WHEN EXISTS (SELECT 1 FROM faces f JOIN face_clusters fc ON fc.id = f.cluster_id
+               WHERE f.path = a.path AND fc.name LIKE ?9 ESCAPE '\\') THEN 3
+  ELSE 4 END";
 
 pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, String> {
     let like = q.query.map(|s| format!("%{}%", escape_like(s)));
@@ -1602,7 +1618,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                        width, height, duration, favorite, missing, sha256
                 FROM assets a
                 {LIBRARY_WHERE}
-                ORDER BY COALESCE(captured_at, modified) DESC, id DESC
+                ORDER BY {LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC
                 LIMIT ?10 OFFSET ?11"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
@@ -2124,6 +2140,63 @@ mod tests {
         // Bare % never becomes a wildcard.
         assert_eq!(library(&conn, &q("%")).unwrap().len(), 1);
         assert!(library(&conn, &q("zzz")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn library_search_ranks_name_over_tag_over_event_over_person() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // a: filename hit (tier 0). b: scene-tag hit (tier 1).
+        upsert_asset(&conn, &asset("/photos/brunch spread.jpg", 1, 4.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/photos/lake morning.jpg", 1, 3.0), scan).unwrap();
+        // c: event name hit (tier 2). d: person-name hit (tier 3).
+        upsert_asset(&conn, &asset("/photos/hike.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/photos/portrait.jpg", 1, 1.0), scan).unwrap();
+        let bid: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/photos/lake morning.jpg'", [], |r| r.get(0))
+            .unwrap();
+        let cid: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/photos/hike.jpg'", [], |r| r.get(0))
+            .unwrap();
+        store_tags(&conn, bid, &[("brunch".to_string(), 0.9)]).unwrap();
+        conn.execute(
+            "INSERT INTO events (name, started_at, ended_at, asset_count, face_count, created_at)
+             VALUES ('Brunch outing', 1.0, 2.0, 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        let eid: i64 = conn.query_row("SELECT id FROM events", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO event_assets (event_id, asset_id) VALUES (?1, ?2)",
+            params![eid, cid],
+        )
+        .unwrap();
+        let face_ids = save_faces(
+            &conn,
+            "/photos/portrait.jpg",
+            &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+        )
+        .unwrap();
+        let cluster = save_cluster(&conn, &face_ids).unwrap();
+        rename_cluster(&conn, cluster, "Brunch Club").unwrap();
+
+        fn q(s: &str) -> LibraryQuery<'_> {
+            LibraryQuery { query: Some(s), limit: 10, ..Default::default() }
+        }
+        let rows = library(&conn, &q("brunch")).unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/photos/brunch spread.jpg",
+                "/photos/lake morning.jpg",
+                "/photos/hike.jpg",
+                "/photos/portrait.jpg"
+            ],
+            "name > tag > event > person"
+        );
+        assert_eq!(library_count(&conn, &q("brunch")).unwrap(), 4);
     }
 
     #[test]
