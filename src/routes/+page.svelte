@@ -669,6 +669,7 @@
         `${summary.events} events`,
         `${summary.tagged} tagged`,
         `${summary.embedded} embedded`,
+        `${summary.faces} faces`,
         summary.places > 0 ? `${summary.places} places` : null,
         summary.failed > 0 ? `${summary.failed} failed` : null
       ].filter((b) => b !== null);

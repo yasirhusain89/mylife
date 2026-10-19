@@ -190,6 +190,7 @@ export type PipelineSummary = {
   events: number;
   tagged: number;
   embedded: number;
+  faces: number;
   places: number;
   failed: number;
 };
