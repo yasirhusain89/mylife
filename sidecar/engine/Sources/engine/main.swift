@@ -892,6 +892,25 @@ func quality(path: String, blurThreshold: Double) throws -> [String: Any] {
     return out
 }
 
+/// Scene tags from the built-in Vision classifier (mountain, flower, bird…).
+/// On-device, no model download: ~1000 everyday categories, one pass.
+func classifyScene(path: String, top: Int) throws -> [String: Any] {
+    guard let src = CGImageSourceCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+        let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+    else { throw EngineError(message: "not an image: \(path)") }
+    let req = VNClassifyImageRequest()
+    do {
+        try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+    } catch {
+        throw EngineError(message: "classify failed: \(error)")
+    }
+    let tags = (req.results ?? []).prefix(max(1, top)).map { obs -> [String: Any] in
+        ["tag": obs.identifier, "confidence": Double(obs.confidence)]
+    }
+    return ["path": path, "tags": tags]
+}
+
 // MARK: - Thumbnails
 
 func thumbnail(path: String, maxPx: Int, quality: Double) throws -> [String: Any] {
@@ -1028,6 +1047,10 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
     case "quality":
         guard let path = str("path") else { throw EngineError(message: "quality requires 'path'") }
         return try quality(path: path, blurThreshold: dbl("blurThreshold", 25.0))
+
+    case "classify":
+        guard let path = str("path") else { throw EngineError(message: "classify requires 'path'") }
+        return try classifyScene(path: path, top: int("top", 3))
 
     case "thumb":
         guard let path = str("path") else { throw EngineError(message: "thumb requires 'path'") }

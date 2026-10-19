@@ -14,6 +14,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("../migrations/005_events.sql")),
     (6, include_str!("../migrations/006_albums.sql")),
     (7, include_str!("../migrations/007_geocode.sql")),
+    (8, include_str!("../migrations/008_person_names.sql")),
+    (9, include_str!("../migrations/009_scene_tags.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -264,6 +266,7 @@ pub struct FaceClusterRow {
     pub id: i64,
     pub face_count: i64,
     pub representative_path: Option<String>,
+    pub name: Option<String>,
 }
 
 pub fn save_faces(conn: &Connection, path: &str, faces: &[serde_json::Value]) -> Result<Vec<i64>, String> {
@@ -319,7 +322,8 @@ pub fn clusters_list(conn: &Connection) -> Result<Vec<FaceClusterRow>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT fc.id, fc.face_count,
-                    (SELECT path FROM faces WHERE cluster_id = fc.id ORDER BY confidence DESC LIMIT 1)
+                    (SELECT path FROM faces WHERE cluster_id = fc.id ORDER BY confidence DESC LIMIT 1),
+                    fc.name
              FROM face_clusters fc
              ORDER BY fc.face_count DESC, fc.id",
         )
@@ -330,6 +334,7 @@ pub fn clusters_list(conn: &Connection) -> Result<Vec<FaceClusterRow>, String> {
                 id: r.get(0)?,
                 face_count: r.get(1)?,
                 representative_path: r.get(2)?,
+                name: r.get(3)?,
             })
         })
         .map_err(|e| format!("query clusters: {e}"))?;
@@ -338,6 +343,65 @@ pub fn clusters_list(conn: &Connection) -> Result<Vec<FaceClusterRow>, String> {
         out.push(row.map_err(|e| format!("cluster row: {e}"))?);
     }
     Ok(out)
+}
+
+pub fn rename_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("person name cannot be empty".into());
+    }
+    let changed = conn
+        .execute("UPDATE face_clusters SET name = ?2 WHERE id = ?1", params![cluster_id, name])
+        .map_err(|e| format!("rename cluster: {e}"))?;
+    if changed == 0 {
+        return Err(format!("cluster {cluster_id} not found"));
+    }
+    Ok(())
+}
+
+/// Moves every face from `from_id` into `into_id`, keeps the target's name
+/// unless it is unnamed (then the source name carries over), and drops the
+/// emptied cluster. Returns the merged face count.
+pub fn merge_clusters(conn: &Connection, from_id: i64, into_id: i64) -> Result<i64, String> {
+    if from_id == into_id {
+        return Err("cannot merge a cluster into itself".into());
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| format!("merge tx: {e}"))?;
+    let exists: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM face_clusters WHERE id = ?1 OR id = ?2",
+            params![from_id, into_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("merge lookup: {e}"))?;
+    if exists != 2 {
+        return Err("one of the clusters does not exist".into());
+    }
+    tx.execute(
+        "UPDATE faces SET cluster_id = ?2 WHERE cluster_id = ?1",
+        params![from_id, into_id],
+    )
+    .map_err(|e| format!("merge faces: {e}"))?;
+    tx.execute(
+        "UPDATE face_clusters SET name = COALESCE(name, (SELECT name FROM face_clusters WHERE id = ?1))
+         WHERE id = ?2",
+        params![from_id, into_id],
+    )
+    .map_err(|e| format!("merge name: {e}"))?;
+    tx.execute("DELETE FROM face_clusters WHERE id = ?1", params![from_id])
+        .map_err(|e| format!("drop merged cluster: {e}"))?;
+    let count: i64 = tx
+        .query_row("SELECT COUNT(*) FROM faces WHERE cluster_id = ?1", params![into_id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("merge count: {e}"))?;
+    tx.execute(
+        "UPDATE face_clusters SET face_count = ?2 WHERE id = ?1",
+        params![into_id, count],
+    )
+    .map_err(|e| format!("merge recount: {e}"))?;
+    tx.commit().map_err(|e| format!("merge commit: {e}"))?;
+    Ok(count)
 }
 
 pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRow>, String> {
@@ -1355,6 +1419,10 @@ pub struct LibraryQuery<'a> {
     /// Capture-time window (epoch seconds, half-open [min, max)).
     pub captured_min: Option<f64>,
     pub captured_max: Option<f64>,
+    /// Some(true) = starred only.
+    pub favorite_only: Option<bool>,
+    /// Only assets carrying this scene tag (from `tag_scenes`).
+    pub scene_tag: Option<&'a str>,
     pub offset: i64,
     pub limit: i64,
 }
@@ -1366,7 +1434,9 @@ const LIBRARY_WHERE: &str = "WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
   AND (?3 IS NULL OR EXISTS (SELECT 1 FROM faces f WHERE f.path = a.path AND f.cluster_id = ?3))
   AND (?4 IS NULL OR ((?4 = 1) = (latitude IS NOT NULL)))
   AND (?5 IS NULL OR COALESCE(captured_at, modified) >= ?5)
-  AND (?6 IS NULL OR COALESCE(captured_at, modified) < ?6)";
+  AND (?6 IS NULL OR COALESCE(captured_at, modified) < ?6)
+  AND (?7 IS NULL OR favorite = ?7)
+  AND (?8 IS NULL OR EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag = ?8))";
 
 pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, String> {
     let sql = format!(
@@ -1375,7 +1445,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 FROM assets a
                 {LIBRARY_WHERE}
                 ORDER BY COALESCE(captured_at, modified) DESC, id DESC
-                LIMIT ?7 OFFSET ?8"
+                LIMIT ?9 OFFSET ?10"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
@@ -1387,6 +1457,8 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 q.has_location.map(i64::from),
                 q.captured_min,
                 q.captured_max,
+                q.favorite_only.map(i64::from),
+                q.scene_tag,
                 q.limit,
                 q.offset
             ],
@@ -1429,11 +1501,104 @@ pub fn library_count(conn: &Connection, q: &LibraryQuery) -> Result<i64, String>
             q.person_cluster,
             q.has_location.map(i64::from),
             q.captured_min,
-            q.captured_max
+            q.captured_max,
+            q.favorite_only.map(i64::from),
+            q.scene_tag
         ],
         |r| r.get(0),
     )
     .map_err(|e| format!("library count: {e}"))
+}
+
+/// Stars or unstars one asset. Returns the new value.
+pub fn set_favorite(conn: &Connection, asset_id: i64, favorite: bool) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE assets SET favorite = ?2 WHERE id = ?1",
+            params![asset_id, i64::from(favorite)],
+        )
+        .map_err(|e| format!("set favorite: {e}"))?;
+    if changed == 0 {
+        return Err(format!("asset {asset_id} not found"));
+    }
+    Ok(())
+}
+
+// MARK: - Scene tags (Vision classifier labels, derived like faces)
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneTag {
+    pub tag: String,
+    pub confidence: f64,
+}
+
+/// Readable images with no tags yet (videos are skipped: the classifier is
+/// stills-only, and a 0.5s poster frame mislabels motion).
+pub fn untagged_images(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path FROM assets
+             WHERE kind = 'image' AND missing = 0
+             AND NOT EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = assets.id)
+             ORDER BY id",
+        )
+        .map_err(|e| format!("prepare untagged: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query untagged: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("untagged row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn store_tags(conn: &Connection, asset_id: i64, tags: &[(String, f64)]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("tags tx: {e}"))?;
+    for (tag, confidence) in tags {
+        tx.execute(
+            "INSERT INTO asset_tags (asset_id, tag, confidence) VALUES (?1, ?2, ?3)
+             ON CONFLICT (asset_id, tag) DO UPDATE SET confidence = excluded.confidence",
+            params![asset_id, tag, confidence],
+        )
+        .map_err(|e| format!("store tag: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("tags commit: {e}"))?;
+    Ok(())
+}
+
+/// Distinct tags in the library with asset counts, most common first.
+pub fn distinct_tags(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tag, COUNT(DISTINCT asset_id) FROM asset_tags
+             GROUP BY tag ORDER BY COUNT(DISTINCT asset_id) DESC, tag",
+        )
+        .map_err(|e| format!("prepare tags: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query tags: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("tag row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Tags for one asset, best first (viewer display).
+pub fn asset_tags(conn: &Connection, asset_id: i64) -> Result<Vec<SceneTag>, String> {
+    let mut stmt = conn
+        .prepare("SELECT tag, confidence FROM asset_tags WHERE asset_id = ?1 ORDER BY confidence DESC")
+        .map_err(|e| format!("prepare asset tags: {e}"))?;
+    let rows = stmt
+        .query_map(params![asset_id], |r| Ok(SceneTag { tag: r.get(0)?, confidence: r.get(1)? }))
+        .map_err(|e| format!("query asset tags: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("asset tag row: {e}"))?);
+    }
+    Ok(out)
 }
 
 #[derive(Serialize)]
@@ -1513,10 +1678,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 7, "user_version tracks the highest applied migration");
+        assert_eq!(v, 9, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -1633,6 +1798,38 @@ mod tests {
     }
 
     #[test]
+    fn cluster_names_and_merges() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()
+        };
+        let a = save_cluster(&conn, &mk("/a.jpg")).unwrap();
+        let b = save_cluster(&conn, &mk("/b.jpg")).unwrap();
+
+        rename_cluster(&conn, a, "Maya").unwrap();
+        assert!(rename_cluster(&conn, a, "  ").is_err(), "blank names rejected");
+        assert!(rename_cluster(&conn, 9999, "Ghost").is_err(), "unknown cluster errors");
+
+        // Unnamed target inherits the source name; counts merge; source gone.
+        let merged = merge_clusters(&conn, a, b).unwrap();
+        assert_eq!(merged, 2);
+        let clusters = clusters_list(&conn).unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].id, b);
+        assert_eq!(clusters[0].name.as_deref(), Some("Maya"));
+        assert_eq!(faces_in_cluster(&conn, b).unwrap().len(), 2);
+
+        assert!(merge_clusters(&conn, b, b).is_err(), "self-merge rejected");
+        assert!(merge_clusters(&conn, b, 9999).is_err(), "missing target errors");
+    }
+
+    #[test]
     fn library_filters_by_month_location_and_person() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -1683,6 +1880,64 @@ mod tests {
         assert_eq!(months.len(), 2);
         assert_eq!(months[0].month, "2026-11");
         assert_eq!(months[1].month, "2026-10");
+    }
+
+    #[test]
+    fn favorites_toggle_and_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        let aid: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0))
+            .unwrap();
+
+        let starred = LibraryQuery { favorite_only: Some(true), limit: 10, ..Default::default() };
+        assert!(library(&conn, &starred).unwrap().is_empty());
+        set_favorite(&conn, aid, true).unwrap();
+        let rows = library(&conn, &starred).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/a.jpg");
+        assert_eq!(library_count(&conn, &starred).unwrap(), 1);
+        set_favorite(&conn, aid, false).unwrap();
+        assert!(library(&conn, &starred).unwrap().is_empty());
+        assert!(set_favorite(&conn, 9999, true).is_err(), "unknown asset errors");
+    }
+
+    #[test]
+    fn scene_tags_store_and_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        let aid: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(untagged_images(&conn).unwrap().len() == 2);
+        store_tags(&conn, aid, &[("mountain".to_string(), 0.9), ("lake".to_string(), 0.4)]).unwrap();
+        // Re-storing updates confidence instead of duplicating.
+        store_tags(&conn, aid, &[("mountain".to_string(), 0.95)]).unwrap();
+
+        let remaining = untagged_images(&conn).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, "/b.jpg");
+
+        let tags = distinct_tags(&conn).unwrap();
+        assert_eq!(tags.len(), 2);
+        let mine = asset_tags(&conn, aid).unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].tag, "mountain");
+
+        let q = LibraryQuery { scene_tag: Some("mountain"), limit: 10, ..Default::default() };
+        let rows = library(&conn, &q).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/a.jpg");
+        assert_eq!(library_count(&conn, &q).unwrap(), 1);
+        let none = LibraryQuery { scene_tag: Some("bird"), limit: 10, ..Default::default() };
+        assert!(library(&conn, &none).unwrap().is_empty());
     }
 
     #[test]

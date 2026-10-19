@@ -41,6 +41,11 @@ export const libraryCount = pick("libraryCount");
 export const libraryMonths = pick("libraryMonths");
 export const libraryStats = pick("libraryStats");
 export const scanRoots = pick("scanRoots");
+export const setFavorite = pick("setFavorite");
+export const tagScenes = pick("tagScenes");
+export const onTagProgress = pick("onTagProgress");
+export const sceneTags = pick("sceneTags");
+export const assetTags = pick("assetTags");
 export const onImportProgress = pick("onImportProgress");
 export const onImportError = pick("onImportError");
 export const enrichAssets = pick("enrichAssets");
@@ -57,6 +62,8 @@ export const runFaceClustering = pick("runFaceClustering");
 export const verifyLibrary = pick("verifyLibrary");
 export const onClusterProgress = pick("onClusterProgress");
 export const clustersList = pick("clustersList");
+export const renameCluster = pick("renameCluster");
+export const mergeClusters = pick("mergeClusters");
 export const facesInCluster = pick("facesInCluster");
 export const facesCount = pick("facesCount");
 export const clusterEvents = pick("clusterEvents");
@@ -125,6 +132,10 @@ export type {
   LibraryMonth,
   LibraryStats,
   ResolvePlacesSummary,
-  ScanRoot
+  ScanRoot,
+  SceneTag,
+  SceneTagCount,
+  TagProgress,
+  TagScenesSummary
 } from "./library";
 export type { SysInfo } from "./engine";

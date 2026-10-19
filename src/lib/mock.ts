@@ -22,6 +22,10 @@ import type {
   LibraryStats,
   ResolvePlacesSummary,
   ScanRoot,
+  SceneTag,
+  SceneTagCount,
+  TagProgress,
+  TagScenesSummary,
   ClusterProgress
 } from "./library";
 
@@ -124,6 +128,7 @@ function memberOf(a: AssetRow): DuplicateMember {
 
 let clusters: FaceClusterRow[] = [];
 let facesByCluster = new Map<number, FaceRow[]>();
+let clusterNames = new Map<number, string>();
 let faceId = 1;
 
 let events: EventRow[] = [];
@@ -161,6 +166,10 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
   }
   if (opts.capturedMin !== undefined) out = out.filter((a) => (a.capturedAt ?? 0) >= opts.capturedMin!);
   if (opts.capturedMax !== undefined) out = out.filter((a) => (a.capturedAt ?? 0) < opts.capturedMax!);
+  if (opts.favoriteOnly) out = out.filter((a) => a.favorite !== 0);
+  if (opts.sceneTag !== undefined) {
+    out = out.filter((a) => (assetTagMap.get(a.id) ?? []).some((t) => t.tag === opts.sceneTag));
+  }
   if (opts.personCluster !== undefined) {
     const members = clusterMembers.get(opts.personCluster);
     out = members ? out.filter((a) => members.has(a.id)) : [];
@@ -194,8 +203,7 @@ export async function libraryMonths(): Promise<LibraryMonth[]> {
     .sort((a, b) => (a.month < b.month ? 1 : -1));
 }
 
-export async function libraryStats(): Promise<LibraryStats> {
-  const photos = assets.filter((a) => a.kind === "image").length;
+export async function libraryStats(): Promise<LibraryStats> {  const photos = assets.filter((a) => a.kind === "image").length;
   return {
     photos,
     videos: assets.filter((a) => a.kind === "video").length,
@@ -273,6 +281,37 @@ export async function trashAssets(ids: number[]): Promise<{ trashed: number; fai
   return { trashed: ids.length, failed: [] };
 }
 
+export async function setFavorite(assetId: number, favorite: boolean): Promise<void> {
+  assets = assets.map((a) => (a.id === assetId ? { ...a, favorite: favorite ? 1 : 0 } : a));
+}
+
+let assetTagMap = new Map<number, SceneTag[]>([
+  [1, [{ tag: "mountain", confidence: 0.91 }, { tag: "lake", confidence: 0.62 }]],
+  [4, [{ tag: "flower", confidence: 0.83 }]]
+]);
+
+export async function tagScenes(): Promise<TagScenesSummary> {
+  return { total: assets.length, tagged: assetTagMap.size, failed: 0 };
+}
+
+export function onTagProgress(_cb: (p: TagProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
+export async function sceneTags(): Promise<SceneTagCount[]> {
+  const counts = new Map<string, number>();
+  for (const tags of assetTagMap.values()) {
+    for (const t of tags) counts.set(t.tag, (counts.get(t.tag) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+export async function assetTags(assetId: number): Promise<SceneTag[]> {
+  return assetTagMap.get(assetId) ?? [];
+}
+
 export async function runFaceClustering(): Promise<{
   images: number;
   faces: number;
@@ -296,8 +335,8 @@ export async function runFaceClustering(): Promise<{
   const clusterA = images.slice(0, Math.max(3, images.length - 2)).map(faceFor);
   const clusterB = images.slice(-2).map(faceFor);
   const list = [
-    { id: 1, faceCount: clusterA.length, representativePath: clusterA[0]?.path ?? null },
-    { id: 2, faceCount: clusterB.length, representativePath: clusterB[0]?.path ?? null }
+    { id: 1, faceCount: clusterA.length, representativePath: clusterA[0]?.path ?? null, name: clusterNames.get(1) ?? null },
+    { id: 2, faceCount: clusterB.length, representativePath: clusterB[0]?.path ?? null, name: clusterNames.get(2) ?? null }
   ];
   clusters = list;
   facesByCluster = new Map([
@@ -323,6 +362,34 @@ export async function verifyLibrary(): Promise<{ missing: number; restored: numb
 
 export async function clustersList(): Promise<FaceClusterRow[]> {
   return clusters;
+}
+
+export async function renameCluster(clusterId: number, name: string): Promise<void> {
+  const clean = name.trim();
+  if (!clean) throw new Error("person name cannot be empty");
+  clusterNames.set(clusterId, clean);
+  clusters = clusters.map((c) => (c.id === clusterId ? { ...c, name: clean } : c));
+}
+
+export async function mergeClusters(fromId: number, intoId: number): Promise<{ merged: number }> {
+  if (fromId === intoId) throw new Error("cannot merge a cluster into itself");
+  const from = facesByCluster.get(fromId) ?? [];
+  const into = facesByCluster.get(intoId) ?? [];
+  facesByCluster.set(intoId, [...into, ...from]);
+  facesByCluster.delete(fromId);
+  const idsA = clusterMembers.get(fromId) ?? new Set<number>();
+  const idsB = clusterMembers.get(intoId) ?? new Set<number>();
+  clusterMembers.set(intoId, new Set([...idsB, ...idsA]));
+  clusterMembers.delete(fromId);
+  if (!clusterNames.get(intoId) && clusterNames.get(fromId)) {
+    clusterNames.set(intoId, clusterNames.get(fromId)!);
+  }
+  clusterNames.delete(fromId);
+  const merged = into.length + from.length;
+  clusters = clusters
+    .filter((c) => c.id !== fromId)
+    .map((c) => (c.id === intoId ? { ...c, faceCount: merged, name: clusterNames.get(intoId) ?? null } : c));
+  return { merged };
 }
 
 export async function facesInCluster(clusterId: number): Promise<FaceRow[]> {

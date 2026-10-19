@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open, isWebMode, assetUrl } from "$lib/bridge";
-  import {
+  import { open, isWebMode, assetUrl } from "$lib/bridge";  import {
     blurredAssets,
     cleanupStats,
     clustersList,
+    renameCluster,
+    mergeClusters,
     clusterEvents,
     eventsList,
     eventAssets,
@@ -43,6 +44,11 @@
     type LibraryMonth,
     libraryStats,
     scanRoots,
+    setFavorite,
+    tagScenes,
+    onTagProgress,
+    sceneTags,
+    assetTags,
     onImportError,
     onImportProgress,
     onClusterProgress,
@@ -60,7 +66,10 @@
     type EnrichProgress,
     type ImportProgress,
     type LibraryStats,
-    type ScanRoot
+    type ScanRoot,
+    type SceneTag,
+    type SceneTagCount,
+    type TagProgress
   } from "$lib/bridge";
   import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
 
@@ -78,6 +87,11 @@
   let stats = $state<LibraryStats | null>(null);
   let roots = $state<ScanRoot[]>([]);
   let filter = $state<"all" | "image" | "video">("all");
+  let favFilter = $state(false);
+  let sceneFilter = $state<string | null>(null);
+  let tagOptions = $state<SceneTagCount[]>([]);
+  let tagging = $state(false);
+  let tagState = $state<TagProgress | null>(null);
   let monthFilter = $state<string | null>(null);
   let locFilter = $state<"all" | "with" | "without">("all");
   let personFilter = $state<number | null>(null);
@@ -94,6 +108,8 @@
     const [capturedMin, capturedMax] = monthFilter ? monthBounds(monthFilter) : [undefined, undefined];
     return {
       kind: filter === "all" ? undefined : filter,
+      favoriteOnly: favFilter || undefined,
+      sceneTag: sceneFilter ?? undefined,
       personCluster: personFilter ?? undefined,
       hasLocation: locFilter === "all" ? undefined : locFilter === "with",
       capturedMin,
@@ -106,6 +122,7 @@
   let error = $state<string | null>(null);
   let thumbs = $state<Record<string, string>>({});
   let people = $state<FaceClusterRow[]>([]);
+  let mergeSelect = $state<Set<number>>(new Set());
   let typedPath = $state("");
   let enriching = $state(false);
   let enrichState = $state<EnrichProgress | null>(null);
@@ -129,6 +146,12 @@
   let viewer = $state<{ index: number } | null>(null);
   let viewerSrc = $state<string | null>(null);
   let viewerError = $state<string | null>(null);
+  let viewerTags = $state<SceneTag[]>([]);
+  // Library multi-select: checkbox set + batch actions.
+  let selectMode = $state(false);
+  let selected = $state<Set<number>>(new Set());
+  let albumOptions = $state<AlbumRow[]>([]);
+  let batchAlbum = $state<number | null>(null);
   let toast = $state<string | null>(null);
 
   async function checkEngine() {
@@ -179,6 +202,11 @@
       roots = await scanRoots();
     } catch {
       roots = [];
+    }
+    try {
+      tagOptions = await sceneTags();
+    } catch {
+      tagOptions = [];
     }
   }
 
@@ -303,18 +331,86 @@
     };
   }
 
+  async function toggleFavorite(a: AssetRow) {
+    const next = a.favorite === 0;
+    try {
+      await setFavorite(a.id, next);
+      for (let i = 0; i < assets.length; i++) {
+        if (assets[i].id === a.id) {
+          assets[i] = { ...assets[i], favorite: next ? 1 : 0 };
+          break;
+        }
+      }
+      // An unstarred photo drops out of the Favorites view.
+      if (favFilter && !next) await refresh();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function toggleSelect(id: number) {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    selected = next;
+  }
+
+  async function enterSelectMode() {
+    selectMode = true;
+    selected = new Set();
+    try {
+      albumOptions = await albumsList();
+      batchAlbum = albumOptions.length > 0 ? albumOptions[0].id : null;
+    } catch {
+      albumOptions = [];
+      batchAlbum = null;
+    }
+  }
+
+  async function batchFavorite() {
+    const ids = [...selected];
+    try {
+      for (const id of ids) await setFavorite(id, true);
+      toast = `Starred ${ids.length} asset${ids.length === 1 ? "" : "s"}`;
+      selected = new Set();
+      await refresh();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function batchAddToAlbum() {
+    if (batchAlbum === null || selected.size === 0) return;
+    try {
+      const r = await albumAdd(batchAlbum, [...selected]);
+      toast = `Added ${r.added} photo${r.added === 1 ? "" : "s"} to the album`;
+      selected = new Set();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function batchTrash() {
+    if (selected.size === 0) return;
+    deleteMode = "trash";
+    confirm = { ids: [...selected], label: `${selected.size} selected assets` };
+    selected = new Set();
+  }
+
   // Lightbox viewer: full-size image via the engine, video via asset URL.
   function openViewer(index: number) {
     if (index < 0 || index >= assets.length) return;
     viewer = { index };
     viewerSrc = null;
     viewerError = null;
+    viewerTags = [];
     void loadViewer(assets[index]);
   }
 
   async function loadViewer(a: AssetRow) {
     viewerSrc = null;
     viewerError = null;
+    viewerTags = [];
     try {
       if (a.kind === "video") {
         const url = assetUrl(a.path);
@@ -324,6 +420,11 @@
         const { image } = await engineThumb(a.path, 1600);
         if (!image) throw new Error("engine returned no image");
         viewerSrc = thumbSrc(image);
+      }
+      try {
+        viewerTags = await assetTags(a.id);
+      } catch {
+        viewerTags = [];
       }
     } catch (e) {
       viewerError = String(e).replace(/^Error: /, "");
@@ -459,6 +560,41 @@
       error = String(e).replace(/^Error: /, "");
     } finally {
       peopleLoading = false;
+    }
+  }
+
+  async function doRenameCluster(cluster: FaceClusterRow) {
+    const name = window.prompt("Person name", cluster.name ?? "");
+    if (name === null || name.trim() === "" || name.trim() === (cluster.name ?? "")) return;
+    try {
+      await renameCluster(cluster.id, name.trim());
+      people = await clustersList();
+      void loadPersonOptions();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function toggleMerge(id: number) {
+    const next = new Set(mergeSelect);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    mergeSelect = next;
+  }
+
+  async function runMerge() {
+    if (mergeSelect.size < 2) return;
+    const ids = [...mergeSelect].sort((a, b) => a - b);
+    const into = ids[0];
+    try {
+      for (let k = 1; k < ids.length; k++) await mergeClusters(ids[k], into);
+      mergeSelect = new Set();
+      people = await clustersList();
+      void loadClusterFaces();
+      void loadPersonOptions();
+      toast = `Merged into one person (${people.find((c) => c.id === into)?.faceCount ?? 0} faces)`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
     }
   }
 
@@ -674,6 +810,27 @@
     }
   }
 
+  function groupEventsByMonth(list: EventRow[]): { month: string; events: EventRow[] }[] {
+    const map = new Map<string, EventRow[]>();
+    for (const e of list) {
+      const d = new Date(e.startedAt * 1000);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const bucket = map.get(key);
+      if (bucket) bucket.push(e);
+      else map.set(key, [e]);
+    }
+    return [...map.entries()].map(([month, bucket]) => ({ month, events: bucket }));
+  }
+
+  function monthLabel(m: string): string {
+    const [y, mo] = m.split("-").map(Number);
+    return new Date(Date.UTC(y, mo - 1, 1)).toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC"
+    });
+  }
+
   async function runFindDuplicates() {
     hashing = true;
     hashState = null;
@@ -746,6 +903,25 @@
     }
   }
 
+  async function runTagScenes() {
+    if (tagging) return;
+    tagging = true;
+    tagState = null;
+    try {
+      const summary = await tagScenes();
+      toast =
+        summary.total === 0
+          ? "Every photo already has scene tags"
+          : `Tagged ${summary.tagged} of ${summary.total} photos` +
+            (summary.failed > 0 ? ` (${summary.failed} unreadable)` : "");
+      await refresh();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      tagging = false;
+    }
+  }
+
   async function chooseFolder() {
     try {
       const picked = await open({ directory: true, multiple: false, title: "Add photo folder" });
@@ -798,6 +974,9 @@
       }),
       onGeocodeError((m) => {
         error = m;
+      }),
+      onTagProgress((p) => {
+        if (tagging) tagState = p;
       })
     ];
     void refresh();
@@ -904,7 +1083,7 @@
                     {#if member.id === group.keptId}
                       <span class="badge keep">keeper</span>
                     {:else}
-                      <div class="row-actions">
+            <div class="row-actions">
                         <button class="tiny" onclick={() => void chooseKeeper(group.id, member.id)}>
                           Keep this
                         </button>
@@ -959,6 +1138,11 @@
       <button onclick={chooseFolder} disabled={importing}>
         {importing ? "Importing…" : "Add folder"}
       </button>
+      {#if selectMode}
+        <button class="ghost" onclick={() => { selectMode = false; selected = new Set(); }}>Done</button>
+      {:else}
+        <button class="ghost" onclick={() => void enterSelectMode()}>Select</button>
+      {/if}
     </div>
 
     <form
@@ -1017,6 +1201,9 @@
         <button class="chip" class:on={filter === "video"} onclick={() => { filter = "video"; void refresh(); }}>
           {stats.videos} videos
         </button>
+        <button class="chip" class:on={favFilter} onclick={() => { favFilter = !favFilter; void refresh(); }} aria-pressed={favFilter}>
+          ★ Favorites
+        </button>
         <span class="total">{fmtBytes(stats.bytes)} indexed</span>
       </div>
 
@@ -1064,7 +1251,23 @@
             <option value="">Everyone</option>
             {#each personOptions as c (c.id)}
               <option value={c.id} selected={personFilter === c.id}>
-                Person {c.id} ({c.faceCount})
+                {c.name ?? `Person ${c.id}`} ({c.faceCount})
+              </option>
+            {/each}
+          </select>
+        {/if}
+        {#if tagOptions.length > 0}
+          <select
+            aria-label="Filter by scene"
+            onchange={(e) => {
+              sceneFilter = e.currentTarget.value || null;
+              void refresh();
+            }}
+          >
+            <option value="">Every scene</option>
+            {#each tagOptions as t (t.tag)}
+              <option value={t.tag} selected={sceneFilter === t.tag}>
+                {t.tag} ({t.count})
               </option>
             {/each}
           </select>
@@ -1088,26 +1291,65 @@
           <button class="ghost" onclick={() => void runEnrich()} disabled={enriching}>
             {enriching ? "Reading metadata…" : "Refresh metadata"}
           </button>
+          <button class="ghost" onclick={() => void runTagScenes()} disabled={tagging || enriching}>
+            {tagging ? "Tagging scenes…" : "Tag scenes"}
+          </button>
           {#if enrichState && enrichState.processed > 0}
             <span class="hint">
               {enrichState.enriched} enriched · {enrichState.failed} unreadable
               {#if enrichState.pending > 0}· {enrichState.pending} pending{/if}
             </span>
           {/if}
+          {#if tagState && tagging}
+            <span class="hint">
+              {tagState.processed} of {tagState.total} photos · {tagState.tagged} tagged
+            </span>
+          {/if}
         </div>
       {/if}
+    {/if}
+
+    {#if selectMode}
+      <div class="enrich batch-bar">
+        <span class="hint">{selected.size} selected</span>
+        <button class="ghost" disabled={selected.size === 0} onclick={() => void batchFavorite()}>★ Star</button>
+        {#if albumOptions.length > 0}
+          <select
+            aria-label="Add selected to album"
+            onchange={(e) => { batchAlbum = e.currentTarget.value === "" ? null : Number(e.currentTarget.value); }}
+          >
+            {#each albumOptions as a (a.id)}
+              <option value={a.id} selected={batchAlbum === a.id}>{a.name}</option>
+            {/each}
+          </select>
+          <button class="ghost" disabled={selected.size === 0 || batchAlbum === null} onclick={() => void batchAddToAlbum()}>
+            Add to album
+          </button>
+        {/if}
+        <button class="tiny danger" disabled={selected.size === 0} onclick={batchTrash}>Trash</button>
+        <button class="ghost" disabled={selected.size === 0} onclick={() => (selected = new Set())}>Clear</button>
+      </div>
     {/if}
 
     {#if assets.length}
       <div class="grid">
         {#each assets as asset, i (asset.id)}
-          <figure>
+          <figure class:selected={selected.has(asset.id)}>
+            {#if selectMode}
+              <input
+                type="checkbox"
+                class="selbox"
+                checked={selected.has(asset.id)}
+                aria-label={`Select ${asset.name}`}
+                onchange={() => toggleSelect(asset.id)}
+              />
+            {/if}
             <button
               type="button"
               class="thumb clickable"
               use:observeThumb={asset.path}
-              title={`Open ${asset.name}`}
-              onclick={() => openViewer(i)}
+              title={selectMode ? `Select ${asset.name}` : `Open ${asset.name}`}
+              onclick={() => { if (selectMode) toggleSelect(asset.id); else openViewer(i); }}
             >
               {#if thumbs[asset.path]}
                 <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
@@ -1116,7 +1358,18 @@
               {/if}
             </button>
             <figcaption>
-              <span class="name" title={asset.name}>{asset.name}</span>
+              <span class="caption-row">
+                <button
+                  type="button"
+                  class="star"
+                  class:on={asset.favorite !== 0}
+                  aria-label={asset.favorite !== 0 ? `Unstar ${asset.name}` : `Star ${asset.name}`}
+                  title={asset.favorite !== 0 ? "Unstar" : "Star"}
+                  aria-pressed={asset.favorite !== 0}
+                  onclick={() => void toggleFavorite(asset)}
+                >★</button>
+                <span class="name" title={asset.name}>{asset.name}</span>
+              </span>
               <span class="meta">
                 {asset.capturedAt ?? asset.modified ? fmtDate(asset.capturedAt ?? asset.modified) : "—"}
                 {#if asset.width && asset.height} · {asset.width}×{asset.height}{/if}
@@ -1160,10 +1413,32 @@
         </p>
       {/if}
       {#if people.length}
+        {#if mergeSelect.size >= 2}
+          <div class="enrich batch-bar">
+            <span class="hint">{mergeSelect.size} selected</span>
+            <button onclick={() => void runMerge()}>
+              Merge into #{[...mergeSelect].sort((a, b) => a - b)[0]}
+            </button>
+            <button class="ghost" onclick={() => (mergeSelect = new Set())}>Clear</button>
+          </div>
+        {/if}
         {#each people as cluster (cluster.id)}
           <article class="group">
             <header>
-              <span>Cluster {cluster.id}</span>
+              <span class="cluster-head">
+                <input
+                  type="checkbox"
+                  class="selbox-inline"
+                  checked={mergeSelect.has(cluster.id)}
+                  aria-label={`Select cluster ${cluster.id} for merge`}
+                  onchange={() => toggleMerge(cluster.id)}
+                />
+                <button
+                  class="ename"
+                  title="Click to name this person"
+                  onclick={() => void doRenameCluster(cluster)}
+                >{cluster.name ?? `Cluster ${cluster.id}`}</button>
+              </span>
               <span class="waste">{cluster.faceCount} face{cluster.faceCount === 1 ? "" : "s"}</span>
             </header>
             {#if peopleFaces[cluster.id]?.length}
@@ -1211,7 +1486,10 @@
       {/if}
       <p class="hint">Place names come from OpenStreetMap and are cached on this device.</p>
       {#if events.length}
-        {#each events as event (event.id)}
+        <div class="timeline">
+          {#each groupEventsByMonth(events) as g (g.month)}
+            <h3 class="sub timeline-month">{monthLabel(g.month)}</h3>
+            {#each g.events as event (event.id)}
           <article class="group event-card">
             <header>
               <button class="ename" title="Click to rename" onclick={() => void doRename(event)}>{event.name}</button>
@@ -1228,6 +1506,7 @@
                 : "no location")}
             </p>
             <div class="row-actions">
+              <button class="tiny" onclick={() => void doRename(event)}>Rename</button>
               <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>
                 {exportBusy === `e${event.id}-drive` ? "Copying…" : "For Google Drive"}
               </button>
@@ -1253,7 +1532,9 @@
               </p>
             {/if}
           </article>
-        {/each}
+            {/each}
+          {/each}
+        </div>
       {:else if !eventsLoading}
         <p class="hint">No events yet — cluster the library by time and place.</p>
       {/if}
@@ -1447,6 +1728,14 @@
           <div class="viewer-bar">
             <span class="hint">{viewer.index + 1} of {assets.length}</span>
             <span class="viewer-name" title={current.name}>{current.name}</span>
+            <button
+              type="button"
+              class="star"
+              class:on={current.favorite !== 0}
+              title={current.favorite !== 0 ? "Unstar" : "Star"}
+              aria-pressed={current.favorite !== 0}
+              onclick={() => void toggleFavorite(current)}
+            >★</button>
             <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
           </div>
           <div class="viewer-stage">
@@ -1474,6 +1763,7 @@
             {current.capturedAt ?? current.modified ? fmtDate(current.capturedAt ?? current.modified) : "—"}
             {#if current.width && current.height} · {current.width}×{current.height}{/if}
             · {fmtBytes(current.sizeBytes)}
+            {#if viewerTags.length > 0} · {viewerTags.map((t) => t.tag).join(", ")}{/if}
           </p>
         </div>
       </div>
@@ -1842,6 +2132,17 @@
     max-height: 82vh;
     overflow: auto;
   }
+  .timeline {
+    border-left: 2px solid #232733;
+    margin: 0.6rem 0 0 0.35rem;
+    padding-left: 0.9rem;
+  }
+  .timeline-month {
+    margin-top: 0.75rem;
+  }
+  .timeline-month:first-child {
+    margin-top: 0.25rem;
+  }
   .picker-grid {
     max-height: 58vh;
     overflow: auto;
@@ -1946,6 +2247,47 @@
   .grid > figure {
     min-width: 0;
   }
+  .grid > figure.selected {
+    outline: 2px solid #2f6bff;
+    border-radius: 8px;
+  }
+  .grid > figure {
+    position: relative;
+  }
+  .selbox {
+    position: absolute;
+    top: 0.35rem;
+    left: 0.35rem;
+    z-index: 1;
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: #2f6bff;
+  }
+  .selbox-inline {
+    width: 1rem;
+    height: 1rem;
+    accent-color: #2f6bff;
+    flex: none;
+  }
+  .cluster-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+  .batch-bar {
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .batch-bar select {
+    background: #0d0f14;
+    border: 1px solid #232733;
+    border-radius: 8px;
+    color: #e7eaf0;
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.5rem;
+  }
   figure {
     margin: 0;
   }
@@ -1979,6 +2321,28 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .caption-row {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    min-width: 0;
+  }
+  .caption-row .name {
+    flex: 1;
+    min-width: 0;
+  }
+  button.star {
+    flex: none;
+    background: transparent;
+    border: 0;
+    padding: 0 0.1rem;
+    font-size: 0.85rem;
+    line-height: 1;
+    color: #4a5160;
+  }
+  button.star.on {
+    color: #f5b83d;
   }
   .meta {
     color: #7b8496;

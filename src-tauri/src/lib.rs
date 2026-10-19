@@ -426,6 +426,115 @@ fn duplicates_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::DuplicateG
     db::duplicate_groups(&conn)
 }
 
+// MARK: - Scene tags
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TagProgress {
+    pub processed: i64,
+    pub total: i64,
+    pub tagged: i64,
+    pub failed: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagScenesSummary {
+    pub total: i64,
+    pub tagged: i64,
+    pub failed: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneTagCount {
+    pub tag: String,
+    pub count: i64,
+}
+
+/// Classifies every untagged readable image with the on-device Vision scene
+/// classifier (mountains, flowers, birds…) and stores the top labels.
+/// One failed file never aborts the run.
+#[tauri::command]
+async fn tag_scenes(app: tauri::AppHandle) -> Result<TagScenesSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        let targets = db::untagged_images(&conn)?;
+        let total = targets.len() as i64;
+        let mut tagged = 0i64;
+        let mut failed = 0i64;
+        for (i, (id, path)) in targets.iter().enumerate() {
+            let ok = if !std::path::Path::new(path).exists() {
+                false
+            } else {
+                match engine::call_blocking(
+                    &engine_state,
+                    "classify",
+                    Some(json!({ "path": path, "top": 3 })),
+                    Duration::from_secs(60),
+                ) {
+                    Ok(reply) => {
+                        let tags: Vec<(String, f64)> = reply
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|t| {
+                                        Some((
+                                            t.get("tag")?.as_str()?.to_string(),
+                                            t.get("confidence")?.as_f64()?,
+                                        ))
+                                    })
+                                    .filter(|(_, c)| *c >= 0.2)
+                                    .take(3)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if tags.is_empty() {
+                            false
+                        } else {
+                            db::store_tags(&conn, *id, &tags).is_ok()
+                        }
+                    }
+                    Err(_) => false,
+                }
+            };
+            if ok {
+                tagged += 1;
+            } else {
+                failed += 1;
+            }
+            let _ = app.emit(
+                "tag-progress",
+                TagProgress { processed: (i + 1) as i64, total, tagged, failed },
+            );
+        }
+        Ok(TagScenesSummary { total, tagged, failed })
+    })
+    .await
+    .map_err(|e| format!("tag task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn scene_tags(conn: tauri::State<'_, DbState>) -> Result<Vec<SceneTagCount>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    Ok(db::distinct_tags(&conn)?
+        .into_iter()
+        .map(|(tag, count)| SceneTagCount { tag, count })
+        .collect())
+}
+
+#[tauri::command]
+fn asset_tags(
+    conn: tauri::State<'_, DbState>,
+    asset_id: i64,
+) -> Result<Vec<db::SceneTag>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::asset_tags(&conn, asset_id)
+}
+
 #[tauri::command]
 fn cleanup_stats_cmd(conn: tauri::State<'_, DbState>) -> Result<db::CleanupStats, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
@@ -627,6 +736,33 @@ fn faces_in_cluster(
 fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
     db::faces_count(&conn)
+}
+
+#[tauri::command]
+fn rename_cluster(
+    conn: tauri::State<'_, DbState>,
+    cluster_id: i64,
+    name: String,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::rename_cluster(&conn, cluster_id, &name)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeClustersResult {
+    merged: i64,
+}
+
+#[tauri::command]
+fn merge_clusters(
+    conn: tauri::State<'_, DbState>,
+    from_id: i64,
+    into_id: i64,
+) -> Result<MergeClustersResult, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let merged = db::merge_clusters(&conn, from_id, into_id)?;
+    Ok(MergeClustersResult { merged })
 }
 
 #[derive(Serialize)]
@@ -1164,6 +1300,8 @@ fn library_list(
     has_location: Option<bool>,
     captured_min: Option<f64>,
     captured_max: Option<f64>,
+    favorite_only: Option<bool>,
+    scene_tag: Option<String>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
@@ -1178,6 +1316,8 @@ fn library_list(
             has_location,
             captured_min,
             captured_max,
+            favorite_only,
+            scene_tag: scene_tag.as_deref(),
             offset: offset.unwrap_or(0).max(0),
             limit: limit.unwrap_or(200).clamp(1, 1000),
         },
@@ -1193,6 +1333,8 @@ fn library_count(
     has_location: Option<bool>,
     captured_min: Option<f64>,
     captured_max: Option<f64>,
+    favorite_only: Option<bool>,
+    scene_tag: Option<String>,
 ) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
     let kind = kind.filter(|k| k == "image" || k == "video");
@@ -1205,6 +1347,8 @@ fn library_count(
             has_location,
             captured_min,
             captured_max,
+            favorite_only,
+            scene_tag: scene_tag.as_deref(),
             ..Default::default()
         },
     )
@@ -1214,6 +1358,16 @@ fn library_count(
 fn library_months(conn: tauri::State<'_, DbState>) -> Result<Vec<db::LibraryMonth>, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
     db::library_months(&conn)
+}
+
+#[tauri::command]
+fn set_favorite(
+    conn: tauri::State<'_, DbState>,
+    asset_id: i64,
+    favorite: bool,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::set_favorite(&conn, asset_id, favorite)
 }
 
 /// Moves files to the macOS Trash (reversible) and flags the rows as missing.
@@ -1334,6 +1488,9 @@ pub fn run() {
             enrich_assets,
             hash_candidates_run,
             score_quality,
+            tag_scenes,
+            scene_tags,
+            asset_tags,
             duplicates_list,
             duplicates_keep,
             cleanup_stats_cmd,
@@ -1343,6 +1500,8 @@ pub fn run() {
             clusters_list,
             faces_in_cluster,
             faces_count,
+            rename_cluster,
+            merge_clusters,
             cluster_events,
             events_list,
             event_assets,
@@ -1361,7 +1520,8 @@ pub fn run() {
             library_count,
             library_months,
             library_stats,
-            scan_roots
+            scan_roots,
+            set_favorite
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

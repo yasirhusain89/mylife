@@ -59,6 +59,8 @@ export type LibraryFilters = {
   hasLocation?: boolean;
   capturedMin?: number;
   capturedMax?: number;
+  favoriteOnly?: boolean;
+  sceneTag?: string;
 };
 
 export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
@@ -69,7 +71,9 @@ export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
     personCluster: opts.personCluster ?? null,
     hasLocation: opts.hasLocation ?? null,
     capturedMin: opts.capturedMin ?? null,
-    capturedMax: opts.capturedMax ?? null
+    capturedMax: opts.capturedMax ?? null,
+    favoriteOnly: opts.favoriteOnly ?? null,
+    sceneTag: opts.sceneTag ?? null
   });
 }
 
@@ -79,8 +83,53 @@ export function libraryCount(opts: Omit<LibraryFilters, "offset" | "limit"> = {}
     personCluster: opts.personCluster ?? null,
     hasLocation: opts.hasLocation ?? null,
     capturedMin: opts.capturedMin ?? null,
-    capturedMax: opts.capturedMax ?? null
+    capturedMax: opts.capturedMax ?? null,
+    favoriteOnly: opts.favoriteOnly ?? null,
+    sceneTag: opts.sceneTag ?? null
   });
+}
+
+export function setFavorite(assetId: number, favorite: boolean): Promise<void> {
+  return invoke("set_favorite", { assetId, favorite });
+}
+
+export type TagProgress = {
+  processed: number;
+  total: number;
+  tagged: number;
+  failed: number;
+};
+
+export type TagScenesSummary = {
+  total: number;
+  tagged: number;
+  failed: number;
+};
+
+export type SceneTagCount = {
+  tag: string;
+  count: number;
+};
+
+export type SceneTag = {
+  tag: string;
+  confidence: number;
+};
+
+export function tagScenes(): Promise<TagScenesSummary> {
+  return invoke("tag_scenes");
+}
+
+export function onTagProgress(cb: (p: TagProgress) => void): Promise<() => void> {
+  return listen<TagProgress>("tag-progress", (e) => cb(e.payload));
+}
+
+export function sceneTags(): Promise<SceneTagCount[]> {
+  return invoke("scene_tags");
+}
+
+export function assetTags(assetId: number): Promise<SceneTag[]> {
+  return invoke("asset_tags", { assetId });
 }
 
 export type LibraryMonth = { month: string; count: number };
@@ -213,6 +262,7 @@ export type FaceClusterRow = {
   id: number;
   faceCount: number;
   representativePath: string | null;
+  name: string | null;
 };
 
 export function faceThumb(
@@ -254,6 +304,14 @@ export function onClusterProgress(cb: (p: ClusterProgress) => void): Promise<() 
 
 export function clustersList(): Promise<FaceClusterRow[]> {
   return invoke("clusters_list");
+}
+
+export function renameCluster(clusterId: number, name: string): Promise<void> {
+  return invoke("rename_cluster", { clusterId, name });
+}
+
+export function mergeClusters(fromId: number, intoId: number): Promise<{ merged: number }> {
+  return invoke("merge_clusters", { fromId, intoId });
 }
 
 export function facesInCluster(clusterId: number): Promise<FaceRow[]> {

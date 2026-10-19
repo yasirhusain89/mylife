@@ -48,6 +48,33 @@ test("import via typed path adds assets", async ({ page }) => {
   await expect(page.getByText("/mock/vacation", { exact: false }).first()).toBeVisible();
 });
 
+test("starring filters the library to favorites", async ({ page }) => {
+  await page.getByRole("button", { name: "Star IMG_20261007_185817.jpg" }).click();
+  await page.getByRole("button", { name: "★ Favorites" }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+});
+
+test("multi-select stars a batch", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185822.jpg" }).check();
+  await expect(page.getByText("2 selected")).toBeVisible();
+  await page.getByRole("button", { name: "★ Star", exact: true }).click();
+  await page.getByRole("button", { name: "★ Favorites" }).click();
+  await expect(page.getByText("Showing 2 of 2")).toBeVisible();
+});
+
+test("people can be named and merged", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await expect(page.getByText("Cluster 1")).toBeVisible();
+  await page.getByRole("checkbox", { name: "Select cluster 1 for merge" }).check();
+  await page.getByRole("checkbox", { name: "Select cluster 2 for merge" }).check();
+  await page.getByRole("button", { name: "Merge into #1" }).click();
+  await expect(page.getByText("Cluster 2")).toBeHidden();
+});
+
 test("indexed folders list every scanned root", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Indexed folders" })).toBeVisible();
   await expect(page.getByText("/photos", { exact: true })).toBeVisible();
@@ -80,8 +107,22 @@ test("highlight video reports photos and clips", async ({ page }) => {
   await expect(page.getByText("1 video clip")).toBeVisible();
 });
 
+test("events render as a month-grouped timeline", async ({ page }) => {
+  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await expect(page.getByRole("heading", { name: "October 2025" })).toBeVisible();
+  await expect(page.getByText("InlawsVisit2026")).toBeVisible();
+});
+
+test("scene tags filter the library", async ({ page }) => {
+  await page.getByRole("button", { name: "Tag scenes" }).click();
+  await page.getByLabel("Filter by scene").selectOption("mountain");
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+});
+
 test("clicking a photo opens the viewer with keyboard navigation", async ({ page }) => {
-  await page.getByRole("button", { name: "IMG_20261007_185817.jpg" }).click();
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("1 of 8")).toBeVisible();
@@ -94,7 +135,7 @@ test("clicking a photo opens the viewer with keyboard navigation", async ({ page
 });
 
 test("video shows a poster with a web-mode note", async ({ page }) => {
-  await page.getByRole("button", { name: "VID_20261007_192001.mp4" }).click();
+  await page.getByTitle("Open VID_20261007_192001.mp4").click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Video playback needs the desktop app")).toBeVisible();
