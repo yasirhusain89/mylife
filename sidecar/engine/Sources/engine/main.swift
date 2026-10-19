@@ -394,7 +394,7 @@ func detectAnimals(path: String) throws -> [String: Any] {
 /// is part of the OS. Returns one cluster per detected person; singletons are
 /// groups of size 1.
 func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
-    struct Face { var path: String; var box: CGRect; var confidence: Double; var desc: FeaturePrintObservation }
+    struct Face { var path: String; var box: CGRect; var confidence: Double; var desc: FeaturePrintObservation; var descriptorB64: String }
     var entries: [Face] = []
     var unreadable = 0
     var descriptorFailures = 0
@@ -432,7 +432,27 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
             // (Swift struct) are distinct types; results yields the former and
             // distance(to:) lives on the latter.
             let desc = FeaturePrintObservation(vnObs)
-            entries.append(Face(path: path, box: b, confidence: Double(obs.confidence), desc: desc))
+            // Persist the feature-print descriptor for Rust-side global
+            // regrouping: base64 little-endian f32, same wire format as
+            // `embedImage` (doubles normalized to f32).
+            let raw = vnObs.data
+            let dim = vnObs.elementCount
+            let descriptorB64: String
+            if vnObs.elementType == .double {
+                let count = raw.count / 8
+                var floats = [Float](repeating: 0, count: count)
+                raw.withUnsafeBytes { ptr in
+                    let doubles = ptr.bindMemory(to: Double.self)
+                    for i in 0..<count { floats[i] = Float(doubles[i]) }
+                }
+                descriptorB64 = floats.withUnsafeBytes { Data($0) }.base64EncodedString()
+            } else if vnObs.elementType == .float, raw.count == dim * 4 {
+                descriptorB64 = raw.base64EncodedString()
+            } else {
+                descriptorFailures += 1
+                continue
+            }
+            entries.append(Face(path: path, box: b, confidence: Double(obs.confidence), desc: desc, descriptorB64: descriptorB64))
         }
     }
 
@@ -465,6 +485,7 @@ func clusterFaces(paths: [String], threshold: Double) throws -> [String: Any] {
                 "width": Double(entries[$0].box.width),
                 "height": Double(entries[$0].box.height),
                 "confidence": entries[$0].confidence,
+                "descriptor": entries[$0].descriptorB64,
             ] },
             "size": members.count,
         ]

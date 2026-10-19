@@ -975,6 +975,213 @@ struct VerifyResult {
 
 // MARK: - People clustering
 
+/// Euclidean distance over f32 descriptors (Vision feature-print distance is
+/// Euclidean over normalized vectors; see stackoverflow iOS16/17 analysis).
+/// Returns INFINITY on length mismatch so corrupt pairs never merge.
+fn face_euclidean(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    let mut sum = 0f64;
+    for i in 0..a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+/// Global union-find over descriptors at `threshold`. Deterministic order:
+/// biggest groups first, ties by smallest face id (stable across reruns).
+pub fn group_faces_by_distance(
+    ids: &[i64],
+    vecs: &[Vec<f32>],
+    threshold: f64,
+) -> Vec<Vec<i64>> {
+    let n = ids.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if face_euclidean(&vecs[i], &vecs[j]) < threshold {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut comps: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        comps.entry(r).or_default().push(ids[i]);
+    }
+    let mut groups: Vec<Vec<i64>> = comps.into_values().collect();
+    for g in &mut groups {
+        g.sort_unstable();
+    }
+    groups.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+    groups
+}
+
+/// Runs the engine's face detector over images missing embeddings, then
+/// globally regroups every stored descriptor. Incremental: images that already
+/// have descriptors skip engine calls, so reruns with no new images only
+/// rebuild the same groups (names preserved via mutual majority).
+pub fn run_cluster_faces(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    paths_override: Option<Vec<String>>,
+    threshold: f64,
+    mut on_progress: impl FnMut(i64, i64, i64),
+) -> Result<ClusterSummary, String> {
+    let all_paths: Vec<String> = match paths_override {
+        Some(p) => p,
+        None => {
+            let rows: Vec<String> = conn
+                .prepare("SELECT path FROM assets WHERE kind = 'image' AND missing = 0")
+                .map_err(|e| format!("image paths: {e}"))?
+                .query_map([], |r| r.get(0))
+                .map_err(|e| format!("image paths: {e}"))?
+                .filter_map(Result::ok)
+                .collect();
+            rows
+        }
+    };
+    if all_paths.is_empty() {
+        return Ok(ClusterSummary { images: 0, faces: 0, clusters: 0, missing: 0 });
+    }
+
+    // Files on an ejected volume cannot be read; say so instead of
+    // reporting a silent zero.
+    let readable: Vec<String> = all_paths
+        .iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .cloned()
+        .collect();
+    let missing = (all_paths.len() - readable.len()) as i64;
+    if readable.is_empty() {
+        return Err(format!(
+            "None of the {} images are readable — the volume they live on may be ejected. Reconnect it, then press \u{201c}Check files\u{201d} in the Library tab.",
+            all_paths.len()
+        ));
+    }
+
+    // Detection candidates: images with no face rows, or with faces lacking
+    // descriptors (pre-migration rows or failed embeds). Already-embedded
+    // images skip engine calls entirely.
+    let (known_paths, null_paths): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) = {
+        let mut known = std::collections::HashSet::new();
+        let mut nulls = std::collections::HashSet::new();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT path FROM faces")
+            .map_err(|e| format!("face paths: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("face paths: {e}"))?;
+        for row in rows {
+            if let Ok(p) = row {
+                known.insert(p);
+            }
+        }
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT path FROM faces WHERE descriptor IS NULL")
+            .map_err(|e| format!("face null paths: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("face null paths: {e}"))?;
+        for row in rows {
+            if let Ok(p) = row {
+                nulls.insert(p);
+            }
+        }
+        (known, nulls)
+    };
+    let candidates: Vec<String> = readable
+        .iter()
+        .filter(|p| !known_paths.contains(*p) || null_paths.contains(*p))
+        .cloned()
+        .collect();
+
+    let mut new_count = 0i64;
+    let mut processed = 0i64;
+    for chunk in candidates.chunks(200) {
+        let reply = engine::call_with_events(
+            engine_state,
+            "cluster_faces",
+            Some(json!({ "paths": chunk, "threshold": threshold })),
+            Duration::from_secs(600),
+            &mut |name, data| {
+                if name == "progress" {
+                    on_progress(
+                        processed + data.get("processed").and_then(Value::as_i64).unwrap_or(0),
+                        readable.len() as i64,
+                        new_count + data.get("faces").and_then(Value::as_i64).unwrap_or(0),
+                    );
+                }
+            },
+        )?;
+
+        // Drop stale rows for this chunk before inserting fresh detections:
+        // upgrade path converts NULL-descriptor rows to embedded ones, and a
+        // redetection that finds zero faces correctly clears the path.
+        for p in chunk {
+            conn.execute("DELETE FROM faces WHERE path = ?1", params![p])
+                .map_err(|e| format!("clear stale faces: {e}"))?;
+        }
+
+        // FLATTEN: ignore per-chunk groups; global regroup happens below.
+        let groups: Vec<&Value> = reply
+            .get("groups")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        for g in groups {
+            let members: Vec<&Value> = g
+                .get("people")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
+            for m in members {
+                let path = m.get("path").and_then(Value::as_str).unwrap_or("");
+                let ids = db::save_faces(conn, path, &[m.clone()])?;
+                new_count += ids.len() as i64;
+            }
+        }
+        processed += chunk.len() as i64;
+        on_progress(processed, readable.len() as i64, new_count);
+    }
+
+    // Global union-find at threshold over ALL stored + new descriptors.
+    let stored = db::face_descriptors(conn)?;
+    let groups: Vec<Vec<i64>> = if stored.is_empty() {
+        Vec::new()
+    } else {
+        let ids: Vec<i64> = stored.iter().map(|(id, _)| *id).collect();
+        let vecs: Vec<Vec<f32>> = stored.into_iter().map(|(_, v)| v).collect();
+        group_faces_by_distance(&ids, &vecs, threshold)
+    };
+    // Faces without descriptors (failed embeds) stay unassigned; they are
+    // candidates again on the next run.
+    db::replace_clusters(conn, groups)?;
+
+    let faces = db::faces_count(conn)?;
+    let clusters = db::clusters_list(conn)?.len() as i64;
+    on_progress(readable.len() as i64, readable.len() as i64, faces);
+    Ok(ClusterSummary { images: readable.len() as i64, faces, clusters, missing })
+}
+
 /// Runs the engine's face detector + feature-print clusterer over every
 /// image in the library (or the given subset), stores every face and its
 /// cluster, and streams progress so the UI can show a live counter.
@@ -989,107 +1196,11 @@ async fn cluster_faces(
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
         let engine_state = app.state::<engine::EngineState>();
-
-        let all_paths: Vec<String> = match paths {
-            Some(p) => p,
-            None => {
-                let rows: Vec<String> = conn
-                    .prepare("SELECT path FROM assets WHERE kind = 'image' AND missing = 0")
-                    .map_err(|e| format!("image paths: {e}"))?
-                    .query_map([], |r| r.get(0))
-                    .map_err(|e| format!("image paths: {e}"))?
-                    .filter_map(Result::ok)
-                    .collect();
-                rows
-            }
-        };
-        if all_paths.is_empty() {
-            return Ok(ClusterSummary { images: 0, faces: 0, clusters: 0, missing: 0 });
-        }
-
-        // Files on an ejected volume cannot be read; say so instead of
-        // reporting a silent zero.
-        let readable: Vec<String> = all_paths
-            .iter()
-            .filter(|p| std::path::Path::new(p).exists())
-            .cloned()
-            .collect();
-        let missing = (all_paths.len() - readable.len()) as i64;
-        if readable.is_empty() {
-            return Err(format!(
-                "None of the {} images are readable — the volume they live on may be ejected. Reconnect it, then press \u{201c}Check files\u{201d} in the Library tab.",
-                all_paths.len()
-            ));
-        }
-
-        let mut total_faces = 0i64;
-        let mut total_clusters = 0i64;
-        let mut processed = 0i64;
-
-        for chunk in readable.chunks(200) {
-            let reply = engine::call_with_events(
-                &engine_state,
-                "cluster_faces",
-                Some(json!({ "paths": chunk, "threshold": threshold })),
-                Duration::from_secs(600),
-                &mut |name, data| {
-                    if name == "progress" {
-                        let _ = app.emit(
-                            "cluster-progress",
-                            json!({
-                                "processed": processed + data.get("processed").and_then(Value::as_i64).unwrap_or(0),
-                                "total": all_paths.len() as i64,
-                                "faces": total_faces + data.get("faces").and_then(Value::as_i64).unwrap_or(0),
-                            }),
-                        );
-                    }
-                },
-            )?;
-
-            let faces = reply.get("faces").and_then(Value::as_i64).unwrap_or(0);
-            let groups: Vec<&Value> = reply
-                .get("groups")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().collect())
-                .unwrap_or_default();
-
-            let mut cluster_rows: Vec<(i64, Vec<i64>)> = Vec::new();
-            for g in groups {
-                let members: Vec<&Value> = g
-                    .get("people")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().collect())
-                    .unwrap_or_default();
-                let mut face_ids = Vec::new();
-                for m in members {
-                    let path = m.get("path").and_then(Value::as_str).unwrap_or("");
-                    let faces_row = db::save_faces(&conn, path, &[m.clone()])?;
-                    face_ids.push(faces_row[0]);
-                }
-                if !face_ids.is_empty() {
-                    let cid = db::save_cluster(&conn, &face_ids)?;
-                    cluster_rows.push((cid, face_ids));
-                }
-                total_clusters += 1;
-            }
-            total_faces += faces;
-            processed += chunk.len() as i64;
-
+        run_cluster_faces(&conn, &engine_state, paths, threshold, |processed, total, faces| {
             let _ = app.emit(
                 "cluster-progress",
-                json!({
-                    "processed": processed,
-                    "total": readable.len() as i64,
-                    "faces": total_faces,
-                }),
+                json!({ "processed": processed, "total": total, "faces": faces }),
             );
-        }
-
-        Ok(ClusterSummary {
-            images: readable.len() as i64,
-            faces: total_faces,
-            clusters: total_clusters,
-            missing,
         })
     })
     .await
@@ -1239,11 +1350,11 @@ fn merge_clusters(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClusterSummary {
-    images: i64,
-    faces: i64,
-    clusters: i64,
-    missing: i64,
+pub struct ClusterSummary {
+    pub images: i64,
+    pub faces: i64,
+    pub clusters: i64,
+    pub missing: i64,
 }
 
 // MARK: - Events
@@ -2803,6 +2914,81 @@ mod tests {
             assert_eq!(b64_decode(&b64_encode(&bytes)).unwrap(), bytes, "len {len}");
         }
         assert!(b64_decode("!!!").is_err(), "junk is rejected");
+    }
+
+    #[test]
+    fn faces_global_union_find_unifies_across_chunks() {
+        // Same person split across two 200-image chunks must land in one group.
+        // Chunk-local grouping would make two groups; global must make one.
+        let ids = vec![1, 2, 3, 4];
+        let same = vec![0.1f32, 0.2, 0.3];
+        let vecs = vec![same.clone(), same.clone(), same.clone(), same.clone()];
+        let groups = group_faces_by_distance(&ids, &vecs, 0.55);
+        assert_eq!(groups.len(), 1, "identical descriptors unify globally");
+        assert_eq!(groups[0], vec![1, 2, 3, 4]);
+
+        // Distant descriptors stay apart at the same threshold.
+        let far_a = vec![0.0f32, 0.0];
+        let far_b = vec![10.0f32, 10.0];
+        let groups = group_faces_by_distance(&[10, 11], &[far_a, far_b], 0.55);
+        assert_eq!(groups.len(), 2, "far descriptors split");
+
+        // Threshold behavior: 0.5 merges, 0.6 splits at 0.55.
+        let o = vec![0.0f32, 0.0];
+        let near = vec![0.3f32, 0.4]; // Euclidean 0.5
+        let edge = vec![0.6f32, 0.0]; // Euclidean 0.6
+        assert_eq!(group_faces_by_distance(&[20, 21], &[o.clone(), near], 0.55).len(), 1);
+        assert_eq!(group_faces_by_distance(&[20, 21], &[o, edge], 0.55).len(), 2);
+    }
+
+    #[test]
+    fn faces_regroup_is_idempotent_and_new_images_join() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+        let face_json = |x: f64, v: &[f32]| {
+            serde_json::json!({
+                "x": x, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9,
+                "descriptor": b64_encode(&db::floats_to_bytes(v)),
+            })
+        };
+        // Two people: A near origin, B far away.
+        let a_vec = vec![0.0f32, 0.0];
+        let b_vec = vec![10.0f32, 10.0];
+        let a1 = db::save_faces(&conn, "/a1.jpg", &[face_json(0.1, &a_vec)]).unwrap()[0];
+        let a2 = db::save_faces(&conn, "/a2.jpg", &[face_json(0.2, &a_vec)]).unwrap()[0];
+        let b1 = db::save_faces(&conn, "/b1.jpg", &[face_json(0.1, &b_vec)]).unwrap()[0];
+        let b2 = db::save_faces(&conn, "/b2.jpg", &[face_json(0.2, &b_vec)]).unwrap()[0];
+
+        let regroup = || -> Vec<Vec<i64>> {
+            let stored = db::face_descriptors(&conn).unwrap();
+            let ids: Vec<i64> = stored.iter().map(|(id, _)| *id).collect();
+            let vecs: Vec<Vec<f32>> = stored.into_iter().map(|(_, v)| v).collect();
+            group_faces_by_distance(&ids, &vecs, 0.55)
+        };
+        let g1 = regroup();
+        assert_eq!(g1.len(), 2, "two people stay apart");
+        let clusters = db::replace_clusters(&conn, g1.clone()).unwrap();
+        assert_eq!(clusters.len(), 2);
+        db::rename_cluster(&conn, clusters[0], "Asha").unwrap();
+        let before = (db::faces_count(&conn).unwrap(), db::clusters_list(&conn).unwrap().len());
+
+        // Rerun with no new images: same counts, name intact.
+        let g2 = regroup();
+        assert_eq!(g1, g2, "grouping is deterministic");
+        db::replace_clusters(&conn, g2).unwrap();
+        assert_eq!((db::faces_count(&conn).unwrap(), db::clusters_list(&conn).unwrap().len()), before);
+        assert!(db::clusters_list(&conn).unwrap().iter().any(|c| c.name.as_deref() == Some("Asha")));
+
+        // New image of person A joins their cluster globally.
+        let _a3 = db::save_faces(&conn, "/a3.jpg", &[face_json(0.15, &a_vec)]).unwrap()[0];
+        let g3 = regroup();
+        assert_eq!(g3.len(), 2, "still two people after adding one of A");
+        db::replace_clusters(&conn, g3).unwrap();
+        let rows = db::clusters_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        let biggest = rows.iter().max_by_key(|r| r.face_count).unwrap();
+        assert_eq!(biggest.face_count, 3, "new image joins existing person");
+        let _ = (a1, a2, b1, b2);
     }
 
     /// Writes a 24-bit BMP (ImageIO decodes it; hand-rolled so the test needs

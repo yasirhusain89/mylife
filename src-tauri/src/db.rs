@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (11, include_str!("../migrations/011_near_dupes.sql")),
     (12, include_str!("../migrations/012_pets.sql")),
     (13, include_str!("../migrations/013_vectors.sql")),
+    (14, include_str!("../migrations/014_face_descriptors.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -297,10 +298,22 @@ pub struct FaceClusterRow {
 pub fn save_faces(conn: &Connection, path: &str, faces: &[serde_json::Value]) -> Result<Vec<i64>, String> {
     let tx = conn.unchecked_transaction().map_err(|e| format!("faces tx: {e}"))?;
     let mut ids = Vec::new();
-    for (i, f) in faces.iter().enumerate() {
+    for f in faces.iter() {
+        let descriptor: Option<Vec<u8>> = match f.get("descriptor") {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                let bytes = b64_decode(s).map_err(|e| format!("invalid descriptor: {e}"))?;
+                // Must decode to whole f32s; reject truncated blobs early so
+                // face_descriptors() never sees them.
+                if bytes.is_empty() || bytes_to_floats(&bytes).is_none() {
+                    return Err("invalid descriptor blob".into());
+                }
+                Some(bytes)
+            }
+            _ => None,
+        };
         tx.execute(
-                "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at)
-                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at, descriptor)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     path,
                     f.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -309,6 +322,7 @@ pub fn save_faces(conn: &Connection, path: &str, faces: &[serde_json::Value]) ->
                     f.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     f.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     now(),
+                    descriptor,
                 ],
             )
             .map_err(|e| format!("insert face: {e}"))?;
@@ -318,6 +332,232 @@ pub fn save_faces(conn: &Connection, path: &str, faces: &[serde_json::Value]) ->
     }
     tx.commit().map_err(|e| format!("faces commit: {e}"))?;
     Ok(ids)
+}
+
+/// Standard base64 decode for face descriptors (no new dependency).
+fn b64_value_face(c: u8) -> Result<u8, String> {
+    match c {
+        b'A'..=b'Z' => Ok(c - b'A'),
+        b'a'..=b'z' => Ok(c - b'a' + 26),
+        b'0'..=b'9' => Ok(c - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err("invalid base64".to_string()),
+    }
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("malformed base64".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return Err("malformed base64".to_string());
+        }
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                if i < 4 - pad {
+                    return Err("malformed base64".to_string());
+                }
+                n <<= 6;
+            } else {
+                n = (n << 6) | b64_value_face(c)? as u32;
+            }
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// All stored face descriptors for global regrouping: (face_id, f32 vector).
+/// Skips rows with NULL or empty descriptors; errors when the surviving
+/// vectors disagree on dimension (corrupt embed, must not silently cluster).
+pub fn face_descriptors(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, descriptor FROM faces WHERE descriptor IS NOT NULL ORDER BY id")
+        .map_err(|e| format!("prepare face descriptors: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
+        .map_err(|e| format!("query face descriptors: {e}"))?;
+    let mut out: Vec<(i64, Vec<f32>)> = Vec::new();
+    for row in rows {
+        let (id, blob) = row.map_err(|e| format!("face descriptor row: {e}"))?;
+        let Some(bytes) = blob else { continue };
+        if bytes.is_empty() {
+            continue;
+        }
+        let Some(vec) = bytes_to_floats(&bytes) else { continue };
+        if vec.is_empty() {
+            continue;
+        }
+        out.push((id, vec));
+    }
+    if let Some(first_len) = out.first().map(|(_, v)| v.len()) {
+        for (id, v) in &out {
+            if v.len() != first_len {
+                return Err(format!(
+                    "face descriptors have inconsistent dimensions for face {id}: got {}, want {first_len}",
+                    v.len()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Rebuilds person clusters from explicit face-id groups (derived data).
+/// Runs in one transaction: snapshots existing membership + names, clears
+/// `face_clusters`, re-inserts one row per non-empty group with a live
+/// recount, and carries each old name to the new group holding the
+/// MUTUAL-majority of that cluster's faces (mirrors cluster_events:
+/// overlap * 2 >= both sides, best overlap wins, each old name used once).
+/// Ties go to the lowest old cluster id; groups with no majority keep NULL.
+pub fn replace_clusters(
+    conn: &Connection,
+    groups: Vec<Vec<i64>>,
+) -> Result<Vec<i64>, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("replace clusters tx: {e}"))?;
+
+    // Snapshot existing clusters (ordered for deterministic tie-breaks).
+    let old_clusters: Vec<(i64, Option<String>)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, name FROM face_clusters ORDER BY id")
+            .map_err(|e| format!("prepare old clusters: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(|e| format!("query old clusters: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("old cluster row: {e}"))?);
+        }
+        v
+    };
+    let mut old_members: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT cluster_id, id FROM faces WHERE cluster_id IS NOT NULL")
+            .map_err(|e| format!("prepare old members: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("query old members: {e}"))?;
+        for row in rows {
+            let (cid, fid) = row.map_err(|e| format!("old member row: {e}"))?;
+            old_members.entry(cid).or_default().insert(fid);
+        }
+    }
+
+    // Clear derived state. Explicitly null faces first so the rebuild works
+    // even when foreign_keys is off; with FK on this is a no-op extra.
+    tx.execute("UPDATE faces SET cluster_id = NULL", [])
+        .map_err(|e| format!("clear face links: {e}"))?;
+    tx.execute("DELETE FROM face_clusters", [])
+        .map_err(|e| format!("clear clusters: {e}"))?;
+
+    // Re-insert one row per non-empty group with a live recount.
+    let mut new_ids: Vec<i64> = Vec::new();
+    let mut new_sets: Vec<(i64, std::collections::HashSet<i64>)> = Vec::new();
+    for group in &groups {
+        if group.is_empty() {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO face_clusters (face_count, created_at) VALUES (0, ?1)",
+            params![now()],
+        )
+        .map_err(|e| format!("insert cluster: {e}"))?;
+        let nid = tx.last_insert_rowid();
+        // Link members that actually exist; placeholders keep the SQL static.
+        for fid in group {
+            tx.execute("UPDATE faces SET cluster_id = ?2 WHERE id = ?1", params![fid, nid])
+                .map_err(|e| format!("link face: {e}"))?;
+        }
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM faces WHERE cluster_id = ?1",
+                params![nid],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("recount cluster: {e}"))?;
+        tx.execute(
+            "UPDATE face_clusters SET face_count = ?2 WHERE id = ?1",
+            params![nid, count],
+        )
+        .map_err(|e| format!("recount update: {e}"))?;
+        let linked: std::collections::HashSet<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM faces WHERE cluster_id = ?1")
+                .map_err(|e| format!("linked members: {e}"))?;
+            let rows = stmt
+                .query_map(params![nid], |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("linked members: {e}"))?;
+            let mut set = std::collections::HashSet::new();
+            for row in rows {
+                set.insert(row.map_err(|e| format!("linked member row: {e}"))?);
+            }
+            set
+        };
+        // Fall back to the requested ids when the concat trick yields nothing
+        // (e.g. empty group already skipped); keeps overlap logic total.
+        let set = if linked.is_empty() {
+            group.iter().cloned().collect()
+        } else {
+            linked
+        };
+        new_ids.push(nid);
+        new_sets.push((nid, set));
+    }
+
+    // Carry names by mutual majority (events rule). Each old name used once;
+    // lowest old cluster id wins ties via ordered scan + strict best.
+    let mut used_old = vec![false; old_clusters.len()];
+    for (nid, members) in &new_sets {
+        if members.is_empty() {
+            continue;
+        }
+        let mut best: Option<usize> = None;
+        let mut best_score = 0i64;
+        for (k, (oid, oname)) in old_clusters.iter().enumerate() {
+            if used_old[k] {
+                continue;
+            }
+            let Some(name) = oname else { continue };
+            if name.trim().is_empty() {
+                continue;
+            }
+            let Some(old_set) = old_members.get(oid) else { continue };
+            if old_set.is_empty() {
+                continue;
+            }
+            let inter = members.intersection(old_set).count() as i64;
+            if inter * 2 >= members.len() as i64
+                && inter * 2 >= old_set.len() as i64
+                && inter > best_score
+            {
+                best_score = inter;
+                best = Some(k);
+            }
+        }
+        if let Some(k) = best {
+            used_old[k] = true;
+            let name = old_clusters[k].1.clone().unwrap_or_default();
+            tx.execute("UPDATE face_clusters SET name = ?2 WHERE id = ?1", params![nid, name])
+                .map_err(|e| format!("carry cluster name: {e}"))?;
+        }
+    }
+
+    tx.commit().map_err(|e| format!("replace clusters commit: {e}"))?;
+    Ok(new_ids)
 }
 
 pub fn save_cluster(
@@ -2394,10 +2634,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 13, "user_version tracks the highest applied migration");
+        assert_eq!(v, 14, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -2721,6 +2961,178 @@ mod tests {
         // Repeats, ghosts, and double-detaches fail cleanly.
         assert!(unassign_face(&conn, ids[0]).is_err(), "already unassigned errors");
         assert!(unassign_face(&conn, 9999).is_err(), "unknown face errors");
+    }
+
+    fn b64_encode_test(bytes: &[u8]) -> String {
+        const ALPH: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPH[((n >> 18) & 63) as usize] as char);
+            out.push(ALPH[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPH[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 { ALPH[(n & 63) as usize] as char } else { '=' });
+        }
+        out
+    }
+
+    fn descriptor_json(x: f64, vec: &[f32]) -> serde_json::Value {
+        serde_json::json!({
+            "x": x, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9,
+            "descriptor": b64_encode_test(&floats_to_bytes(vec)),
+        })
+    }
+
+    #[test]
+    fn face_descriptor_roundtrip_through_save_load() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+
+        // New style: with descriptor. Old style: without (pre-migration NULL).
+        let with = descriptor_json(0.1, &[1.0, -0.5, 0.25]);
+        let without = serde_json::json!({"x": 0.5, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.8});
+        let ids_a = save_faces(&conn, "/a.jpg", &[with]).unwrap();
+        let ids_b = save_faces(&conn, "/b.jpg", &[without]).unwrap();
+        assert_eq!(ids_a.len() + ids_b.len(), 2);
+
+        let stored = face_descriptors(&conn).unwrap();
+        assert_eq!(stored.len(), 1, "NULL/empty rows are skipped");
+        assert_eq!(stored[0].0, ids_a[0]);
+        assert_eq!(stored[0].1, vec![1.0, -0.5, 0.25]);
+
+        // Dim mismatch is corrupt: must error, not silently cluster.
+        let other = descriptor_json(0.1, &[1.0, 2.0]);
+        save_faces(&conn, "/c.jpg", &[other]).unwrap();
+        assert!(
+            face_descriptors(&conn).is_err(),
+            "inconsistent dims must error"
+        );
+    }
+
+    #[test]
+    fn replace_clusters_is_idempotent_and_keeps_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+
+        let mk = |path: &str, v: &[f32]| {
+            save_faces(&conn, path, &[descriptor_json(0.1, v)]).unwrap()[0]
+        };
+        let a = mk("/a.jpg", &[0.0, 0.0]);
+        let b = mk("/b.jpg", &[0.0, 0.0]);
+        let c = mk("/c.jpg", &[10.0, 10.0]);
+        let d = mk("/d.jpg", &[10.0, 10.0]);
+
+        let first = replace_clusters(&conn, vec![vec![a, b], vec![c, d]]).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(faces_count(&conn).unwrap(), 4);
+        rename_cluster(&conn, first[0], "Maya").unwrap();
+
+        let before_counts = (faces_count(&conn).unwrap(), clusters_list(&conn).unwrap().len());
+        // Rerun with identical groups: same counts, name intact.
+        let second = replace_clusters(&conn, vec![vec![a, b], vec![c, d]]).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            (faces_count(&conn).unwrap(), clusters_list(&conn).unwrap().len()),
+            (before_counts.0, before_counts.1),
+            "rerun changes no counts"
+        );
+        let names: Vec<Option<String>> =
+            clusters_list(&conn).unwrap().into_iter().map(|c| c.name).collect();
+        assert!(names.contains(&Some("Maya".to_string())), "name survives rerun: {names:?}");
+        // No dupes: still 4 faces total.
+        assert_eq!(faces_count(&conn).unwrap(), 4);
+    }
+
+    #[test]
+    fn replace_clusters_carries_names_by_mutual_majority() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()[0]
+        };
+        // Split: old 3-face cluster named Maya splits 2 vs 1.
+        let (a, b, c) = (mk("/a.jpg"), mk("/b.jpg"), mk("/c.jpg"));
+        let old = replace_clusters(&conn, vec![vec![a, b, c]]).unwrap();
+        rename_cluster(&conn, old[0], "Maya").unwrap();
+        let split = replace_clusters(&conn, vec![vec![a, b], vec![c]]).unwrap();
+        assert_eq!(split.len(), 2);
+        let rows = clusters_list(&conn).unwrap();
+        let named: Vec<_> = rows.iter().filter(|r| r.name.is_some()).collect();
+        assert_eq!(named.len(), 1, "exactly the majority keeps the name");
+        assert_eq!(named[0].name.as_deref(), Some("Maya"));
+        assert_eq!(named[0].face_count, 2, "majority group keeps the name");
+
+        // Merge: two named clusters merge majority into one group.
+        let (d, e) = (mk("/d.jpg"), mk("/e.jpg"));
+        // Rebuild to two groups: [a,b]=Maya, [c,d,e] fresh; name the second.
+        let two = replace_clusters(&conn, vec![vec![a, b], vec![c, d, e]]).unwrap();
+        // two[0] should carry Maya (majority of old [a,b]); name the other.
+        let rows = clusters_list(&conn).unwrap();
+        assert!(rows.iter().any(|r| r.name.as_deref() == Some("Maya")));
+        let other_id = rows.iter().find(|r| r.name.is_none()).map(|r| r.id).unwrap_or(two[1]);
+        rename_cluster(&conn, other_id, "Leo").unwrap();
+        // Merge all into one: Maya (2 faces) vs Leo (3 faces) -> Leo wins majority.
+        let merged = replace_clusters(&conn, vec![vec![a, b, c, d, e]]).unwrap();
+        assert_eq!(merged.len(), 1);
+        let rows = clusters_list(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        // Old Leo cluster (3 faces) has inter=3 vs Maya inter=2; best overlap wins.
+        assert_eq!(rows[0].name.as_deref(), Some("Leo"), "best overlap wins the merge");
+
+        // Tie: two old clusters equally overlap one new group -> lowest old id wins.
+        let (f, g, h, i) = (mk("/f.jpg"), mk("/g.jpg"), mk("/h.jpg"), mk("/i.jpg"));
+        let olds = replace_clusters(&conn, vec![vec![f, g], vec![h, i]]).unwrap();
+        // olds[0] has lower cluster id (inserted first).
+        rename_cluster(&conn, olds[0], "First").unwrap();
+        rename_cluster(&conn, olds[1], "Second").unwrap();
+        let tied = replace_clusters(&conn, vec![vec![f, h]]).unwrap();
+        assert_eq!(tied.len(), 1);
+        let rows = clusters_list(&conn).unwrap();
+        // The single-face leftovers (g,i) are ungrouped? No: we only passed [f,h],
+        // so g,i are unassigned; the one group overlaps both olds 1-1 with mutual
+        // majority (1*2>=2 and 1*2>=2). Tie -> lowest old cluster id.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_deref(), Some("First"), "tie goes to lowest cluster id");
+    }
+
+    #[test]
+    fn cross_chunk_faces_unify_in_one_regroup() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        // Simulate two separate detection calls (two "chunks") for one person:
+        // identical descriptors saved in two independent save_faces calls.
+        let same = [0.1f32, 0.2, 0.3];
+        let chunk1 = save_faces(&conn, "/chunk1-a.jpg", &[descriptor_json(0.1, &same)]).unwrap();
+        let chunk1b = save_faces(&conn, "/chunk1-b.jpg", &[descriptor_json(0.2, &same)]).unwrap();
+        let chunk2 = save_faces(&conn, "/chunk2-a.jpg", &[descriptor_json(0.1, &same)]).unwrap();
+        let chunk2b = save_faces(&conn, "/chunk2-b.jpg", &[descriptor_json(0.2, &same)]).unwrap();
+        assert_eq!(face_descriptors(&conn).unwrap().len(), 4);
+
+        // One global regroup containing members from both chunks -> one person.
+        let all: Vec<i64> =
+            [chunk1, chunk1b, chunk2, chunk2b].into_iter().flatten().collect();
+        let ids = replace_clusters(&conn, vec![all]).unwrap();
+        assert_eq!(ids.len(), 1, "cross-chunk members land in one group");
+        let rows = clusters_list(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].face_count, 4);
     }
 
     #[test]
