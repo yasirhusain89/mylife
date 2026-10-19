@@ -35,6 +35,9 @@
     importFolder,
     onEnrichProgress,
     libraryList,
+    libraryCount,
+    libraryMonths,
+    type LibraryMonth,
     libraryStats,
     onImportError,
     onImportProgress,
@@ -68,6 +71,28 @@
   let assets = $state<AssetRow[]>([]);
   let stats = $state<LibraryStats | null>(null);
   let filter = $state<"all" | "image" | "video">("all");
+  let monthFilter = $state<string | null>(null);
+  let locFilter = $state<"all" | "with" | "without">("all");
+  let personFilter = $state<number | null>(null);
+  let months = $state<LibraryMonth[]>([]);
+  let personOptions = $state<FaceClusterRow[]>([]);
+  let filteredTotal = $state(0);
+
+  function monthBounds(m: string): [number, number] {
+    const [y, mo] = m.split("-").map(Number);
+    return [Date.UTC(y, mo - 1, 1) / 1000, Date.UTC(y, mo, 1) / 1000];
+  }
+
+  function currentFilters() {
+    const [capturedMin, capturedMax] = monthFilter ? monthBounds(monthFilter) : [undefined, undefined];
+    return {
+      kind: filter === "all" ? undefined : filter,
+      personCluster: personFilter ?? undefined,
+      hasLocation: locFilter === "all" ? undefined : locFilter === "with",
+      capturedMin,
+      capturedMax
+    };
+  }
   let root = $state<string | null>(null);
   let importing = $state(false);
   let progress = $state<ImportProgress | null>(null);
@@ -86,7 +111,7 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums">("library");
+  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums" | "settings">("library");
   let flagged = $state<Set<number>>(new Set());
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
@@ -132,21 +157,29 @@
 
   async function refresh() {
     resetThumbs();
-    assets = await libraryList({ kind: filter === "all" ? undefined : filter, limit: PAGE });
+    const f = currentFilters();
+    assets = await libraryList({ ...f, limit: PAGE });
+    filteredTotal = await libraryCount(f);
     stats = await libraryStats();
+    months = await libraryMonths();
+  }
+
+  async function loadPersonOptions() {
+    try {
+      personOptions = await clustersList();
+    } catch {
+      personOptions = [];
+    }
   }
 
   function libraryTotal(): number {
-    if (!stats) return 0;
-    if (filter === "image") return stats.photos;
-    if (filter === "video") return stats.videos;
-    return stats.photos + stats.videos;
+    return filteredTotal;
   }
 
   async function loadMore() {
     try {
       const next = await libraryList({
-        kind: filter === "all" ? undefined : filter,
+        ...currentFilters(),
         limit: PAGE,
         offset: assets.length
       });
@@ -673,6 +706,7 @@
       })
     ];
     void refresh();
+    void loadPersonOptions();
     return () => {
       for (const off of offs) void off.then((f) => f());
       thumbObserver?.disconnect();
@@ -701,10 +735,16 @@
     <button class="tab" class:on={tab === "albums"} onclick={() => { tab = "albums"; void loadAlbums(); }}>
       Albums{#if albums.length > 0}&nbsp;{albums.length}{/if}
     </button>
+    <button class="tab" class:on={tab === "settings"} onclick={() => { tab = "settings"; }}>
+      Settings
+    </button>
   </nav>
 
   {#if error}
-    <p class="error global-error">{error}</p>
+    <div class="error global-error" role="alert">
+      <span>{error}</span>
+      <button class="tiny" onclick={() => (error = null)} aria-label="Dismiss error">Dismiss</button>
+    </div>
   {/if}
 
   {#if tab === "cleanup"}
@@ -867,6 +907,57 @@
           {stats.videos} videos
         </button>
         <span class="total">{fmtBytes(stats.bytes)} indexed</span>
+      </div>
+
+      <div class="filters">
+        <select
+          aria-label="Filter by month"
+          onchange={(e) => { monthFilter = e.currentTarget.value || null; void refresh(); }}
+        >
+          <option value="">All dates</option>
+          {#each months as m (m.month)}
+            <option value={m.month} selected={monthFilter === m.month}>
+              {m.month} ({m.count})
+            </option>
+          {/each}
+        </select>
+        <button
+          class="chip"
+          class:on={locFilter === "all"}
+          onclick={() => { locFilter = "all"; void refresh(); }}
+        >
+          Anywhere
+        </button>
+        <button
+          class="chip"
+          class:on={locFilter === "with"}
+          onclick={() => { locFilter = "with"; void refresh(); }}
+        >
+          With location
+        </button>
+        <button
+          class="chip"
+          class:on={locFilter === "without"}
+          onclick={() => { locFilter = "without"; void refresh(); }}
+        >
+          No location
+        </button>
+        {#if personOptions.length > 0}
+          <select
+            aria-label="Filter by person"
+            onchange={(e) => {
+              personFilter = e.currentTarget.value === "" ? null : Number(e.currentTarget.value);
+              void refresh();
+            }}
+          >
+            <option value="">Everyone</option>
+            {#each personOptions as c (c.id)}
+              <option value={c.id} selected={personFilter === c.id}>
+                Person {c.id} ({c.faceCount})
+              </option>
+            {/each}
+          </select>
+        {/if}
       </div>
 
       {#if stats.missing > 0}
@@ -1119,6 +1210,7 @@
     </section>
   {/if}
 
+  {#if tab === "settings"}
   <section class="card" aria-labelledby="engine-heading">
     <div class="card-head">
       <h2 id="engine-heading">Engine</h2>
@@ -1149,7 +1241,10 @@
     {:else if status.state === "down"}
       <p class="error">{status.error}</p>
     {/if}
+
+    <p class="hint">Storage: library index and thumbnails stay on this device. Only reverse-geocoding lookups leave the machine.</p>
   </section>
+  {/if}
 
   {#if confirm}
     <div class="scrim">
@@ -1416,6 +1511,23 @@
     color: #8a93a5;
     margin: 0.5rem 0;
   }
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin: 0 0 0.6rem;
+  }
+  .filters select {
+    background: #0d0f14;
+    color: #e7eaf0;
+    border: 1px solid #232733;
+    border-radius: 999px;
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.2rem 0.5rem;
+    max-width: 12rem;
+  }
   .mode select {
     background: #0d0f14;
     color: #e7eaf0;
@@ -1676,5 +1788,9 @@
     border-radius: 8px;
     padding: 0.5rem 0.8rem;
     margin-bottom: 0.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
   }
 </style>

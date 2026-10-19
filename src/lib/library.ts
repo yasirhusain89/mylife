@@ -51,10 +51,42 @@ export function importFolder(root: string, recursive = true): Promise<ImportSumm
   return invoke("import_folder", { root, recursive });
 }
 
-export function libraryList(
-  opts: { kind?: "image" | "video"; offset?: number; limit?: number } = {},
-): Promise<AssetRow[]> {
-  return invoke("library_list", opts);
+export type LibraryFilters = {
+  kind?: "image" | "video";
+  offset?: number;
+  limit?: number;
+  personCluster?: number;
+  hasLocation?: boolean;
+  capturedMin?: number;
+  capturedMax?: number;
+};
+
+export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
+  return invoke("library_list", {
+    kind: opts.kind,
+    offset: opts.offset,
+    limit: opts.limit,
+    personCluster: opts.personCluster ?? null,
+    hasLocation: opts.hasLocation ?? null,
+    capturedMin: opts.capturedMin ?? null,
+    capturedMax: opts.capturedMax ?? null
+  });
+}
+
+export function libraryCount(opts: Omit<LibraryFilters, "offset" | "limit"> = {}): Promise<number> {
+  return invoke("library_count", {
+    kind: opts.kind,
+    personCluster: opts.personCluster ?? null,
+    hasLocation: opts.hasLocation ?? null,
+    capturedMin: opts.capturedMin ?? null,
+    capturedMax: opts.capturedMax ?? null
+  });
+}
+
+export type LibraryMonth = { month: string; count: number };
+
+export function libraryMonths(): Promise<LibraryMonth[]> {
+  return invoke("library_months");
 }
 
 export function libraryStats(): Promise<LibraryStats> {

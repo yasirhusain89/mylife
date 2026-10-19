@@ -999,14 +999,60 @@ fn library_list(
     conn: tauri::State<'_, DbState>,
     kind: Option<String>,
     blurred_only: Option<bool>,
+    person_cluster: Option<i64>,
+    has_location: Option<bool>,
+    captured_min: Option<f64>,
+    captured_max: Option<f64>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
-    let offset = offset.unwrap_or(0).max(0);
-    let limit = limit.unwrap_or(200).clamp(1, 1000);
     let kind = kind.filter(|k| k == "image" || k == "video");
-    db::library(&conn, kind.as_deref(), blurred_only.unwrap_or(false), offset, limit)
+    db::library(
+        &conn,
+        &db::LibraryQuery {
+            kind: kind.as_deref(),
+            blurred_only: blurred_only.unwrap_or(false),
+            person_cluster,
+            has_location,
+            captured_min,
+            captured_max,
+            offset: offset.unwrap_or(0).max(0),
+            limit: limit.unwrap_or(200).clamp(1, 1000),
+        },
+    )
+}
+
+#[tauri::command]
+fn library_count(
+    conn: tauri::State<'_, DbState>,
+    kind: Option<String>,
+    blurred_only: Option<bool>,
+    person_cluster: Option<i64>,
+    has_location: Option<bool>,
+    captured_min: Option<f64>,
+    captured_max: Option<f64>,
+) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let kind = kind.filter(|k| k == "image" || k == "video");
+    db::library_count(
+        &conn,
+        &db::LibraryQuery {
+            kind: kind.as_deref(),
+            blurred_only: blurred_only.unwrap_or(false),
+            person_cluster,
+            has_location,
+            captured_min,
+            captured_max,
+            ..Default::default()
+        },
+    )
+}
+
+#[tauri::command]
+fn library_months(conn: tauri::State<'_, DbState>) -> Result<Vec<db::LibraryMonth>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::library_months(&conn)
 }
 
 /// Moves files to the macOS Trash (reversible) and flags the rows as missing.
@@ -1100,6 +1146,16 @@ pub fn run() {
             if !applied.is_empty() {
                 eprintln!("fotoflow: applied migrations {applied:?}");
             }
+            // Flag files that vanished while the app was closed (ejected
+            // volumes) so the first paint already reports them instead of
+            // booting with missing: 0. Stat-only; fast even on big libraries.
+            match db::verify_missing(&conn) {
+                Ok((missing, restored)) if missing + restored > 0 => {
+                    eprintln!("fotoflow: startup verify: {missing} missing, {restored} restored");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("fotoflow: startup verify failed: {e}"),
+            }
             app.manage(Arc::new(Mutex::new(conn)) as DbState);
             app.manage(engine::new_state());
             Ok(())
@@ -1134,6 +1190,8 @@ pub fn run() {
             export_highlight,
             export_bundle,
             library_list,
+            library_count,
+            library_months,
             library_stats
         ])
         .run(tauri::generate_context!())

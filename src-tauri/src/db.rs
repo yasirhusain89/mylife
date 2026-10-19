@@ -1204,23 +1204,53 @@ pub struct CleanupStats {
 
 // MARK: - Queries
 
-pub fn library(
-    conn: &Connection,
-    kind: Option<&str>,
-    blurred_only: bool,
-    offset: i64,
-    limit: i64,
-) -> Result<Vec<AssetRow>, String> {
-    let sql = "SELECT id, path, name, ext, kind, mime, size_bytes, modified, captured_at,
-                      width, height, duration, favorite, missing, sha256
-               FROM assets
-               WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
-                 AND (?2 = 0 OR blurred = 1)
-               ORDER BY COALESCE(captured_at, modified) DESC, id DESC
-               LIMIT ?3 OFFSET ?4";
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare library: {e}"))?;
+#[derive(Default)]
+pub struct LibraryQuery<'a> {
+    pub kind: Option<&'a str>,
+    pub blurred_only: bool,
+    /// Only assets that have a detected face in this person cluster.
+    pub person_cluster: Option<i64>,
+    /// Some(true) = geotagged only, Some(false) = untagged only.
+    pub has_location: Option<bool>,
+    /// Capture-time window (epoch seconds, half-open [min, max)).
+    pub captured_min: Option<f64>,
+    pub captured_max: Option<f64>,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+/// The WHERE fragment shared by library() and library_count() so the
+/// "Showing X of N" total always matches the filtered grid.
+const LIBRARY_WHERE: &str = "WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
+  AND (?2 = 0 OR blurred = 1)
+  AND (?3 IS NULL OR EXISTS (SELECT 1 FROM faces f WHERE f.path = a.path AND f.cluster_id = ?3))
+  AND (?4 IS NULL OR ((?4 = 1) = (latitude IS NOT NULL)))
+  AND (?5 IS NULL OR COALESCE(captured_at, modified) >= ?5)
+  AND (?6 IS NULL OR COALESCE(captured_at, modified) < ?6)";
+
+pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, String> {
+    let sql = format!(
+        "SELECT id, path, name, ext, kind, mime, size_bytes, modified, captured_at,
+                       width, height, duration, favorite, missing, sha256
+                FROM assets a
+                {LIBRARY_WHERE}
+                ORDER BY COALESCE(captured_at, modified) DESC, id DESC
+                LIMIT ?7 OFFSET ?8"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
-        .query_map(params![kind, i64::from(blurred_only), limit, offset], |r| {
+        .query_map(
+            params![
+                q.kind,
+                i64::from(q.blurred_only),
+                q.person_cluster,
+                q.has_location.map(i64::from),
+                q.captured_min,
+                q.captured_max,
+                q.limit,
+                q.offset
+            ],
+            |r| {
             Ok(AssetRow {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -1244,6 +1274,57 @@ pub fn library(
     let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(|e| format!("row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Filtered total for the "Showing X of N" label; same predicates as library().
+pub fn library_count(conn: &Connection, q: &LibraryQuery) -> Result<i64, String> {
+    let sql = format!("SELECT COUNT(*) FROM assets a {LIBRARY_WHERE}");
+    conn.query_row(
+        &sql,
+        params![
+            q.kind,
+            i64::from(q.blurred_only),
+            q.person_cluster,
+            q.has_location.map(i64::from),
+            q.captured_min,
+            q.captured_max
+        ],
+        |r| r.get(0),
+    )
+    .map_err(|e| format!("library count: {e}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMonth {
+    pub month: String,
+    pub count: i64,
+}
+
+/// Months present in the readable library, newest first, for the date picker.
+pub fn library_months(conn: &Connection) -> Result<Vec<LibraryMonth>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT strftime('%Y-%m', COALESCE(captured_at, modified), 'unixepoch') AS m,
+                    COUNT(*)
+             FROM assets
+             WHERE missing = 0 AND COALESCE(captured_at, modified) IS NOT NULL
+             GROUP BY m ORDER BY m DESC",
+        )
+        .map_err(|e| format!("prepare library months: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(LibraryMonth {
+                month: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })
+        .map_err(|e| format!("query library months: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("library month row: {e}"))?);
     }
     Ok(out)
 }
@@ -1336,15 +1417,15 @@ mod tests {
         conn.execute("UPDATE assets SET captured_at = 50.0 WHERE path = '/new.jpg'", []).unwrap();
         conn.execute("UPDATE assets SET captured_at = 900.0 WHERE path = '/old.jpg'", []).unwrap();
 
-        let all = library(&conn, None, false, 0, 10).unwrap();
+        let all = library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].path, "/old.jpg", "newest capture first");
 
-        let paged = library(&conn, None, false, 1, 10).unwrap();
+        let paged = library(&conn, &LibraryQuery { offset: 1, limit: 10, ..Default::default() }).unwrap();
         assert_eq!(paged.len(), 1);
         assert_eq!(paged[0].path, "/new.jpg", "offset skips the newest");
 
-        let videos = library(&conn, Some("video"), false, 0, 10).unwrap();
+        let videos = library(&conn, &LibraryQuery { kind: Some("video"), limit: 10, ..Default::default() }).unwrap();
         assert!(videos.is_empty(), "kind filter excludes images");
 
         let s = stats(&conn).unwrap();
@@ -1366,16 +1447,16 @@ mod tests {
         )
         .unwrap();
 
-        let blurred_rows = library(&conn, None, true, 0, 10).unwrap();
+        let blurred_rows = library(&conn, &LibraryQuery { blurred_only: true, limit: 10, ..Default::default() }).unwrap();
         assert_eq!(blurred_rows.len(), 1, "only the flagged photo");
         assert_eq!(blurred_rows[0].path, "/soft.jpg");
 
-        let all_rows = library(&conn, Some("image"), false, 0, 10).unwrap();
+        let all_rows = library(&conn, &LibraryQuery { kind: Some("image"), limit: 10, ..Default::default() }).unwrap();
         assert_eq!(all_rows.len(), 2, "kind + blurred filters compose");
 
-        let page = library(&conn, None, true, 0, 1).unwrap();
+        let page = library(&conn, &LibraryQuery { blurred_only: true, limit: 1, ..Default::default() }).unwrap();
         assert_eq!(page.len(), 1, "limit still applies alongside the filter");
-        assert!(library(&conn, Some("video"), true, 0, 10).unwrap().is_empty());
+        assert!(library(&conn, &LibraryQuery { kind: Some("video"), blurred_only: true, limit: 10, ..Default::default() }).unwrap().is_empty());
     }
 
     #[test]
@@ -1409,6 +1490,59 @@ mod tests {
 
         let stats = faces_count(&conn).unwrap();
         assert_eq!(stats, 1);
+    }
+
+    #[test]
+    fn library_filters_by_month_location_and_person() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // a: Oct, geotagged; b: Oct, untagged; c: Nov, geotagged.
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/c.jpg", 1, 3.0), scan).unwrap();
+        // 2026-10-03, 2026-10-04, 2026-11-02.
+        conn.execute("UPDATE assets SET captured_at = 1791000000.0 WHERE path = '/a.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET captured_at = 1791100000.0 WHERE path = '/b.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET captured_at = 1793600000.0 WHERE path = '/c.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET latitude = 1.0, longitude = 2.0 WHERE path IN ('/a.jpg', '/c.jpg')", [])
+            .unwrap();
+        // One face on /a.jpg, clustered as person 1.
+        let face_ids = save_faces(
+            &conn,
+            "/a.jpg",
+            &[serde_json::json!({"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2, "confidence": 0.9})],
+        )
+        .unwrap();
+        let cluster = save_cluster(&conn, &face_ids).unwrap();
+
+        let base = LibraryQuery { limit: 10, ..Default::default() };
+        assert_eq!(library(&conn, &base).unwrap().len(), 3);
+
+        // Month window for October 2026: [Oct 1, Nov 1) UTC.
+        let oct = LibraryQuery { captured_min: Some(1_790_812_800.0), captured_max: Some(1_793_491_200.0), limit: 10, ..Default::default() };
+        assert_eq!(library(&conn, &oct).unwrap().len(), 2);
+
+        // Location presence.
+        let geo = LibraryQuery { has_location: Some(true), limit: 10, ..Default::default() };
+        assert_eq!(library(&conn, &geo).unwrap().len(), 2);
+        let nongeo = LibraryQuery { has_location: Some(false), limit: 10, ..Default::default() };
+        let rows = library(&conn, &nongeo).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/b.jpg");
+
+        // Person cluster.
+        let person = LibraryQuery { person_cluster: Some(cluster), limit: 10, ..Default::default() };
+        let rows = library(&conn, &person).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/a.jpg");
+        assert_eq!(library_count(&conn, &person).unwrap(), 1);
+
+        // Months list covers both months, newest first.
+        let months = library_months(&conn).unwrap();
+        assert_eq!(months.len(), 2);
+        assert_eq!(months[0].month, "2026-11");
+        assert_eq!(months[1].month, "2026-10");
     }
 
     #[test]
@@ -1559,7 +1693,7 @@ mod verify_tests {
         // "Eject" one file: flagged missing and hidden from library queries.
         std::fs::remove_file(dir.join("b.jpg")).unwrap();
         assert_eq!(verify_missing(&conn).unwrap(), (1, 0));
-        assert_eq!(library(&conn, None, false, 0, 10).unwrap().len(), 2);
+        assert_eq!(library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap().len(), 2);
         let still_indexed: i64 = conn
             .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
             .unwrap();
@@ -1568,6 +1702,6 @@ mod verify_tests {
         // "Remount": the flag clears and the file reappears.
         std::fs::write(dir.join("b.jpg"), b"x").unwrap();
         assert_eq!(verify_missing(&conn).unwrap(), (0, 1));
-        assert_eq!(library(&conn, None, false, 0, 10).unwrap().len(), 3);
+        assert_eq!(library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap().len(), 3);
     }
 }
