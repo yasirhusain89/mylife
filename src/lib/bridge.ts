@@ -1,6 +1,7 @@
 import * as realLibrary from "./library";
 import * as realEngine from "./engine";
 import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import * as mock from "./mock";
 
 /**
@@ -88,6 +89,15 @@ export const engineSysInfo: typeof realEngine.engineSysInfo = WEB
 export function open(opts?: { title?: string; directory?: boolean; multiple?: boolean }): Promise<string | null> {
   if (WEB) return mock.open(opts);
   return tauriOpen(opts ?? {}) as Promise<string | null>;
+}
+
+/**
+ * Playable/src-able URL for a library file. Empty in web mode (no real
+ * files behind the mock); the viewer falls back to the thumbnail poster.
+ */
+export function assetUrl(path: string): string {
+  if (WEB) return "";
+  return convertFileSrc(path);
 }
 
 export type {

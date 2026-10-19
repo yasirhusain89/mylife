@@ -61,3 +61,23 @@ test("event place names resolve from coordinates", async ({ page }) => {
   await page.getByRole("button", { name: "Resolve place names" }).click();
   await expect(page.getByText("San Francisco, California")).toBeVisible();
 });
+
+test("clicking a photo opens the viewer with keyboard navigation", async ({ page }) => {
+  await page.getByRole("button", { name: "IMG_20261007_185817.jpg" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("1 of 8")).toBeVisible();
+  await expect(dialog.getByRole("img").first()).toBeVisible();
+  await page.keyboard.press("ArrowRight");
+  await expect(dialog.getByText("2 of 8")).toBeVisible();
+  await expect(dialog.getByText("IMG_20261007_185822.jpg").first()).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
+test("video shows a poster with a web-mode note", async ({ page }) => {
+  await page.getByRole("button", { name: "VID_20261007_192001.mp4" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("Video playback needs the desktop app")).toBeVisible();
+});

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open, isWebMode } from "$lib/bridge";
+  import { open, isWebMode, assetUrl } from "$lib/bridge";
   import {
     blurredAssets,
     cleanupStats,
@@ -122,6 +122,10 @@
   let eventsLoading = $state(false);
   let resolvingPlaces = $state(false);
   let geocodeState = $state<GeocodeProgress | null>(null);
+  // Lightbox viewer over the current library page (index into `assets`).
+  let viewer = $state<{ index: number } | null>(null);
+  let viewerSrc = $state<string | null>(null);
+  let viewerError = $state<string | null>(null);
   let toast = $state<string | null>(null);
 
   async function checkEngine() {
@@ -199,6 +203,11 @@
 
   // Thumbnail pipeline: viewport-driven, pooled, cancellable.
   //
+  // Engine thumbs arrive as raw base64; the web mock returns full data URIs.
+  function thumbSrc(image: string): string {
+    return image.startsWith("data:") ? image : `data:image/jpeg;base64,${image}`;
+  }
+  //
   // Library/picker figures register through `observeThumb`; the observer
   // enqueues only on-screen paths (200px overscan prefetch). Up to
   // THUMB_CONCURRENCY engine calls run at once instead of strictly
@@ -226,7 +235,7 @@
       thumbActive++;
       engineThumb(path, 256).then(
         ({ image }) => {
-          if (gen === thumbGen && image) thumbs[path] = `data:image/jpeg;base64,${image}`;
+          if (gen === thumbGen && image) thumbs[path] = thumbSrc(image);
         },
         () => {
           /* unreadable asset: leave the placeholder */
@@ -284,6 +293,53 @@
         thumbObserver?.unobserve(node);
       }
     };
+  }
+
+  // Lightbox viewer: full-size image via the engine, video via asset URL.
+  function openViewer(index: number) {
+    if (index < 0 || index >= assets.length) return;
+    viewer = { index };
+    viewerSrc = null;
+    viewerError = null;
+    void loadViewer(assets[index]);
+  }
+
+  async function loadViewer(a: AssetRow) {
+    viewerSrc = null;
+    viewerError = null;
+    try {
+      if (a.kind === "video") {
+        const url = assetUrl(a.path);
+        // Empty in web mode: the markup falls back to the thumbnail poster.
+        if (url) viewerSrc = url;
+      } else {
+        const { image } = await engineThumb(a.path, 1600);
+        if (!image) throw new Error("engine returned no image");
+        viewerSrc = thumbSrc(image);
+      }
+    } catch (e) {
+      viewerError = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function stepViewer(delta: number) {
+    if (!viewer || assets.length === 0) return;
+    const next = (viewer.index + delta + assets.length) % assets.length;
+    viewer = { index: next };
+    void loadViewer(assets[next]);
+  }
+
+  function closeViewer() {
+    viewer = null;
+    viewerSrc = null;
+    viewerError = null;
+  }
+
+  function viewerKey(e: KeyboardEvent) {
+    if (!viewer) return;
+    if (e.key === "Escape") closeViewer();
+    else if (e.key === "ArrowRight") { e.preventDefault(); stepViewer(1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); stepViewer(-1); }
   }
 
   async function runImport(target: string) {
@@ -550,7 +606,7 @@
     if (thumbs[key]) return;
     try {
       const { image } = await faceThumb(f.path, f.x, f.y, f.width, f.height, 160);
-      if (image) thumbs[key] = `data:image/jpeg;base64,${image}`;
+      if (image) thumbs[key] = thumbSrc(image);
     } catch {
       /* unreadable face crop */
     }
@@ -746,6 +802,7 @@
   });
 </script>
 
+<svelte:window onkeydown={viewerKey} />
 <main class="container">
   <header>
     <h1>fotoflow</h1>
@@ -1020,15 +1077,21 @@
 
     {#if assets.length}
       <div class="grid">
-        {#each assets as asset (asset.id)}
+        {#each assets as asset, i (asset.id)}
           <figure>
-            <div class="thumb" use:observeThumb={asset.path}>
+            <button
+              type="button"
+              class="thumb clickable"
+              use:observeThumb={asset.path}
+              title={`Open ${asset.name}`}
+              onclick={() => openViewer(i)}
+            >
               {#if thumbs[asset.path]}
                 <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
               {:else}
                 <span class="placeholder">{asset.ext.toUpperCase()}</span>
               {/if}
-            </div>
+            </button>
             <figcaption>
               <span class="name" title={asset.name}>{asset.name}</span>
               <span class="meta">
@@ -1342,6 +1405,53 @@
         </div>
       </div>
     </div>
+  {/if}
+
+  {#if viewer}
+    {@const current = assets[viewer.index]}
+    {#if current}
+      <div
+        class="scrim"
+        role="dialog"
+        aria-modal="true"
+        aria-label={current.name}
+        tabindex={-1}
+      >
+        <div class="viewer">
+          <div class="viewer-bar">
+            <span class="hint">{viewer.index + 1} of {assets.length}</span>
+            <span class="viewer-name" title={current.name}>{current.name}</span>
+            <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
+          </div>
+          <div class="viewer-stage">
+            <button class="viewer-nav" onclick={() => stepViewer(-1)} aria-label="Previous">‹</button>
+            {#if current.kind === "video" && viewerSrc}
+              {#key viewerSrc}
+                <!-- svelte-ignore a11y_media_has_caption: library files ship no caption tracks -->
+                <video src={viewerSrc} controls autoplay playsinline></video>
+              {/key}
+            {:else if current.kind === "video"}
+              {#if thumbs[current.path]}
+                <img src={thumbs[current.path]} alt={current.name} />
+              {/if}
+              <p class="hint">Video playback needs the desktop app — the web preview has no file to play.</p>
+            {:else if viewerSrc}
+              <img src={viewerSrc} alt={current.name} />
+            {:else if viewerError}
+              <p class="error">{viewerError}</p>
+            {:else}
+              <p class="hint">Loading full size…</p>
+            {/if}
+            <button class="viewer-nav" onclick={() => stepViewer(1)} aria-label="Next">›</button>
+          </div>
+          <p class="hint viewer-meta">
+            {current.capturedAt ?? current.modified ? fmtDate(current.capturedAt ?? current.modified) : "—"}
+            {#if current.width && current.height} · {current.width}×{current.height}{/if}
+            · {fmtBytes(current.sizeBytes)}
+          </p>
+        </div>
+      </div>
+    {/if}
   {/if}
 
   {#if toast}
@@ -1695,6 +1805,64 @@
   }
   .thumb.clickable {
     cursor: pointer;
+  }
+  button.thumb {
+    display: block;
+    width: 100%;
+    padding: 0;
+    background: #0d0f14;
+    border: 0;
+    color: inherit;
+  }
+  .viewer {
+    background: #101319;
+    border: 1px solid #232733;
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    width: min(64rem, 96vw);
+    max-height: 92vh;
+    overflow: auto;
+  }
+  .viewer-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    margin-bottom: 0.6rem;
+  }
+  .viewer-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .viewer-stage {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .viewer-stage img,
+  .viewer-stage video {
+    flex: 1;
+    min-width: 0;
+    max-height: 74vh;
+    width: 100%;
+    object-fit: contain;
+    border-radius: 8px;
+    background: #000;
+  }
+  button.viewer-nav {
+    background: transparent;
+    border: 1px solid #232733;
+    border-radius: 8px;
+    font-size: 1.6rem;
+    line-height: 1;
+    padding: 0.6rem 0.8rem;
+    flex: none;
+  }
+  .viewer-meta {
+    margin: 0.5rem 0 0;
   }
   .thumb.clickable:hover {
     outline: 2px solid #2f6bff;
