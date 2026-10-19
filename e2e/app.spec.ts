@@ -48,6 +48,12 @@ test("import via typed path adds assets", async ({ page }) => {
   await expect(page.getByText("/mock/vacation", { exact: false }).first()).toBeVisible();
 });
 
+test("post-import pipeline organizes automatically", async ({ page }) => {
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await expect(page.getByText("Library organized: 8 enriched", { exact: false })).toBeVisible();
+});
+
 test("starring filters the library to favorites", async ({ page }) => {
   await page.getByRole("button", { name: "Star IMG_20261007_185817.jpg" }).click();
   await page.getByRole("button", { name: "★ Favorites" }).click();

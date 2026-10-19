@@ -456,66 +456,228 @@ pub struct SceneTagCount {
 /// Classifies every untagged readable image with the on-device Vision scene
 /// classifier (mountains, flowers, birds…) and stores the top labels.
 /// One failed file never aborts the run.
+pub fn run_tag_scenes(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    mut on_progress: impl FnMut(i64, i64, i64, i64),
+) -> Result<TagScenesSummary, String> {
+    let targets = db::untagged_images(conn)?;
+    let total = targets.len() as i64;
+    let mut tagged = 0i64;
+    let mut failed = 0i64;
+    for (i, (id, path)) in targets.iter().enumerate() {
+        let ok = if !std::path::Path::new(path).exists() {
+            false
+        } else {
+            match engine::call_blocking(
+                engine_state,
+                "classify",
+                Some(json!({ "path": path, "top": 3 })),
+                Duration::from_secs(60),
+            ) {
+                Ok(reply) => {
+                    let tags: Vec<(String, f64)> = reply
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|t| {
+                                    Some((
+                                        t.get("tag")?.as_str()?.to_string(),
+                                        t.get("confidence")?.as_f64()?,
+                                    ))
+                                })
+                                .filter(|(_, c)| *c >= 0.2)
+                                .take(3)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if tags.is_empty() {
+                        false
+                    } else {
+                        db::store_tags(conn, *id, &tags).is_ok()
+                    }
+                }
+                Err(_) => false,
+            }
+        };
+        if ok {
+            tagged += 1;
+        } else {
+            failed += 1;
+        }
+        on_progress((i + 1) as i64, total, tagged, failed);
+    }
+    Ok(TagScenesSummary { total, tagged, failed })
+}
+
 #[tauri::command]
 async fn tag_scenes(app: tauri::AppHandle) -> Result<TagScenesSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
         let engine_state = app.state::<engine::EngineState>();
-        let targets = db::untagged_images(&conn)?;
-        let total = targets.len() as i64;
-        let mut tagged = 0i64;
-        let mut failed = 0i64;
-        for (i, (id, path)) in targets.iter().enumerate() {
-            let ok = if !std::path::Path::new(path).exists() {
-                false
-            } else {
-                match engine::call_blocking(
-                    &engine_state,
-                    "classify",
-                    Some(json!({ "path": path, "top": 3 })),
-                    Duration::from_secs(60),
-                ) {
-                    Ok(reply) => {
-                        let tags: Vec<(String, f64)> = reply
-                            .get("tags")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|t| {
-                                        Some((
-                                            t.get("tag")?.as_str()?.to_string(),
-                                            t.get("confidence")?.as_f64()?,
-                                        ))
-                                    })
-                                    .filter(|(_, c)| *c >= 0.2)
-                                    .take(3)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if tags.is_empty() {
-                            false
-                        } else {
-                            db::store_tags(&conn, *id, &tags).is_ok()
-                        }
-                    }
-                    Err(_) => false,
-                }
-            };
-            if ok {
-                tagged += 1;
-            } else {
-                failed += 1;
-            }
+        run_tag_scenes(&conn, &engine_state, |processed, total, tagged, failed| {
             let _ = app.emit(
                 "tag-progress",
-                TagProgress { processed: (i + 1) as i64, total, tagged, failed },
+                TagProgress { processed, total, tagged, failed },
             );
-        }
-        Ok(TagScenesSummary { total, tagged, failed })
+        })
     })
     .await
     .map_err(|e| format!("tag task join failed: {e}"))?
+}
+
+// MARK: - Post-import pipeline
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineProgress {
+    pub stage: String,
+    pub processed: i64,
+    pub total: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineSummary {
+    pub enriched: i64,
+    pub hashed: i64,
+    pub scored: i64,
+    pub events: i64,
+    pub tagged: i64,
+    pub places: i64,
+    pub failed: i64,
+}
+
+/// Offline place fill for the pipeline: exact cell, cached fence, static
+/// table — never the network. Precise fence hits pin their cell; coarse
+/// static labels apply in-memory only (see resolve_places).
+pub fn run_fill_cached_places(conn: &rusqlite::Connection) -> Result<i64, String> {
+    let targets = db::events_missing_places(conn)?;
+    let mut filled = 0i64;
+    for t in &targets {
+        let lat_key = db::round_coord(t.latitude);
+        let lon_key = db::round_coord(t.longitude);
+        if let Some(p) = db::geocode_cache_lookup(conn, lat_key, lon_key)? {
+            db::set_event_place(conn, t.event_id, &p)?;
+            filled += 1;
+            continue;
+        }
+        if let Ok(Some(p)) = db::geocode_covering(conn, t.latitude, t.longitude) {
+            let _ = db::geocode_cache_store(conn, lat_key, lon_key, &p, None);
+            db::set_event_place(conn, t.event_id, &p)?;
+            filled += 1;
+            continue;
+        }
+        if let Some(label) = crate::geofences::static_geofence(t.latitude, t.longitude) {
+            db::set_event_place(conn, t.event_id, &approx_label(label))?;
+            filled += 1;
+        }
+    }
+    Ok(filled)
+}
+
+/// Runs every offline organization pass in dependency order: metadata,
+/// hashes, blur scores, event clusters, scene tags, cached-only places.
+/// Faces stay manual (slow); network geocoding stays on its button.
+/// A stage-level error counts once and the chain continues — one bad
+/// stage never strands the rest.
+pub fn run_post_import(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    max_attempts: i64,
+    mut on_stage: impl FnMut(PipelineProgress),
+) -> Result<PipelineSummary, String> {
+    let mut failed = 0i64;
+    let mut emit = |stage: &str, processed: i64, total: i64| {
+        on_stage(PipelineProgress { stage: stage.to_string(), processed, total });
+    };
+
+    let enriched = match run_enrich(conn, engine_state, max_attempts, |p, _, f, pend| {
+        emit("enrich", p, p + pend);
+    }) {
+        Ok(s) => {
+            failed += s.failed;
+            s.enriched
+        }
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let hashed = match run_hash(conn, engine_state, |h, f, _| {
+        emit("hash", h + f, 0);
+    }) {
+        Ok((h, _, _)) => h,
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let scored = match run_quality(conn, engine_state, 25.0, |s, _| {
+        emit("quality", s, 0);
+    }) {
+        Ok((s, _)) => s,
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let events = match db::cluster_events(conn, 4.0, 500.0) {
+        Ok((e, _)) => {
+            emit("events", e, e);
+            e
+        }
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let tagged = match run_tag_scenes(conn, engine_state, |p, t, _, _| {
+        emit("tag", p, t);
+    }) {
+        Ok(s) => {
+            failed += s.failed;
+            s.tagged
+        }
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let places = match run_fill_cached_places(conn) {
+        Ok(n) => {
+            emit("places", n, n);
+            n
+        }
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    emit("done", 0, 0);
+    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, places, failed })
+}
+
+#[tauri::command]
+async fn run_post_import_cmd(app: tauri::AppHandle) -> Result<PipelineSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        run_post_import(&conn, &engine_state, 3, |p| {
+            let _ = app.emit("pipeline-progress", p);
+        })
+    })
+    .await
+    .map_err(|e| format!("pipeline task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -880,6 +1042,13 @@ fn parse_nominatim_bbox(body: &serde_json::Value) -> Option<(f64, f64, f64, f64)
     }
 }
 
+/// Marks coarse static labels as approximate. Precise network and cached
+/// labels never carry the mark; `events_missing_places` treats marked rows
+/// as still needing refinement.
+fn approx_label(label: &str) -> String {
+    format!("≈ {label}")
+}
+
 /// Fills `events.place` for every event that has coordinates but no name yet.
 /// Cache-first per ~100m cell; network lookups are throttled to one per
 /// second. A single failed lookup never aborts the run — it is counted and
@@ -936,7 +1105,7 @@ async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, S
                             // label stays on this event, while precise network
                             // results keep flowing into their own cells.
                             cached += 1;
-                            let label = label.to_string();
+                            let label = approx_label(label);
                             seen.insert(cell, Some(label.clone()));
                             Some(label)
                         } else {
@@ -1529,6 +1698,7 @@ pub fn run() {
             hash_candidates_run,
             score_quality,
             tag_scenes,
+            run_post_import_cmd,
             scene_tags,
             asset_tags,
             duplicates_list,
@@ -1786,6 +1956,62 @@ mod tests {
         let state = engine_state();
         let summary = run_enrich(&conn, &state, 3, |_, _, _, _| {}).unwrap();
         assert_eq!((summary.processed, summary.pending), (0, 0));
+    }
+
+    #[test]
+    fn pipeline_chains_all_offline_stages_and_is_stable_on_rerun() {
+        let dir = fixture("ff-pipeline-test", 0);
+        let real_png = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        std::fs::copy(&real_png, dir.join("a.png")).unwrap();
+        std::fs::copy(&real_png, dir.join("b.png")).unwrap();
+        std::fs::write(dir.join("corrupt.jpg"), b"not a jpeg").unwrap();
+        // macOS copy preserves the source mtime, which would split the
+        // import across two days: rewrite so every file is stamped now.
+        for name in ["a.png", "b.png"] {
+            let bytes = std::fs::read(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        let state = engine_state();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+
+        let mut stages = Vec::new();
+        let first = run_post_import(&conn, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
+        assert_eq!(first.enriched, 2, "both real PNGs decode");
+        assert_eq!(first.hashed, 3, "hashing reads bytes, even corrupt ones");
+        assert_eq!(first.events, 1, "one import session clusters together");
+        // The 16px icon classifies nothing above the 0.2 floor and the
+        // corrupt file fails outright: every image still leaves the
+        // untagged set exactly once (tagged 0 + tag-stage fails 3).
+        // Positive tag storage is covered at the db level.
+        assert_eq!(first.tagged, 0);
+        assert_eq!(first.places, 0, "no coordinates, nothing to fill");
+        for want in ["enrich", "hash", "quality", "events", "tag", "places", "done"] {
+            assert!(stages.contains(&want.to_string()), "stage {want} reports progress");
+        }
+
+        let snapshot = || -> (i64, i64, i64, i64) {
+            let events: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            let groups: i64 = conn
+                .query_row("SELECT COUNT(*) FROM duplicate_groups", [], |r| r.get(0))
+                .unwrap_or(0);
+            let tags: i64 = conn
+                .query_row("SELECT COUNT(*) FROM asset_tags", [], |r| r.get(0))
+                .unwrap();
+            let faces: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+                .unwrap_or(0);
+            (events, groups, tags, faces)
+        };
+        let before = snapshot();
+        let second = run_post_import(&conn, &state, 3, |_| {}).unwrap();
+        assert_eq!(snapshot(), before, "rerun creates no new rows");
+        assert_eq!(second.tagged, 0, "nothing newly tagged on rerun");
     }
 
     /// Builds N byte-identical files plus unique ones, so dedupe has real work.

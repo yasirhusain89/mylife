@@ -20,6 +20,8 @@ import type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  PipelineProgress,
+  PipelineSummary,
   ResolvePlacesSummary,
   ScanRoot,
   SceneTag,
@@ -310,6 +312,14 @@ export async function sceneTags(): Promise<SceneTagCount[]> {
 
 export async function assetTags(assetId: number): Promise<SceneTag[]> {
   return assetTagMap.get(assetId) ?? [];
+}
+
+export async function runPostImport(): Promise<PipelineSummary> {
+  return { enriched: 8, hashed: 8, scored: 8, events: 1, tagged: 2, places: 0, failed: 0 };
+}
+
+export function onPipelineProgress(_cb: (p: PipelineProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
 }
 
 export async function runFaceClustering(): Promise<{

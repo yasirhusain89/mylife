@@ -46,6 +46,8 @@ export const tagScenes = pick("tagScenes");
 export const onTagProgress = pick("onTagProgress");
 export const sceneTags = pick("sceneTags");
 export const assetTags = pick("assetTags");
+export const runPostImport = pick("runPostImport");
+export const onPipelineProgress = pick("onPipelineProgress");
 export const onImportProgress = pick("onImportProgress");
 export const onImportError = pick("onImportError");
 export const enrichAssets = pick("enrichAssets");
@@ -131,6 +133,8 @@ export type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  PipelineProgress,
+  PipelineSummary,
   ResolvePlacesSummary,
   ScanRoot,
   SceneTag,

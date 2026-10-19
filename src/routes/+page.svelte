@@ -31,7 +31,8 @@
     engineThumb,
     enrichAssets,
     findDuplicates,
-    keepCopy,
+    runPostImport,
+    onPipelineProgress,    keepCopy,
     onHashProgress,
     onQualityProgress,
     scoreQuality,
@@ -66,6 +67,7 @@
     type EnrichProgress,
     type ImportProgress,
     type LibraryStats,
+    type PipelineProgress,
     type ScanRoot,
     type SceneTag,
     type SceneTagCount,
@@ -119,6 +121,8 @@
   let root = $state<string | null>(null);
   let importing = $state(false);
   let progress = $state<ImportProgress | null>(null);
+  let pipelining = $state(false);
+  let pipelineState = $state<PipelineProgress | null>(null);
   let error = $state<string | null>(null);
   let thumbs = $state<Record<string, string>>({});
   let people = $state<FaceClusterRow[]>([]);
@@ -469,11 +473,35 @@
         bytes: summary.bytes
       };
       await refresh();
-      void runEnrich();
+      void runPipeline();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       importing = false;
+    }
+  }
+
+  async function runPipeline() {
+    if (pipelining) return;
+    pipelining = true;
+    pipelineState = null;
+    try {
+      const summary = await runPostImport();
+      const bits = [
+        `${summary.enriched} enriched`,
+        `${summary.hashed} hashed`,
+        `${summary.scored} scored`,
+        `${summary.events} events`,
+        `${summary.tagged} tagged`,
+        summary.places > 0 ? `${summary.places} places` : null,
+        summary.failed > 0 ? `${summary.failed} failed` : null
+      ].filter((b) => b !== null);
+      toast = `Library organized: ${bits.join(" · ")}`;
+      await refresh();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      pipelining = false;
     }
   }
 
@@ -1021,6 +1049,9 @@
       }),
       onTagProgress((p) => {
         if (tagging) tagState = p;
+      }),
+      onPipelineProgress((p) => {
+        if (pipelining) pipelineState = p;
       })
     ];
     void refresh();
@@ -1230,6 +1261,15 @@
         <p class="hint">
           {progress.scanned} scanned · {progress.imported} new · {progress.unchanged} unchanged ·
           {fmtBytes(progress.bytes)}
+        </p>
+      </div>
+    {/if}
+
+    {#if pipelining}
+      <div class="progress">
+        <div class="bar live"><span></span></div>
+        <p class="hint">
+          Organizing after import{pipelineState ? `: ${pipelineState.stage} (${pipelineState.processed}${pipelineState.total > 0 ? ` of ${pipelineState.total}` : ""})` : "…"}
         </p>
       </div>
     {/if}

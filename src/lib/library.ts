@@ -132,6 +132,30 @@ export function assetTags(assetId: number): Promise<SceneTag[]> {
   return invoke("asset_tags", { assetId });
 }
 
+export type PipelineProgress = {
+  stage: string;
+  processed: number;
+  total: number;
+};
+
+export type PipelineSummary = {
+  enriched: number;
+  hashed: number;
+  scored: number;
+  events: number;
+  tagged: number;
+  places: number;
+  failed: number;
+};
+
+export function runPostImport(): Promise<PipelineSummary> {
+  return invoke("run_post_import_cmd");
+}
+
+export function onPipelineProgress(cb: (p: PipelineProgress) => void): Promise<() => void> {
+  return listen<PipelineProgress>("pipeline-progress", (e) => cb(e.payload));
+}
+
 export type LibraryMonth = { month: string; count: number };
 
 export function libraryMonths(): Promise<LibraryMonth[]> {

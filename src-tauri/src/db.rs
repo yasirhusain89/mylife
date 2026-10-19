@@ -894,9 +894,11 @@ pub struct PlaceTarget {
 }
 
 /// Events that have coordinates but no resolved place name yet.
+/// Coarse `≈`-marked labels count as missing: they are provisional and a
+/// network resolve refines them.
 pub fn events_missing_places(conn: &Connection) -> Result<Vec<PlaceTarget>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, latitude, longitude FROM events WHERE place IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id")
+        .prepare("SELECT id, latitude, longitude FROM events WHERE (place IS NULL OR place LIKE '≈ %') AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id")
         .map_err(|e| format!("prepare missing places: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -2379,6 +2381,30 @@ mod tests {
             geocode_covering(&conn, 37.771, -122.415).unwrap().as_deref(),
             Some("Mission District")
         );
+    }
+
+    #[test]
+    fn coarse_marked_events_stay_refinement_eligible() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO events (name, started_at, ended_at, latitude, longitude, asset_count, face_count, created_at)
+             VALUES ('Oct 9', 1.0, 2.0, 37.7749, -122.4194, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+        let eid: i64 = conn.query_row("SELECT id FROM events", [], |r| r.get(0)).unwrap();
+
+        // Unlabeled: needs a place.
+        assert_eq!(events_missing_places(&conn).unwrap().len(), 1);
+        // Coarse static label: still eligible for network refinement.
+        set_event_place(&conn, eid, "≈ California, United States").unwrap();
+        let still = events_missing_places(&conn).unwrap();
+        assert_eq!(still.len(), 1);
+        assert_eq!(still[0].event_id, eid);
+        // Precise label: done.
+        set_event_place(&conn, eid, "San Francisco, California").unwrap();
+        assert!(events_missing_places(&conn).unwrap().is_empty());
     }
 }
 
