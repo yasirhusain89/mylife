@@ -131,9 +131,9 @@
   }
 
   async function refresh() {
+    resetThumbs();
     assets = await libraryList({ kind: filter === "all" ? undefined : filter, limit: PAGE });
     stats = await libraryStats();
-    void loadThumbs(assets);
   }
 
   function libraryTotal(): number {
@@ -158,16 +158,93 @@
     }
   }
 
-  async function loadThumbs(rows: AssetRow[]) {
-    for (const a of rows) {
-      if (thumbs[a.path]) continue;
-      try {
-        const { image } = await engineThumb(a.path, 256);
-        if (image) thumbs[a.path] = `data:image/jpeg;base64,${image}`;
-      } catch {
-        /* unreadable asset: leave the placeholder */
-      }
+  // Thumbnail pipeline: viewport-driven, pooled, cancellable.
+  //
+  // Library/picker figures register through `observeThumb`; the observer
+  // enqueues only on-screen paths (200px overscan prefetch). Up to
+  // THUMB_CONCURRENCY engine calls run at once instead of strictly
+  // serially. resetThumbs() drops pending work and invalidates in-flight
+  // results on tab switches; whatever is still visible is requeued.
+  const THUMB_CONCURRENCY = 6;
+  let thumbQueue: string[] = [];
+  let thumbQueued = new Set<string>();
+  let visiblePaths = new Set<string>();
+  let thumbActive = 0;
+  let thumbGen = 0;
+  let thumbObserver: IntersectionObserver | null = null;
+
+  function queueThumb(path: string) {
+    if (thumbs[path] || thumbQueued.has(path)) return;
+    thumbQueued.add(path);
+    thumbQueue.push(path);
+    void pumpThumbs();
+  }
+
+  async function pumpThumbs() {
+    const gen = thumbGen;
+    while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length > 0) {
+      const path = thumbQueue.shift() as string;
+      thumbActive++;
+      engineThumb(path, 256).then(
+        ({ image }) => {
+          if (gen === thumbGen && image) thumbs[path] = `data:image/jpeg;base64,${image}`;
+        },
+        () => {
+          /* unreadable asset: leave the placeholder */
+        }
+      ).finally(() => {
+        thumbActive--;
+        thumbQueued.delete(path);
+        void pumpThumbs();
+      });
     }
+  }
+
+  function resetThumbs() {
+    thumbGen++;
+    thumbQueue = [];
+    thumbQueued.clear();
+    for (const p of visiblePaths) queueThumb(p);
+  }
+
+  // Eager variant for bounded surfaces (cleanup lists, album members):
+  // same pool, no viewport gating.
+  function loadThumbs(rows: { path: string }[]) {
+    for (const a of rows) queueThumb(a.path);
+  }
+
+  function ensureThumbObserver(): IntersectionObserver | null {
+    if (thumbObserver) return thumbObserver;
+    if (typeof IntersectionObserver === "undefined") return null;
+    thumbObserver = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const p = (e.target as HTMLElement).dataset.thumbPath;
+          if (!p) continue;
+          if (e.isIntersecting) {
+            visiblePaths.add(p);
+            queueThumb(p);
+          } else {
+            visiblePaths.delete(p);
+          }
+        }
+      },
+      { rootMargin: "200px" }
+    );
+    return thumbObserver;
+  }
+
+  function observeThumb(node: HTMLElement, path: string) {
+    node.dataset.thumbPath = path;
+    const obs = ensureThumbObserver();
+    if (obs) obs.observe(node);
+    else queueThumb(path); // no viewport API (prerender): load eagerly
+    return {
+      destroy() {
+        visiblePaths.delete(path);
+        thumbObserver?.unobserve(node);
+      }
+    };
   }
 
   async function runImport(target: string) {
@@ -194,6 +271,7 @@
   }
 
   async function refreshCleanup() {
+    resetThumbs();
     cleanup = await cleanupStats();
     groups = await duplicatesList();
     blurred = await blurredAssets(36);
@@ -268,6 +346,7 @@
   }
 
   async function loadPeople() {
+    resetThumbs();
     peopleLoading = true;
     people = [];
     try {
@@ -291,6 +370,7 @@
   let pickerSelected = $state<Set<number>>(new Set());
 
   async function loadAlbums() {
+    resetThumbs();
     albumsLoading = true;
     try {
       albums = await albumsList();
@@ -355,9 +435,8 @@
     picker = { albumId: album.id, name: album.name };
     pickerSelected = new Set();
     libraryList({ limit: 500 })
-      .then(async (rows) => {
+      .then((rows) => {
         pickerAssets = rows;
-        await loadThumbs(rows);
       })
       .catch((e) => (error = String(e).replace(/^Error: /, "")));
   }
@@ -374,6 +453,7 @@
     if (!target) return;
     const ids = [...pickerSelected];
     picker = null;
+    resetThumbs();
     if (ids.length === 0) return;
     try {
       const r = await albumAdd(target.albumId, ids);
@@ -438,6 +518,7 @@
   }
 
   async function loadEvents() {
+    resetThumbs();
     eventsLoading = true;
     try {
       events = await eventsList();
@@ -594,6 +675,8 @@
     void refresh();
     return () => {
       for (const off of offs) void off.then((f) => f());
+      thumbObserver?.disconnect();
+      thumbObserver = null;
     };
   });
 </script>
@@ -817,7 +900,7 @@
       <div class="grid">
         {#each assets as asset (asset.id)}
           <figure>
-            <div class="thumb">
+            <div class="thumb" use:observeThumb={asset.path}>
               {#if thumbs[asset.path]}
                 <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
               {:else}
@@ -1100,6 +1183,7 @@
               <button
                 type="button"
                 class="thumb small clickable"
+                use:observeThumb={asset.path}
                 aria-pressed={pickerSelected.has(asset.id)}
                 title={asset.name}
                 onclick={() => togglePicker(asset.id)}
@@ -1115,7 +1199,7 @@
           {/each}
         </div>
         <div class="dialog-actions">
-          <button class="ghost" onclick={() => (picker = null)}>Cancel</button>
+          <button class="ghost" onclick={() => { picker = null; resetThumbs(); }}>Cancel</button>
           <button disabled={pickerSelected.size === 0} onclick={() => void addPicked()}>
             Add {pickerSelected.size} photo{pickerSelected.size === 1 ? "" : "s"}
           </button>
