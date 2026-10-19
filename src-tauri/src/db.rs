@@ -1576,6 +1576,9 @@ pub struct LibraryQuery<'a> {
     pub favorite_only: Option<bool>,
     /// Only assets carrying this scene tag (from `tag_scenes`).
     pub scene_tag: Option<&'a str>,
+    /// Substring match on file name or path (search box). The LIKE pattern
+    /// (with `%`/`_` escaped) is built inside library()/library_count().
+    pub query: Option<&'a str>,
     pub offset: i64,
     pub limit: i64,
 }
@@ -1589,16 +1592,18 @@ const LIBRARY_WHERE: &str = "WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
   AND (?5 IS NULL OR COALESCE(captured_at, modified) >= ?5)
   AND (?6 IS NULL OR COALESCE(captured_at, modified) < ?6)
   AND (?7 IS NULL OR favorite = ?7)
-  AND (?8 IS NULL OR EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag = ?8))";
+  AND (?8 IS NULL OR EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag = ?8))
+  AND (?9 IS NULL OR a.name LIKE ?9 ESCAPE '\\' OR a.path LIKE ?9 ESCAPE '\\')";
 
 pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, String> {
+    let like = q.query.map(|s| format!("%{}%", escape_like(s)));
     let sql = format!(
         "SELECT id, path, name, ext, kind, mime, size_bytes, modified, captured_at,
                        width, height, duration, favorite, missing, sha256
                 FROM assets a
                 {LIBRARY_WHERE}
                 ORDER BY COALESCE(captured_at, modified) DESC, id DESC
-                LIMIT ?9 OFFSET ?10"
+                LIMIT ?10 OFFSET ?11"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
@@ -1612,6 +1617,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 q.captured_max,
                 q.favorite_only.map(i64::from),
                 q.scene_tag,
+                like.as_deref(),
                 q.limit,
                 q.offset
             ],
@@ -1645,6 +1651,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
 
 /// Filtered total for the "Showing X of N" label; same predicates as library().
 pub fn library_count(conn: &Connection, q: &LibraryQuery) -> Result<i64, String> {
+    let like = q.query.map(|s| format!("%{}%", escape_like(s)));
     let sql = format!("SELECT COUNT(*) FROM assets a {LIBRARY_WHERE}");
     conn.query_row(
         &sql,
@@ -1656,7 +1663,8 @@ pub fn library_count(conn: &Connection, q: &LibraryQuery) -> Result<i64, String>
             q.captured_min,
             q.captured_max,
             q.favorite_only.map(i64::from),
-            q.scene_tag
+            q.scene_tag,
+            like.as_deref()
         ],
         |r| r.get(0),
     )
@@ -2091,6 +2099,31 @@ mod tests {
         assert_eq!(library_count(&conn, &q).unwrap(), 1);
         let none = LibraryQuery { scene_tag: Some("bird"), limit: 10, ..Default::default() };
         assert!(library(&conn, &none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn library_search_matches_names_paths_and_escapes_wildcards() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/photos/birthday-brunch.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/photos/trip-100%.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/other/mountain.png", 1, 3.0), scan).unwrap();
+
+        fn q(s: &str) -> LibraryQuery<'_> {
+            LibraryQuery { query: Some(s), limit: 10, ..Default::default() }
+        }
+        assert_eq!(library(&conn, &q("brunch")).unwrap().len(), 1);
+        assert_eq!(library_count(&conn, &q("brunch")).unwrap(), 1);
+        // Path match, case-insensitive.
+        assert_eq!(library(&conn, &q("MOUNTAIN")).unwrap().len(), 1);
+        // A literal % in the query matches only the file that has one.
+        let pct = library(&conn, &q("100%")).unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].name, "trip-100%.jpg");
+        // Bare % never becomes a wildcard.
+        assert_eq!(library(&conn, &q("%")).unwrap().len(), 1);
+        assert!(library(&conn, &q("zzz")).unwrap().is_empty());
     }
 
     #[test]

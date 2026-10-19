@@ -1511,6 +1511,7 @@ fn library_list(
     captured_max: Option<f64>,
     favorite_only: Option<bool>,
     scene_tag: Option<String>,
+    query: Option<String>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
@@ -1527,6 +1528,7 @@ fn library_list(
             captured_max,
             favorite_only,
             scene_tag: scene_tag.as_deref(),
+            query: query.as_deref(),
             offset: offset.unwrap_or(0).max(0),
             limit: limit.unwrap_or(200).clamp(1, 1000),
         },
@@ -1544,6 +1546,7 @@ fn library_count(
     captured_max: Option<f64>,
     favorite_only: Option<bool>,
     scene_tag: Option<String>,
+    query: Option<String>,
 ) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
     let kind = kind.filter(|k| k == "image" || k == "video");
@@ -1558,6 +1561,7 @@ fn library_count(
             captured_max,
             favorite_only,
             scene_tag: scene_tag.as_deref(),
+            query: query.as_deref(),
             ..Default::default()
         },
     )

@@ -88,8 +88,55 @@
   let assets = $state<AssetRow[]>([]);
   let stats = $state<LibraryStats | null>(null);
   let roots = $state<ScanRoot[]>([]);
+  const RECENT_SEARCH_KEY = "fotoflow-recent-searches";
+
+  function loadRecentSearches(): string[] {
+    try {
+      if (typeof localStorage === "undefined") return [];
+      const raw = localStorage.getItem(RECENT_SEARCH_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.filter((s) => typeof s === "string").slice(0, 5) : [];
+    } catch {
+      return [];
+    }
+  }
+
   let filter = $state<"all" | "image" | "video">("all");
   let favFilter = $state(false);
+  let searchText = $state("");
+  let searchQuery = $state<string | null>(null);
+  let recentSearches = $state<string[]>(loadRecentSearches());
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function saveRecentSearch(q: string) {
+    recentSearches = [q, ...recentSearches.filter((s) => s !== q)].slice(0, 5);
+    try {
+      localStorage.setItem(RECENT_SEARCH_KEY, JSON.stringify(recentSearches));
+    } catch {
+      /* storage unavailable: recents just don't persist */
+    }
+  }
+
+  function queueSearch() {
+    if (searchTimer) clearTimeout(searchTimer);
+    const text = searchText;
+    searchTimer = setTimeout(() => void applySearch(text), 300);
+  }
+
+  async function applySearch(raw: string) {
+    const q = raw.trim();
+    searchText = q;
+    searchQuery = q === "" ? null : q;
+    if (q !== "") saveRecentSearch(q);
+    await refresh();
+  }
+
+  function clearSearch() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchText = "";
+    searchQuery = null;
+    void refresh();
+  }
   let sceneFilter = $state<string | null>(null);
   let tagOptions = $state<SceneTagCount[]>([]);
   let tagging = $state(false);
@@ -112,6 +159,7 @@
       kind: filter === "all" ? undefined : filter,
       favoriteOnly: favFilter || undefined,
       sceneTag: sceneFilter ?? undefined,
+      query: searchQuery ?? undefined,
       personCluster: personFilter ?? undefined,
       hasLocation: locFilter === "all" ? undefined : locFilter === "with",
       capturedMin,
@@ -1219,6 +1267,27 @@
         <button class="ghost" onclick={() => void enterSelectMode()}>Select</button>
       {/if}
     </div>
+
+    <div class="path-entry" role="search">
+      <input
+        type="search"
+        placeholder="Search file names…"
+        aria-label="Search library"
+        bind:value={searchText}
+        oninput={queueSearch}
+      />
+      {#if searchText !== ""}
+        <button type="button" class="ghost" onclick={clearSearch}>Clear</button>
+      {/if}
+    </div>
+    {#if searchText === "" && recentSearches.length > 0}
+      <div class="enrich">
+        <span class="hint">Recent:</span>
+        {#each recentSearches as r (r)}
+          <button class="chip" onclick={() => void applySearch(r)}>{r}</button>
+        {/each}
+      </div>
+    {/if}
 
     <form
       class="path-entry"

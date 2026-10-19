@@ -172,6 +172,14 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
   if (opts.sceneTag !== undefined) {
     out = out.filter((a) => (assetTagMap.get(a.id) ?? []).some((t) => t.tag === opts.sceneTag));
   }
+  if (opts.query !== undefined) {
+    const needle = opts.query.trim().toLowerCase();
+    if (needle !== "") {
+      out = out.filter(
+        (a) => a.name.toLowerCase().includes(needle) || a.path.toLowerCase().includes(needle)
+      );
+    }
+  }
   if (opts.personCluster !== undefined) {
     const members = clusterMembers.get(opts.personCluster);
     out = members ? out.filter((a) => members.has(a.id)) : [];

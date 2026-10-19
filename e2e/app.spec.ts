@@ -96,6 +96,17 @@ test("month filter narrows the grid", async ({ page }) => {
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
 
+test("filename search narrows and clears", async ({ page }) => {
+  await page.getByRole("searchbox", { name: "Search library" }).fill("185817");
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+  await page.getByRole("button", { name: "Clear" }).click();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.getByText("Recent:")).toBeVisible();
+  await page.getByRole("button", { name: "185817", exact: true }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+});
+
 test("event place names resolve from coordinates", async ({ page }) => {
   await page.getByRole("button", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();

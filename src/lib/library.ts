@@ -61,6 +61,7 @@ export type LibraryFilters = {
   capturedMax?: number;
   favoriteOnly?: boolean;
   sceneTag?: string;
+  query?: string;
 };
 
 export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
@@ -73,7 +74,8 @@ export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
     capturedMin: opts.capturedMin ?? null,
     capturedMax: opts.capturedMax ?? null,
     favoriteOnly: opts.favoriteOnly ?? null,
-    sceneTag: opts.sceneTag ?? null
+    sceneTag: opts.sceneTag ?? null,
+    query: opts.query?.trim() ? opts.query.trim() : null
   });
 }
 
@@ -85,7 +87,8 @@ export function libraryCount(opts: Omit<LibraryFilters, "offset" | "limit"> = {}
     capturedMin: opts.capturedMin ?? null,
     capturedMax: opts.capturedMax ?? null,
     favoriteOnly: opts.favoriteOnly ?? null,
-    sceneTag: opts.sceneTag ?? null
+    sceneTag: opts.sceneTag ?? null,
+    query: opts.query?.trim() ? opts.query.trim() : null
   });
 }
 
