@@ -49,6 +49,14 @@ function pickRead<K extends keyof RealLibrary & keyof MockLibrary & keyof ApiLib
   return pick(key);
 }
 
+/** Write counterpart of pickRead: API client in api mode, else the Tauri/mock pick. */
+function pickWrite<K extends keyof RealLibrary & keyof MockLibrary & keyof ApiLibrary>(
+  key: K
+): RealLibrary[K] {
+  if (API) return api[key] as unknown as RealLibrary[K];
+  return pick(key);
+}
+
 export const importFolder = pick("importFolder");
 export const libraryList = pickRead("libraryList");
 export const libraryCount = pickRead("libraryCount");
@@ -56,8 +64,8 @@ export const libraryMonths = pickRead("libraryMonths");
 export const libraryStats = pickRead("libraryStats");
 export const scanRoots = pickRead("scanRoots");
 export const assetsInRoot = pickRead("assetsInRoot");
-export const setFavorite = pick("setFavorite");
-export const tagScenes = pick("tagScenes");
+export const setFavorite = pickWrite("setFavorite");
+export const tagScenes = pickWrite("tagScenes");
 export const onTagProgress = pick("onTagProgress");
 export const sceneTags = pickRead("sceneTags");
 export const assetTags = pick("assetTags");
@@ -102,11 +110,11 @@ export const resolvePlaces = pick("resolvePlaces");
 export const onGeocodeProgress = pick("onGeocodeProgress");
 export const onGeocodeError = pick("onGeocodeError");
 export const albumsList = pickRead("albumsList");
-export const albumCreate = pick("albumCreate");
+export const albumCreate = pickWrite("albumCreate");
 export const albumRename = pick("albumRename");
 export const albumDelete = pick("albumDelete");
 export const albumAssets = pick("albumAssets");
-export const albumAdd = pick("albumAdd");
+export const albumAdd = pickWrite("albumAdd");
 export const albumRemove = pick("albumRemove");
 export const exportBundle = pick("exportBundle");
 export const exportHighlight = pick("exportHighlight");

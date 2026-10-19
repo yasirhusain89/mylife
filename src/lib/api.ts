@@ -7,7 +7,8 @@ import type {
   LibraryMonth,
   LibraryStats,
   ScanRoot,
-  SceneTagCount
+  SceneTagCount,
+  TagScenesSummary
 } from "./library";
 
 /**
@@ -128,4 +129,47 @@ export function albumsList(): Promise<AlbumRow[]> {
 
 export function sceneTags(): Promise<SceneTagCount[]> {
   return getJson<SceneTagCount[]>("/api/tags");
+}
+
+/**
+ * Write slice: same names/signatures as the Tauri-backed writes in
+ * library.ts, served by the Rust HTTP server (see src-tauri/src/server.rs).
+ * The server's tag run is synchronous with no progress stream — it
+ * resolves with the final summary directly.
+ */
+
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${base()}${path}`, {
+    method: "POST",
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  if (!res.ok) {
+    let detail: string | null = null;
+    try {
+      const parsed = (await res.json()) as { error?: unknown };
+      if (typeof parsed?.error === "string" && parsed.error.trim() !== "") detail = parsed.error;
+    } catch {
+      /* non-JSON error body — fall back to status text */
+    }
+    throw new Error(detail ?? `POST ${path} failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as T;
+}
+
+export function setFavorite(assetId: number, favorite: boolean): Promise<void> {
+  return postJson<void>("/api/favorites", { id: assetId, favorite });
+}
+
+export async function albumCreate(name: string): Promise<number> {
+  const { id } = await postJson<{ id: number }>("/api/albums", { name });
+  return id;
+}
+
+export function albumAdd(albumId: number, assetIds: number[]): Promise<{ added: number }> {
+  return postJson<{ added: number }>(`/api/albums/${albumId}/add`, { assetIds });
+}
+
+export function tagScenes(): Promise<TagScenesSummary> {
+  return postJson<TagScenesSummary>("/api/tags/run");
 }

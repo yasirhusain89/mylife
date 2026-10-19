@@ -48,3 +48,61 @@ test("root-assets lists every id under /photos", async ({ page }) => {
   }, API!);
   expect(ids).toHaveLength(8);
 });
+
+test("favorite persists and the favorites filter shows it", async ({ page }) => {
+  const name = "IMG_20261007_185817.jpg";
+  // Reset via HTTP so a stale DB file can't leave the star pre-set, then
+  // reload so the UI starts unstarred; the starring itself stays UI-driven.
+  await page.evaluate(async (base) => {
+    const rows = (await (
+      await fetch(`${base}/api/library?limit=500`)
+    ).json()) as { id: number }[];
+    await Promise.all(
+      rows.map((a) =>
+        fetch(`${base}/api/favorites`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: a.id, favorite: false })
+        })
+      )
+    );
+  }, API!);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Library" })).toBeVisible();
+  await page.getByRole("button", { name: `Star ${name}` }).first().click();
+  await page.getByRole("button", { name: "★ Favorites" }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await expect(page.getByText(name).first()).toBeVisible();
+});
+
+test("album create+add via UI then Albums tab shows the count", async ({ page }) => {
+  const name = `e2e-album-${Date.now()}`;
+  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("button", { name: "New album", exact: true }).click();
+  await page.getByRole("textbox", { name: "New album" }).fill(name);
+  await page.getByRole("button", { name: "Create" }).click();
+  // Scope to this run's album card: the shared DB file keeps albums
+  // from earlier runs, so bare lookups would match several cards.
+  const card = page.locator("article", { hasText: name });
+  await expect(card.getByRole("button", { name })).toBeVisible();
+  await card.getByRole("button", { name: "Add photos" }).click();
+  await page.locator('button[title="IMG_20261007_185817.jpg"]').click();
+  await page.getByRole("button", { name: "Add 1 photo" }).click();
+  await expect(page.getByText(/Added 1 photo to/)).toBeVisible();
+  await expect(card.getByText("1 photo")).toBeVisible();
+});
+
+test("tag-run returns a summary without error", async ({ page }) => {
+  const summary = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/tags/run`, { method: "POST" });
+    if (!r.ok) throw new Error(`tags/run failed: ${r.status}`);
+    return (await r.json()) as { total: number; tagged: number; failed: number };
+  }, API!);
+  expect(typeof summary.total).toBe("number");
+  expect(typeof summary.tagged).toBe("number");
+  expect(typeof summary.failed).toBe("number");
+  // UI trigger resolves too (no progress stream over HTTP — the button
+  // just settles back with a summary toast).
+  await page.getByRole("button", { name: "Tag scenes" }).click();
+  await expect(page.getByText(/Tagged \d+ of \d+ photos|already has scene tags/)).toBeVisible();
+});

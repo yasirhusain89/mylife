@@ -8,12 +8,19 @@
 //!
 //! Bound to 127.0.0.1 only; permissive CORS is safe on loopback and lets
 //! the Vite dev server (another loopback port) call it from a browser.
+//!
+//! Write slice (POST, additive over the GET routes): favorites, album
+//! create/add, and a synchronous tag-run summary. The tag run has no
+//! engine classifier and no progress stream over HTTP — it reports the
+//! pending total with `tagged: 0` (same summary shape as the Tauri
+//! `tag_scenes` command). Handler failures reuse the GET error envelope
+//! `{ "error": ... }` with status 500.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -208,9 +215,110 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/root-assets", get(root_assets))
         .route("/api/clusters", get(clusters))
         .route("/api/events", get(events))
-        .route("/api/albums", get(albums))
+        .route("/api/albums", get(albums).post(album_create).options(preflight))
+        .route("/api/albums/:id/add", post(album_add).options(preflight))
         .route("/api/tags", get(tags))
+        .route("/api/tags/run", post(tags_run).options(preflight))
+        .route("/api/favorites", post(favorite_set).options(preflight))
         .with_state(state)
+}
+
+/// Preflight for the POST routes: JSON bodies trigger a browser OPTIONS
+/// check cross-port (Vite :1422 -> API :1423); answer with the loopback
+/// `*` origin plus the methods/headers the writes need.
+async fn preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*")),
+            (
+                HeaderName::from_static("access-control-allow-methods"),
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            ),
+            (
+                HeaderName::from_static("access-control-allow-headers"),
+                HeaderValue::from_static("content-type"),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct FavoriteBody {
+    id: i64,
+    favorite: bool,
+}
+
+async fn favorite_set(state: State<ApiState>, body: axum::Json<FavoriteBody>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::set_favorite(&conn, body.id, body.favorite) {
+        Ok(()) => (cors(), Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AlbumCreateBody {
+    name: String,
+}
+
+async fn album_create(state: State<ApiState>, body: axum::Json<AlbumCreateBody>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::album_create(&conn, &body.name) {
+        Ok(id) => (cors(), Json(serde_json::json!({ "id": id }))).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumAddBody {
+    asset_ids: Vec<i64>,
+}
+
+async fn album_add(
+    state: State<ApiState>,
+    Path(id): Path<i64>,
+    body: axum::Json<AlbumAddBody>,
+) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::album_add_assets(&conn, id, &body.asset_ids) {
+        Ok(added) => (cors(), Json(serde_json::json!({ "added": added }))).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+/// Synchronous tag-run summary without the engine classifier or the
+/// Tauri `tag-progress` stream (HTTP has no event channel): reports the
+/// pending untagged-image total with `tagged: 0`, same summary shape the
+/// `tag_scenes` command returns.
+async fn tags_run(State(state): State<ApiState>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::untagged_images(&conn) {
+        Ok(targets) => (
+            cors(),
+            Json(super::TagScenesSummary {
+                total: targets.len() as i64,
+                tagged: 0,
+                failed: 0,
+            }),
+        )
+            .into_response(),
+        Err(e) => err(e),
+    }
 }
 
 /// Demo seed mirroring the web mock: 8 assets under /photos so the API
@@ -331,6 +439,73 @@ mod tests {
             // Unknown route: axum 404, still loopback-confined.
             let missing = ureq::get(&format!("{base}/api/nope")).call();
             assert!(missing.is_err());
+        });
+    }
+
+    #[test]
+    fn writes_round_trip_through_http() {
+        // Favorite -> library filter shows it; album create+add -> albums
+        // list shows the count; tag-run returns the summary shape.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            assert!(seed_demo(&conn).unwrap(), "first seed fills the empty db");
+            let state = ApiState { db: Arc::new(Mutex::new(conn)) };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+
+            let favorited: serde_json::Value = ureq::post(&format!("{base}/api/favorites"))
+                .send_json(serde_json::json!({ "id": 1, "favorite": true }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert_eq!(favorited.get("ok"), Some(&serde_json::Value::Bool(true)));
+            let favs: Vec<serde_json::Value> =
+                ureq::get(&format!("{base}/api/library?favoriteOnly=true"))
+                    .call()
+                    .unwrap()
+                    .body_mut()
+                    .read_json()
+                    .unwrap();
+            assert_eq!(favs.len(), 1);
+            assert_eq!(favs[0].get("id"), Some(&serde_json::json!(1)));
+
+            let created: serde_json::Value = ureq::post(&format!("{base}/api/albums"))
+                .send_json(serde_json::json!({ "name": "Trip" }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            let album_id = created.get("id").and_then(|v| v.as_i64()).unwrap();
+            let added: serde_json::Value =
+                ureq::post(&format!("{base}/api/albums/{album_id}/add"))
+                    .send_json(serde_json::json!({ "assetIds": [1, 2] }))
+                    .unwrap()
+                    .body_mut()
+                    .read_json()
+                    .unwrap();
+            assert_eq!(added.get("added"), Some(&serde_json::json!(2)));
+            let albums: Vec<serde_json::Value> = ureq::get(&format!("{base}/api/albums"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            let row = albums.iter().find(|a| a.get("id") == Some(&serde_json::json!(album_id))).unwrap();
+            assert_eq!(row.get("assetCount"), Some(&serde_json::json!(2)));
+
+            let summary: serde_json::Value = ureq::post(&format!("{base}/api/tags/run"))
+                .send_empty()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert!(summary.get("total").and_then(|v| v.as_i64()).is_some());
+            assert!(summary.get("tagged").and_then(|v| v.as_i64()).is_some());
+            assert!(summary.get("failed").and_then(|v| v.as_i64()).is_some());
         });
     }
 }
