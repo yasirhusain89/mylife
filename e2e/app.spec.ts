@@ -88,6 +88,15 @@ test("people can be named and merged", async ({ page }) => {
   await expect(page.getByText("Cluster 2")).toBeHidden();
 });
 
+test("cluster cards expand and jump to the library", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+  await page.getByRole("button", { name: "View in Library" }).first().click();
+  await expect(page.getByText("Showing 4 of 4")).toBeVisible();
+});
+
 test("pet detection surfaces sightings and filters", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find pets" }).click();

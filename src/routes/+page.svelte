@@ -188,6 +188,7 @@
   let thumbs = $state<Record<string, string>>({});
   let people = $state<FaceClusterRow[]>([]);
   let mergeSelect = $state<Set<number>>(new Set());
+  let openClusterId = $state<number | null>(null);
   let pets = $state<PetSighting[]>([]);
   let petsLoading = $state(false);
   let petState = $state<PetProgress | null>(null);
@@ -688,6 +689,39 @@
     if (next.has(id)) next.delete(id);
     else next.add(id);
     mergeSelect = next;
+  }
+
+  async function toggleClusterPhotos(cluster: FaceClusterRow) {
+    openClusterId = openClusterId === cluster.id ? null : cluster.id;
+    if (openClusterId === null) return;
+    try {
+      const faces = await facesInCluster(cluster.id);
+      peopleFaces = { ...peopleFaces, [cluster.id]: faces };
+      const seen = new Set<string>();
+      const rows = faces
+        .filter((f) => {
+          if (seen.has(f.path)) return false;
+          seen.add(f.path);
+          return true;
+        })
+        .map((f) => ({ path: f.path }) as AssetRow);
+      for (const f of faces) void loadFaceThumb(f);
+      void loadThumbs(rows);
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function clusterSourcePaths(clusterId: number): string[] {
+    const seen = new Set<string>();
+    for (const f of peopleFaces[clusterId] ?? []) seen.add(f.path);
+    return [...seen];
+  }
+
+  function viewPersonInLibrary(clusterId: number) {
+    personFilter = clusterId;
+    tab = "library";
+    void refresh();
   }
 
   async function runMerge() {
@@ -1756,6 +1790,32 @@
               </span>
               <span class="waste">{cluster.faceCount} face{cluster.faceCount === 1 ? "" : "s"}</span>
             </header>
+            <div class="row-actions">
+              <button class="tiny" onclick={() => void toggleClusterPhotos(cluster)}>
+                {openClusterId === cluster.id ? "Hide photos" : "Show photos"}
+              </button>
+              <button class="tiny" onclick={() => viewPersonInLibrary(cluster.id)}>
+                View in Library
+              </button>
+            </div>
+            {#if openClusterId === cluster.id}
+              <div class="members">
+                {#each clusterSourcePaths(cluster.id) as path (path)}
+                  <figure>
+                    <div class="thumb small">
+                      {#if thumbs[path]}
+                        <img src={thumbs[path]} alt={path.split("/").pop()} loading="lazy" />
+                      {:else}
+                        <span class="placeholder">IMG</span>
+                      {/if}
+                    </div>
+                    <figcaption>
+                      <span class="name" title={path}>{path.split("/").pop()}</span>
+                    </figcaption>
+                  </figure>
+                {/each}
+              </div>
+            {/if}
             {#if peopleFaces[cluster.id]?.length}
               <div class="members">
                 {#each peopleFaces[cluster.id] as face (face.id)}
