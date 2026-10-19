@@ -581,5 +581,5 @@ export function onQualityProgress(cb: (p: CleanupProgress) => void): Promise<() 
 }
 
 export function engineThumb(path: string, maxPx = 256): Promise<{ path: string; image: string }> {
-  return invoke("engine_call", { cmd: "thumb", params: { path, maxPx } });
+  return invoke("cached_thumb", { path, maxPx });
 }

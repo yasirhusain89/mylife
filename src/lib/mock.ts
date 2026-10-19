@@ -682,6 +682,11 @@ export async function engineCall<T>(cmd: string, params?: object): Promise<T> {
     const path = p.path ?? "?";
     return { path, image: svgThumb(path.split("/").pop() ?? "?") } as T;
   }
+  if (cmd === "cached_thumb") {
+    const p = (params ?? {}) as { path?: string; maxPx?: number };
+    const path = p.path ?? "?";
+    return { path, image: svgThumb(path.split("/").pop() ?? "?") } as T;
+  }
   if (cmd === "face_thumb") return { image: svgThumb("face") } as T;
   throw new Error(`web mode: engine command ${cmd} not mocked`);
 }

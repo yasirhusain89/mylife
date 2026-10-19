@@ -1,6 +1,9 @@
 mod db;
 mod engine;
 mod geofences;
+mod server;
+
+pub use server::serve;
 
 use serde::Serialize;
 use rusqlite::params;
@@ -1849,6 +1852,218 @@ fn scan_roots(conn: tauri::State<'_, DbState>) -> Result<Vec<db::ScanRoot>, Stri
     db::scan_roots(&conn)
 }
 
+// MARK: - Thumbnail disk cache
+
+/// Cap for the on-disk thumbnail cache: past this size the oldest entries
+/// (by mtime) are evicted until the directory is back under the target.
+const THUMB_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const THUMB_CACHE_PRUNE_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// FNV-1a (64-bit) over the cache identity. Hand-rolled so no new dependency
+/// is needed for a single hash.
+fn thumb_cache_key(canonical: &str, len: u64, mtime_secs: u64, mtime_nanos: u32, max_px: u32) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in format!("{canonical}|{len}|{mtime_secs}.{mtime_nanos}|{max_px}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Cache file for a source image: the key folds in the canonical path, file
+/// size, mtime and requested size, so an edited file naturally misses and the
+/// stale entry is left for the size-cap eviction below.
+fn thumb_cache_file(
+    cache_dir: &std::path::Path,
+    path: &str,
+    max_px: u32,
+) -> Result<std::path::PathBuf, String> {
+    let meta = std::fs::metadata(path).map_err(|_| format!("thumb: source file not found: {path}"))?;
+    let (secs, nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let canonical = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    Ok(cache_dir.join(format!(
+        "{}.jpg",
+        thumb_cache_key(&canonical, meta.len(), secs, nanos, max_px)
+    )))
+}
+
+/// Deletes the oldest files (by mtime) while `dir` exceeds `max_bytes`,
+/// stopping once it is back under `target_bytes`. Returns files removed.
+/// Individual stat/remove failures are skipped, never fatal.
+fn prune_thumb_cache(dir: &std::path::Path, max_bytes: u64, target_bytes: u64) -> usize {
+    let mut entries: Vec<(u64, std::path::PathBuf, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    for entry in rd.filter_map(Result::ok) {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() * 1_000_000_000 + d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        total += size;
+        entries.push((mtime, p, size));
+    }
+    if total <= max_bytes {
+        return 0;
+    }
+    entries.sort_by_key(|(mtime, _, _)| *mtime); // oldest first
+    let mut removed = 0;
+    for (_, path, size) in entries {
+        if total <= target_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 encode (no new dependency for one conversion).
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn b64_value(c: u8) -> Result<u8, String> {
+    match c {
+        b'A'..=b'Z' => Ok(c - b'A'),
+        b'a'..=b'z' => Ok(c - b'a' + 26),
+        b'0'..=b'9' => Ok(c - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err("thumb: engine returned invalid base64".to_string()),
+    }
+}
+
+/// Standard base64 decode; rejects malformed input instead of guessing.
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("thumb: engine returned malformed base64".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return Err("thumb: engine returned malformed base64".to_string());
+        }
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                if i < 4 - pad {
+                    return Err("thumb: engine returned malformed base64".to_string());
+                }
+                n <<= 6;
+            } else {
+                n = (n << 6) | b64_value(c)? as u32;
+            }
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Disk-backed thumbnail fetch shared by the `cached_thumb` command and its
+/// tests: hit → the cached JPEG re-encoded to the engine's base64 shape;
+/// miss → a single engine `thumb` call whose JPEG bytes populate the cache.
+/// The returned object mirrors the engine `thumb` reply (`path`/`image`/…).
+fn cached_thumb_value(
+    engine_state: &engine::EngineState,
+    cache_dir: &std::path::Path,
+    path: &str,
+    max_px: u32,
+) -> Result<Value, String> {
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("thumb: source file not found: {path}"));
+    }
+    let cache_file = thumb_cache_file(cache_dir, path, max_px)?;
+    if cache_file.exists() {
+        if let Ok(bytes) = std::fs::read(&cache_file) {
+            if !bytes.is_empty() {
+                return Ok(json!({
+                    "path": path,
+                    "image": b64_encode(&bytes),
+                    "mime": "image/jpeg",
+                    "maxPx": max_px.clamp(16, 4096),
+                }));
+            }
+        }
+    }
+    let reply = engine::call_blocking(
+        engine_state,
+        "thumb",
+        Some(json!({ "path": path, "maxPx": max_px })),
+        Duration::from_secs(60),
+    )?;
+    let b64 = reply
+        .get("image")
+        .and_then(Value::as_str)
+        .ok_or("thumb engine returned no image")?;
+    let bytes = b64_decode(b64)?;
+    if bytes.is_empty() {
+        return Err("thumb engine returned an empty image".to_string());
+    }
+    if let Some(parent) = cache_file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create thumbs dir: {e}"))?;
+    }
+    std::fs::write(&cache_file, &bytes).map_err(|e| format!("write thumb cache: {e}"))?;
+    prune_thumb_cache(cache_dir, THUMB_CACHE_MAX_BYTES, THUMB_CACHE_PRUNE_TARGET_BYTES);
+    Ok(reply)
+}
+
+/// Library thumbnail with a disk cache under `{app_data}/thumbs/`: repeat
+/// renders for the same (file, size, mtime, max_px) skip the engine entirely.
+/// Missing files are a clean error; the Library keeps its placeholder.
+#[tauri::command]
+async fn cached_thumb(app: tauri::AppHandle, path: String, max_px: u32) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("thumbs");
+        std::fs::create_dir_all(&cache_dir).map_err(|e| format!("create thumbs dir: {e}"))?;
+        let engine_state = app.state::<engine::EngineState>();
+        cached_thumb_value(&engine_state, &cache_dir, &path, max_px)
+    })
+    .await
+    .map_err(|e| format!("thumb task join failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1879,6 +2094,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             engine_call,
+            cached_thumb,
             import_folder,
             enrich_assets,
             hash_candidates_run,
@@ -2344,6 +2560,110 @@ mod tests {
             .query_row("SELECT SUM(hash_attempts) FROM assets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(attempts, 2, "each file was hashed exactly once");
+    }
+
+    #[test]
+    fn thumb_cache_key_covers_size_and_max_px() {
+        let dir = std::env::temp_dir().join("ff-thumb-key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("icon.png");
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        std::fs::copy(&favicon, &src).unwrap();
+        let s = src.to_str().unwrap();
+
+        let at256 = thumb_cache_file(&dir, s, 256).unwrap();
+        let at512 = thumb_cache_file(&dir, s, 512).unwrap();
+        assert_ne!(at256, at512, "max_px is part of the key");
+        assert_eq!(at256.extension().and_then(|e| e.to_str()), Some("jpg"));
+
+        // Same path but different bytes → different key (size/mtime invalidation).
+        std::fs::write(&src, b"different-bytes").unwrap();
+        let rewritten = thumb_cache_file(&dir, s, 256).unwrap();
+        assert_ne!(at256, rewritten, "edited files must miss the old entry");
+    }
+
+    #[test]
+    fn thumb_cache_missing_source_is_a_clean_error() {
+        let state = engine::new_state(); // never touched: the stat fails first
+        let dir = std::env::temp_dir().join("ff-thumb-missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let err =
+            cached_thumb_value(&state, &dir, "/definitely/not/a/photo.jpg", 256).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn thumb_cache_serves_identical_bytes_from_disk() {
+        let state = engine_state();
+        let src_dir = std::env::temp_dir().join("ff-thumb-src");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        assert!(favicon.exists(), "static/favicon.png must exist for the thumb test");
+        let src = src_dir.join("icon.png");
+        std::fs::copy(&favicon, &src).unwrap();
+
+        let cache_dir = std::env::temp_dir().join("ff-thumb-cache");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let first = cached_thumb_value(&state, &cache_dir, src.to_str().unwrap(), 256)
+            .expect("engine thumb on favicon.png");
+        let img1 = first.get("image").and_then(Value::as_str).expect("image field");
+        assert!(!img1.is_empty(), "engine must return thumb bytes");
+
+        let files: Vec<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "one cache file after the first call");
+        let mtime_before = files[0].metadata().unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let second =
+            cached_thumb_value(&state, &cache_dir, src.to_str().unwrap(), 256).expect("cached thumb");
+        let img2 = second.get("image").and_then(Value::as_str).unwrap();
+        assert_eq!(img1, img2, "cache hit returns identical bytes");
+        let mtime_after = std::fs::metadata(&files[0].path()).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "a hit must not rewrite the cache file");
+    }
+
+    #[test]
+    fn thumb_cache_prune_evicts_oldest_until_under_target() {
+        let dir = std::env::temp_dir().join("ff-thumb-prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5u8 {
+            std::fs::write(dir.join(format!("{i:02}.jpg")), vec![i; 100]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // 500B on disk vs a 300B cap: eviction runs until <= 150B, i.e. only
+        // the newest file survives.
+        let removed = prune_thumb_cache(&dir, 300, 150);
+        assert_eq!(removed, 4, "oldest four files are evicted");
+        assert!(!dir.join("00.jpg").exists(), "oldest goes first");
+        assert!(dir.join("04.jpg").exists(), "newest survives");
+        let remaining: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        assert!(remaining <= 150, "under the prune target, got {remaining}B");
+
+        // Under the cap: no-op.
+        assert_eq!(prune_thumb_cache(&dir, 300, 150), 0);
+    }
+
+    #[test]
+    fn thumb_b64_roundtrips_without_a_backend() {
+        for len in [0usize, 1, 2, 3, 4, 5, 100, 255] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            assert_eq!(b64_decode(&b64_encode(&bytes)).unwrap(), bytes, "len {len}");
+        }
+        assert!(b64_decode("!!!").is_err(), "junk is rejected");
     }
 }
 
