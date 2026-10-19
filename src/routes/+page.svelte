@@ -566,11 +566,13 @@
     }
   }
 
-  async function doRenameCluster(cluster: FaceClusterRow) {
-    const name = window.prompt("Person name", cluster.name ?? "");
-    if (name === null || name.trim() === "" || name.trim() === (cluster.name ?? "")) return;
+  function doRenameCluster(cluster: FaceClusterRow) {
+    askName("Person name", cluster.name ?? "", "Rename", (n) => void renameClusterTo(cluster.id, n));
+  }
+
+  async function renameClusterTo(clusterId: number, name: string) {
     try {
-      await renameCluster(cluster.id, name.trim());
+      await renameCluster(clusterId, name);
       people = await clustersList();
       void loadPersonOptions();
     } catch (e) {
@@ -599,6 +601,18 @@
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
+  }
+
+  // In-app dialogs: the app WebView suppresses native prompt()/confirm(),
+  // which made album create/delete and every rename silently do nothing.
+  type NameDialog = { title: string; initial: string; okLabel: string; run: (name: string) => void };
+  let nameDialog = $state<NameDialog | null>(null);
+  let nameValue = $state("");
+  let deleteAlbumTarget = $state<AlbumRow | null>(null);
+
+  function askName(title: string, initial: string, okLabel: string, run: (name: string) => void) {
+    nameDialog = { title, initial, okLabel, run };
+    nameValue = initial;
   }
 
   // MARK: - Albums
@@ -639,33 +653,43 @@
     if (openAlbumId !== null) void loadAlbumMembers(album.id);
   }
 
-  async function newAlbum() {
-    const name = window.prompt("Album name");
-    if (name === null || name.trim() === "") return;
+  async function createAlbum(name: string) {
     try {
-      await albumCreate(name.trim());
+      await albumCreate(name);
       await loadAlbums();
-      toast = `Created “${name.trim()}”`;
+      toast = `Created “${name}”`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
   }
 
-  async function renameAlbum(album: AlbumRow) {
-    const name = window.prompt("Album name", album.name);
-    if (name === null || name.trim() === "" || name === album.name) return;
+  function newAlbum() {
+    askName("New album", "", "Create", (n) => void createAlbum(n));
+  }
+
+  function renameAlbum(album: AlbumRow) {
+    askName("Album name", album.name, "Rename", (n) => void renameAlbumTo(album.id, n));
+  }
+
+  async function renameAlbumTo(albumId: number, name: string) {
     try {
-      await albumRename(album.id, name.trim());
+      await albumRename(albumId, name);
       await loadAlbums();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
   }
 
-  async function deleteAlbum(album: AlbumRow) {
-    if (!window.confirm(`Delete album “${album.name}”? Photos stay in the library.`)) return;
+  function deleteAlbum(album: AlbumRow) {
+    deleteAlbumTarget = album;
+  }
+
+  async function confirmDeleteAlbum() {
+    const target = deleteAlbumTarget;
+    deleteAlbumTarget = null;
+    if (!target) return;
     try {
-      await albumDelete(album.id);
+      await albumDelete(target.id);
       await loadAlbums();
       toast = "Album deleted";
     } catch (e) {
@@ -817,11 +841,13 @@
     }
   }
 
-  async function doRename(event: EventRow) {
-    const name = window.prompt("Event name", event.name);
-    if (name === null || name.trim() === "" || name === event.name) return;
+  function doRename(event: EventRow) {
+    askName("Event name", event.name, "Rename", (n) => void renameEventTo(event.id, n));
+  }
+
+  async function renameEventTo(eventId: number, name: string) {
     try {
-      await renameEvent(event.id, name.trim());
+      await renameEvent(eventId, name);
       events = await eventsList();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1825,6 +1851,50 @@
     {/if}
   {/if}
 
+  {#if nameDialog}
+    <div class="scrim" role="dialog" aria-modal="true" aria-label={nameDialog.title} tabindex={-1}>
+      <form
+        class="dialog"
+        onsubmit={(e) => {
+          e.preventDefault();
+          const v = nameValue.trim();
+          const d = nameDialog;
+          if (v === "" || !d) return;
+          nameDialog = null;
+          d.run(v);
+        }}
+      >
+        <h3>{nameDialog.title}</h3>
+        <!-- svelte-ignore a11y_autofocus: modal dialog takes focus on open -->
+        <input
+          class="name-input"
+          type="text"
+          bind:value={nameValue}
+          aria-label={nameDialog.title}
+          maxlength={80}
+          autofocus
+        />
+        <div class="dialog-actions">
+          <button type="button" class="ghost" onclick={() => (nameDialog = null)}>Cancel</button>
+          <button type="submit" disabled={nameValue.trim() === ""}>{nameDialog.okLabel}</button>
+        </div>
+      </form>
+    </div>
+  {/if}
+
+  {#if deleteAlbumTarget}
+    <div class="scrim" role="dialog" aria-modal="true" aria-label="Delete album" tabindex={-1}>
+      <div class="dialog">
+        <h3 id="delete-album-heading">Delete “{deleteAlbumTarget.name}”?</h3>
+        <p class="hint">Photos stay in the library.</p>
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (deleteAlbumTarget = null)}>Cancel</button>
+          <button class="danger-solid" onclick={() => void confirmDeleteAlbum()}>Delete</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if toast}
     <p class="toast" role="status">{toast}</p>
   {/if}
@@ -2297,6 +2367,16 @@
     justify-content: flex-end;
     gap: 0.5rem;
     margin-top: 0.9rem;
+  }
+  .name-input {
+    width: 100%;
+    background: #0d0f14;
+    border: 1px solid #232733;
+    border-radius: 8px;
+    color: #e7eaf0;
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.4rem 0.6rem;
   }
   .toast {
     position: fixed;

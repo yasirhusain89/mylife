@@ -114,6 +114,40 @@ test("events render as a month-grouped timeline", async ({ page }) => {
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
 });
 
+test("album workflow: create, add photos, show, rename, delete", async ({ page }) => {
+  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("New album").fill("Family");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("Family").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Add photos" }).click();
+  const picker = page.getByRole("dialog", { name: /Add photos to/ });
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "IMG_20261007_185817.jpg" }).click();
+  await picker.getByRole("button", { name: "IMG_20261007_185822.jpg" }).click();
+  await picker.getByRole("button", { name: "Add 2 photos" }).click();
+  await page.getByRole("button", { name: "Show photos" }).click();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Remove", exact: true }).first().click();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeHidden();
+
+  await page.getByRole("button", { name: "Family", exact: true }).click();
+  const rename = page.getByRole("dialog", { name: "Album name" });
+  await rename.getByLabel("Album name").fill("Kin");
+  await rename.getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByText("Kin").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Delete album" }).click();
+  const confirm = page.getByRole("dialog", { name: "Delete album" });
+  await expect(confirm).toBeVisible();
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("Family").first()).toBeHidden();
+});
+
 test("event cards expand to member photos", async ({ page }) => {
   await page.getByRole("button", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
