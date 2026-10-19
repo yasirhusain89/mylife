@@ -239,3 +239,55 @@ test("video shows a poster with a web-mode note", async ({ page }) => {
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Video playback needs the desktop app")).toBeVisible();
 });
+
+test("picker search narrows candidates", async ({ page }) => {
+  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("Searchable");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("Searchable").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Add photos" }).click();
+  const picker = page.getByRole("dialog", { name: /Add photos to/ });
+  await expect(picker).toBeVisible();
+  await expect(picker.getByText("8 of 8")).toBeVisible();
+  await picker.getByLabel("Search photos by filename").fill("185817");
+  await expect(picker.getByText("1 of 8")).toBeVisible();
+  await expect(picker.getByRole("button", { name: "IMG_20261007_185817.jpg" })).toBeVisible();
+  await expect(picker.getByRole("button", { name: "IMG_20261007_185822.jpg" })).toBeHidden();
+});
+
+test("picker inline new-album creates and selects", async ({ page }) => {
+  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("First");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("First").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Add photos" }).click();
+  const picker = page.getByRole("dialog", { name: /Add photos to/ });
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "＋ New album" }).click();
+  await picker.getByLabel("New album name").fill("Second");
+  await picker.getByRole("button", { name: "Create" }).click();
+  await expect(picker.getByRole("heading", { name: /Second/ })).toBeVisible();
+  await picker.getByRole("button", { name: "IMG_20261007_185817.jpg" }).click();
+  await picker.getByRole("button", { name: /Add 1 photo/ }).click();
+  await expect(page.getByText("Added 1 photo to “Second”")).toBeVisible();
+});
+
+test("batch-bar inline new-album creates and adds", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  const batchBar = page.locator(".batch-bar");
+  await batchBar.getByRole("button", { name: "＋ New album" }).click();
+  await batchBar.getByLabel("New album name").fill("BatchAlbum");
+  await batchBar.getByRole("button", { name: "Create" }).click();
+  await expect(batchBar.getByLabel("Add selected to album")).toBeVisible();
+  await batchBar.getByRole("button", { name: "Add to album" }).click();
+  await expect(page.getByText("Added 1 photo to the album")).toBeVisible();
+  await page.getByRole("button", { name: /^Albums/ }).click();
+  await expect(page.getByText("BatchAlbum").first()).toBeVisible();
+});

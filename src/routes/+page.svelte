@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open, isWebMode, assetUrl } from "$lib/bridge";  import {
+  import { open, isWebMode, isApiMode, assetUrl } from "$lib/bridge";  import {
     blurredAssets,
     cleanupStats,
     clustersList,
@@ -761,6 +761,21 @@
   let picker = $state<{ albumId: number; name: string } | null>(null);
   let pickerAssets = $state<AssetRow[]>([]);
   let pickerSelected = $state<Set<number>>(new Set());
+  let pickerSearch = $state("");
+  let pickerNewOpen = $state(false);
+  let pickerNewName = $state("");
+  let batchNewOpen = $state(false);
+  let batchNewName = $state("");
+  let inlineBusy = $state(false);
+  let eventAlbumChoice = $state<Record<number, number | null>>({});
+  let eventAlbumBusy = $state<number | null>(null);
+  let pickerFiltered = $derived(
+    pickerSearch.trim() === ""
+      ? pickerAssets
+      : pickerAssets.filter((a) =>
+          a.name.toLowerCase().includes(pickerSearch.trim().toLowerCase())
+        )
+  );
 
   async function loadAlbums() {
     resetThumbs();
@@ -794,9 +809,81 @@
     try {
       await albumCreate(name);
       await loadAlbums();
+      try {
+        albumOptions = await albumsList();
+        if (batchAlbum === null && albumOptions.length > 0) batchAlbum = albumOptions[0].id;
+      } catch {
+        /* album dropdown refresh is best-effort */
+      }
       toast = `Created “${name}”`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function ensureAlbumOptions() {
+    try {
+      albumOptions = await albumsList();
+      if (albumOptions.length > 0) {
+        if (batchAlbum === null || !albumOptions.some((a) => a.id === batchAlbum)) {
+          batchAlbum = albumOptions[0].id;
+        }
+        const next: Record<number, number | null> = { ...eventAlbumChoice };
+        for (const e of events) {
+          if (next[e.id] == null || !albumOptions.some((a) => a.id === next[e.id])) {
+            next[e.id] = albumOptions[0].id;
+          }
+        }
+        eventAlbumChoice = next;
+      }
+    } catch {
+      /* dropdown options are best-effort */
+    }
+  }
+
+  async function inlineCreateAlbum(rawName: string, origin: "picker" | "batch") {
+    const name = rawName.trim();
+    if (name === "" || inlineBusy) return;
+    inlineBusy = true;
+    try {
+      const id = await albumCreate(name);
+      const list = await albumsList();
+      albums = list;
+      albumOptions = list;
+      if (origin === "picker") {
+        picker = { albumId: id, name };
+        pickerNewOpen = false;
+        pickerNewName = "";
+      } else {
+        batchAlbum = id;
+        batchNewOpen = false;
+        batchNewName = "";
+      }
+      toast = `Created “${name}”`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      inlineBusy = false;
+    }
+  }
+
+  async function addEventToAlbum(eventId: number) {
+    const albumId = eventAlbumChoice[eventId];
+    const members = eventMembers[eventId] ?? [];
+    if (albumId == null || members.length === 0 || eventAlbumBusy !== null) return;
+    eventAlbumBusy = eventId;
+    try {
+      const r = await albumAdd(albumId, members.map((m) => m.id));
+      const target = albumOptions.find((a) => a.id === albumId);
+      await loadAlbums();
+      toast =
+        target != null
+          ? `Added ${r.added} photo${r.added === 1 ? "" : "s"} to “${target.name}”`
+          : `Added ${r.added} photo${r.added === 1 ? "" : "s"} to the album`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      eventAlbumBusy = null;
     }
   }
 
@@ -812,6 +899,11 @@
     try {
       await albumRename(albumId, name);
       await loadAlbums();
+      try {
+        albumOptions = await albumsList();
+      } catch {
+        /* best-effort */
+      }
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
@@ -828,6 +920,14 @@
     try {
       await albumDelete(target.id);
       await loadAlbums();
+      try {
+        albumOptions = await albumsList();
+        if (batchAlbum !== null && !albumOptions.some((a) => a.id === batchAlbum)) {
+          batchAlbum = albumOptions.length > 0 ? albumOptions[0].id : null;
+        }
+      } catch {
+        /* best-effort */
+      }
       toast = "Album deleted";
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -837,6 +937,9 @@
   function openPicker(album: AlbumRow) {
     picker = { albumId: album.id, name: album.name };
     pickerSelected = new Set();
+    pickerSearch = "";
+    pickerNewOpen = false;
+    pickerNewName = "";
     libraryList({ limit: 500 })
       .then((rows) => {
         pickerAssets = rows;
@@ -962,6 +1065,7 @@
     eventsLoading = true;
     try {
       events = await eventsList();
+      await ensureAlbumOptions();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -974,6 +1078,7 @@
     try {
       await clusterEvents(gapHours, 500);
       events = await eventsList();
+      await ensureAlbumOptions();
       toast = `Grouped into ${events.length} event${events.length === 1 ? "" : "s"}`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1185,13 +1290,19 @@
   // IPC bridge does not exist. Skip registration there instead of throwing.
   const inApp = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const web = isWebMode();
+  const api = isApiMode();
 
   onMount(() => {
-    if (!inApp && !web) {
+    if (!inApp && !web && !api) {
       error = "Open this inside the fotoflow app window — the dev-server tab has no engine bridge.";
       return;
     }
-    const offs = [
+    // API thin slice serves reads only (no progress streams); the Tauri
+    // `listen` calls have no HTTP equivalent and would reject under plain
+    // vite, so skip registration there and rely on refresh().
+    const offs = api
+      ? []
+      : [
       onImportProgress((p) => {
         if (importing) progress = p;
       }),
@@ -1669,6 +1780,29 @@
             Add to album
           </button>
         {/if}
+        <button class="ghost" onclick={() => { batchNewOpen = !batchNewOpen; }}>
+          ＋ New album
+        </button>
+        {#if batchNewOpen}
+          <form
+            class="path-entry inline-new"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void inlineCreateAlbum(batchNewName, "batch");
+            }}
+          >
+            <input
+              type="text"
+              placeholder="New album name"
+              aria-label="New album name"
+              bind:value={batchNewName}
+              maxlength={80}
+            />
+            <button type="submit" disabled={batchNewName.trim() === "" || inlineBusy}>
+              {inlineBusy ? "Creating…" : "Create"}
+            </button>
+          </form>
+        {/if}
         <button class="tiny danger" disabled={selected.size === 0} onclick={batchTrash}>Trash</button>
         <button class="ghost" disabled={selected.size === 0} onclick={() => (selected = new Set())}>Clear</button>
       </div>
@@ -1930,6 +2064,31 @@
               <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight({ eventId: event.id }, event.name)}>
                 {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
               </button>
+              {#if albumOptions.length > 0}
+                <select
+                  aria-label={`Add ${event.name} to album`}
+                  onchange={(e) => {
+                    eventAlbumChoice = {
+                      ...eventAlbumChoice,
+                      [event.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
+                    };
+                  }}
+                >
+                  {#each albumOptions as a (a.id)}
+                    <option
+                      value={a.id}
+                      selected={(eventAlbumChoice[event.id] ?? albumOptions[0]?.id) === a.id}
+                    >{a.name}</option>
+                  {/each}
+                </select>
+                <button
+                  class="tiny"
+                  disabled={(eventMembers[event.id] ?? []).length === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                  onclick={() => void addEventToAlbum(event.id)}
+                >
+                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Album"}
+                </button>
+              {/if}
             </div>
             {#if highlightResult && highlightKey === `e${event.id}`}
               <p class="hint">
@@ -2117,8 +2276,42 @@
     <div class="scrim" role="dialog" aria-labelledby="picker-heading">
       <div class="dialog wide">
         <h3 id="picker-heading">Add photos to “{picker.name}”</h3>
+        <div class="path-entry">
+          <input
+            type="search"
+            placeholder="Search by filename…"
+            aria-label="Search photos by filename"
+            bind:value={pickerSearch}
+          />
+        </div>
+        <p class="hint">{pickerFiltered.length} of {pickerAssets.length}</p>
+        <div class="enrich">
+          <button class="ghost" onclick={() => { pickerNewOpen = !pickerNewOpen; }}>
+            ＋ New album
+          </button>
+          {#if pickerNewOpen}
+            <form
+              class="path-entry inline-new"
+              onsubmit={(e) => {
+                e.preventDefault();
+                void inlineCreateAlbum(pickerNewName, "picker");
+              }}
+            >
+              <input
+                type="text"
+                placeholder="New album name"
+                aria-label="New album name"
+                bind:value={pickerNewName}
+                maxlength={80}
+              />
+              <button type="submit" disabled={pickerNewName.trim() === "" || inlineBusy}>
+                {inlineBusy ? "Creating…" : "Create"}
+              </button>
+            </form>
+          {/if}
+        </div>
         <div class="members picker-grid">
-          {#each pickerAssets as asset (asset.id)}
+          {#each pickerFiltered as asset (asset.id)}
             <figure class:keeper={pickerSelected.has(asset.id)}>
               <button
                 type="button"
@@ -2138,6 +2331,9 @@
             </figure>
           {/each}
         </div>
+        {#if pickerFiltered.length === 0}
+          <p class="hint">No photos match “{pickerSearch.trim()}”.</p>
+        {/if}
         <div class="dialog-actions">
           <button class="ghost" onclick={() => { picker = null; resetThumbs(); }}>Cancel</button>
           <button disabled={pickerSelected.size === 0} onclick={() => void addPicked()}>
@@ -2792,6 +2988,21 @@
     font: inherit;
     font-size: 0.8rem;
     padding: 0.3rem 0.5rem;
+  }
+  .row-actions select {
+    background: #0d0f14;
+    border: 1px solid #232733;
+    border-radius: 6px;
+    color: #e7eaf0;
+    font: inherit;
+    font-size: 0.68rem;
+    padding: 0.15rem 0.4rem;
+    max-width: 10rem;
+  }
+  .inline-new {
+    flex: 1;
+    min-width: 12rem;
+    margin: 0;
   }
   figure {
     margin: 0;
