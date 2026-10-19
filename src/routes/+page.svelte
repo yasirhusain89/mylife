@@ -42,6 +42,7 @@
     libraryMonths,
     type LibraryMonth,
     libraryStats,
+    scanRoots,
     onImportError,
     onImportProgress,
     onClusterProgress,
@@ -58,7 +59,8 @@
     type DuplicateGroup,
     type EnrichProgress,
     type ImportProgress,
-    type LibraryStats
+    type LibraryStats,
+    type ScanRoot
   } from "$lib/bridge";
   import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
 
@@ -74,6 +76,7 @@
   let status = $state<EngineStatus>({ state: "idle" });
   let assets = $state<AssetRow[]>([]);
   let stats = $state<LibraryStats | null>(null);
+  let roots = $state<ScanRoot[]>([]);
   let filter = $state<"all" | "image" | "video">("all");
   let monthFilter = $state<string | null>(null);
   let locFilter = $state<"all" | "with" | "without">("all");
@@ -172,6 +175,11 @@
     filteredTotal = await libraryCount(f);
     stats = await libraryStats();
     months = await libraryMonths();
+    try {
+      roots = await scanRoots();
+    } catch {
+      roots = [];
+    }
   }
 
   async function loadPersonOptions() {
@@ -973,6 +981,21 @@
       <p class="root" title={root}>{root}</p>
     {/if}
 
+    {#if roots.length}
+      <h3 class="sub">Indexed folders</h3>
+      <ul class="roots">
+        {#each roots as r (r.root)}
+          <li>
+            <span class="root" title={r.root}>{r.root}</span>
+            <span class="hint">
+              {r.assets} asset{r.assets === 1 ? "" : "s"}{#if r.missing > 0} · {r.missing} unreachable{/if}
+              · scanned {r.scans} time{r.scans === 1 ? "" : "s"} · {fmtDate(r.lastStartedAt)}
+            </span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
     {#if progress}
       <div class="progress">
         <div class="bar" class:live={importing}><span></span></div>
@@ -1218,7 +1241,8 @@
             {#if highlightResult && highlightKey === `e${event.id}`}
               <p class="hint">
                 Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
-                {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} video{highlightResult.videosSkipped === 1 ? "" : "s"} skipped{/if}
+                · {highlightResult.photos} photo{highlightResult.photos === 1 ? "" : "s"}{#if highlightResult.videosIncluded > 0} · {highlightResult.videosIncluded} video clip{highlightResult.videosIncluded === 1 ? "" : "s"}{/if}
+                {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
                 <br />{highlightResult.output}
               </p>
             {/if}
@@ -1274,6 +1298,8 @@
             {#if highlightResult && highlightKey === `a${album.id}`}
               <p class="hint">
                 Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
+                · {highlightResult.photos} photo{highlightResult.photos === 1 ? "" : "s"}{#if highlightResult.videosIncluded > 0} · {highlightResult.videosIncluded} video clip{highlightResult.videosIncluded === 1 ? "" : "s"}{/if}
+                {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
                 <br />{highlightResult.output}
               </p>
             {/if}
@@ -1543,6 +1569,24 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .roots {
+    list-style: none;
+    margin: 0 0 0.6rem;
+    padding: 0;
+  }
+  .roots li {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.8rem;
+    align-items: baseline;
+    padding: 0.3rem 0;
+    border-top: 1px solid #232733;
+  }
+  .roots li .root {
+    flex: 1;
+    min-width: 12rem;
+    margin: 0;
   }
   .progress {
     margin-bottom: 0.6rem;

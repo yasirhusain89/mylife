@@ -21,6 +21,7 @@ import type {
   LibraryMonth,
   LibraryStats,
   ResolvePlacesSummary,
+  ScanRoot,
   ClusterProgress
 } from "./library";
 
@@ -85,6 +86,7 @@ const seed: AssetRow[] = [
 
 let assets: AssetRow[] = [...seed];
 let nextId = 100;
+let scanHistory: string[] = ["/photos"];
 
 // AssetRow carries no location column; the mock tracks "has GPS" separately
 // so the With/No-location filter chips have something to chew on.
@@ -138,6 +140,7 @@ export async function importFolder(root: string, _recursive = true): Promise<Imp
     nextId++;
   }
   assets = [...assets, ...added];
+  if (!scanHistory.includes(root)) scanHistory.push(root);
   return {
     root,
     scanId: 1,
@@ -200,6 +203,19 @@ export async function libraryStats(): Promise<LibraryStats> {
     missing: 0,
     hashed: assets.filter((a) => a.sha256 !== null).length
   };
+}
+
+export async function scanRoots(): Promise<ScanRoot[]> {
+  return scanHistory.map((root) => {
+    const members = assets.filter((a) => a.path === root || a.path.startsWith(`${root}/`));
+    return {
+      root,
+      scans: 1,
+      lastStartedAt: 1_760_000_000,
+      assets: members.length,
+      missing: members.filter((a) => a.missing !== 0).length
+    };
+  });
 }
 
 export async function enrichAssets(_maxAttempts = 3): Promise<EnrichSummary> {
@@ -465,7 +481,7 @@ export async function exportHighlight(
   _source: { eventId?: number; albumId?: number },
   _name?: string,
 ): Promise<HighlightResult> {
-  return { output: "/tmp/highlight.mp4", bytes: 587_000, seconds: 9, photos: 3, videosSkipped: 0 };
+  return { output: "/tmp/highlight.mp4", bytes: 587_000, seconds: 9, photos: 3, videosIncluded: 1, videosSkipped: 0 };
 }
 
 export function onHashProgress(_cb: (p: CleanupProgress) => void): Promise<() => void> {

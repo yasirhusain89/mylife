@@ -40,6 +40,7 @@ export const libraryList = pick("libraryList");
 export const libraryCount = pick("libraryCount");
 export const libraryMonths = pick("libraryMonths");
 export const libraryStats = pick("libraryStats");
+export const scanRoots = pick("scanRoots");
 export const onImportProgress = pick("onImportProgress");
 export const onImportError = pick("onImportError");
 export const enrichAssets = pick("enrichAssets");
@@ -123,6 +124,7 @@ export type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
-  ResolvePlacesSummary
+  ResolvePlacesSummary,
+  ScanRoot
 } from "./library";
 export type { SysInfo } from "./engine";

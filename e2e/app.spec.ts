@@ -48,6 +48,16 @@ test("import via typed path adds assets", async ({ page }) => {
   await expect(page.getByText("/mock/vacation", { exact: false }).first()).toBeVisible();
 });
 
+test("indexed folders list every scanned root", async ({ page }) => {
+  await expect(page.getByRole("heading", { name: "Indexed folders" })).toBeVisible();
+  await expect(page.getByText("/photos", { exact: true })).toBeVisible();
+  await expect(page.getByText("8 assets", { exact: false }).first()).toBeVisible();
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
+  await page.getByRole("button", { name: "Scan" }).click();
+  const roots = page.getByRole("list");
+  await expect(roots.getByText("/mock/vacation", { exact: true })).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
@@ -60,6 +70,14 @@ test("event place names resolve from coordinates", async ({ page }) => {
   await expect(page.getByText("37.7749, -122.4194")).toBeVisible();
   await page.getByRole("button", { name: "Resolve place names" }).click();
   await expect(page.getByText("San Francisco, California")).toBeVisible();
+});
+
+test("highlight video reports photos and clips", async ({ page }) => {
+  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Highlight video" }).click();
+  await expect(page.getByText("3 photos")).toBeVisible();
+  await expect(page.getByText("1 video clip")).toBeVisible();
 });
 
 test("clicking a photo opens the viewer with keyboard navigation", async ({ page }) => {

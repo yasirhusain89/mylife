@@ -35,8 +35,10 @@ SDK="$(xcrun --show-sdk-path)"
 mkdir -p src-tauri/binaries
 
 # Placeholder protocol version marker; bump when engine protocol changes.
+# -g keeps line info in crash reports (stripped only for release builds).
 "$SWIFTC_BIN" \
   -O \
+  -g \
   -sdk "$SDK" \
   -target "${ARCH}-apple-macos15.0" \
   sidecar/engine/Sources/engine/main.swift \

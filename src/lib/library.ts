@@ -93,6 +93,18 @@ export function libraryStats(): Promise<LibraryStats> {
   return invoke("library_stats");
 }
 
+export type ScanRoot = {
+  root: string;
+  scans: number;
+  lastStartedAt: number;
+  assets: number;
+  missing: number;
+};
+
+export function scanRoots(): Promise<ScanRoot[]> {
+  return invoke("scan_roots");
+}
+
 export function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {
   return listen<ImportProgress>("import-progress", (e) => cb(e.payload));
 }
@@ -392,6 +404,7 @@ export type HighlightResult = {
   bytes: number;
   seconds: number;
   photos: number;
+  videosIncluded: number;
   videosSkipped: number;
 };
 

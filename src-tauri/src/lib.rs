@@ -905,6 +905,7 @@ pub struct HighlightResult {
     pub bytes: i64,
     pub seconds: f64,
     pub photos: i64,
+    pub videos_included: i64,
     pub videos_skipped: i64,
 }
 
@@ -924,14 +925,14 @@ async fn export_highlight(
 
         let asset_paths: Vec<String> = match (paths, event_id, album_id) {
             (Some(p), _, _) => p,
+            // Event/album order is the timeline: photos and video clips
+            // interleave chronologically; the engine caps each clip.
             (None, Some(eid), _) => db::event_assets(&conn, eid)?
                 .into_iter()
-                .filter(|a| a.kind == "image")
                 .map(|a| a.path)
                 .collect(),
             (None, None, Some(aid)) => db::album_assets(&conn, aid)?
                 .into_iter()
-                .filter(|a| a.kind == "image")
                 .map(|a| a.path)
                 .collect(),
             (None, None, None) => {
@@ -941,7 +942,7 @@ async fn export_highlight(
         drop(conn);
 
         if asset_paths.is_empty() {
-            return Err("no photos in this event for a highlight video".into());
+            return Err("no photos or videos in this event for a highlight video".into());
         }
 
         let dir = app
@@ -975,6 +976,7 @@ async fn export_highlight(
             bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
             seconds: reply.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
             photos: reply.get("photos").and_then(Value::as_i64).unwrap_or(0),
+            videos_included: reply.get("videosIncluded").and_then(Value::as_i64).unwrap_or(0),
             videos_skipped: reply.get("videosSkipped").and_then(Value::as_i64).unwrap_or(0),
         })
     })
@@ -1007,11 +1009,12 @@ fn unique_bundle_name(
     used: &mut std::collections::HashSet<String>,
     exists: &dyn Fn(&str) -> bool,
     stem: &str,
+    ext: &str,
 ) -> String {
-    let mut candidate = format!("{stem}.jpg");
+    let mut candidate = format!("{stem}.{ext}");
     let mut n = 2;
     while used.contains(&candidate) || exists(&candidate) {
-        candidate = format!("{stem}-{n}.jpg");
+        candidate = format!("{stem}-{n}.{ext}");
         n += 1;
     }
     used.insert(candidate.clone());
@@ -1027,9 +1030,9 @@ fn slugify(name: &str) -> String {
     if collapsed.is_empty() { "event".to_string() } else { collapsed.to_lowercase() }
 }
 
-/// Copies an event's or album's photos into `dest_dir/<name-slug>/`:
-/// - mode "drive": byte-for-byte copies (full quality)
-/// - mode "whatsapp": recoded 1280px JPEGs via the engine
+/// Copies an event's or album's photos and videos into `dest_dir/<name-slug>/`:
+/// - mode "drive": byte-for-byte copies (full quality, original extensions)
+/// - mode "whatsapp": recoded 1280px JPEGs + 1280x720 MP4s via the engine
 ///
 /// Blurred shots and known duplicates are excluded from WhatsApp bundles;
 /// Drive bundles keep everything except missing files.
@@ -1079,12 +1082,12 @@ async fn export_bundle(
         let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for asset in &assets {
-            if asset.kind != "image" {
-                skipped += 1; // video transcoding lands in a follow-up
-                continue;
-            }
             let src = std::path::Path::new(&asset.path);
             if !src.exists() {
+                skipped += 1;
+                continue;
+            }
+            if mode == "whatsapp" && blurred_set.contains(&asset.path) {
                 skipped += 1;
                 continue;
             }
@@ -1093,28 +1096,53 @@ async fn export_bundle(
             let stem = slugify(&asset.name.trim_end_matches(
                 |c: char| c.is_ascii_alphanumeric() || c == '.'
             ));
-            let dest = out_dir.join(unique_bundle_name(&mut used_names, &|c| {
-                out_dir.join(c).exists()
-            }, &stem));
+            let exists = |c: &str| out_dir.join(c).exists();
+            if asset.kind == "image" {
+                let dest = out_dir.join(unique_bundle_name(&mut used_names, &exists, &stem, "jpg"));
+                if mode == "drive" {
+                    std::fs::copy(src, &dest).map_err(|e| format!("copy {}: {e}", asset.path))?;
+                    bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+                    exported += 1;
+                } else {
+                    let reply = engine::call_blocking(
+                        &engine_state,
+                        "compress",
+                        Some(json!({
+                            "path": asset.path,
+                            "output": dest.to_string_lossy(),
+                            "maxPx": 1280,
+                            "quality": 0.72,
+                        })),
+                        Duration::from_secs(60),
+                    )?;
+                    bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+                    exported += 1;
+                }
+                continue;
+            }
+            // Videos: Drive keeps the original bytes under the original
+            // extension; WhatsApp gets a 1280x720 recode. Either way they
+            // are no longer skipped.
             if mode == "drive" {
+                let ext = src
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("mp4")
+                    .to_lowercase();
+                let dest = out_dir.join(unique_bundle_name(&mut used_names, &exists, &stem, &ext));
                 std::fs::copy(src, &dest).map_err(|e| format!("copy {}: {e}", asset.path))?;
                 bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
                 exported += 1;
             } else {
-                if blurred_set.contains(&asset.path) {
-                    skipped += 1;
-                    continue;
-                }
+                let dest = out_dir.join(unique_bundle_name(&mut used_names, &exists, &stem, "mp4"));
                 let reply = engine::call_blocking(
                     &engine_state,
-                    "compress",
+                    "compress_video",
                     Some(json!({
                         "path": asset.path,
                         "output": dest.to_string_lossy(),
-                        "maxPx": 1280,
-                        "quality": 0.72,
                     })),
-                    Duration::from_secs(60),
+                    Duration::from_secs(300),
                 )?;
                 bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
                 exported += 1;
@@ -1266,6 +1294,12 @@ fn library_stats(conn: tauri::State<'_, DbState>) -> Result<db::LibraryStats, St
     db::stats(&conn)
 }
 
+#[tauri::command]
+fn scan_roots(conn: tauri::State<'_, DbState>) -> Result<Vec<db::ScanRoot>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::scan_roots(&conn)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1326,7 +1360,8 @@ pub fn run() {
             library_list,
             library_count,
             library_months,
-            library_stats
+            library_stats,
+            scan_roots
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1366,13 +1401,17 @@ mod tests {
     fn bundle_names_dedupe_within_and_across_exports() {
         let mut used = std::collections::HashSet::new();
         let none = |_: &str| false;
-        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001.jpg");
-        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001-2.jpg");
-        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001"), "img-0001-3.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001", "jpg"), "img-0001.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001", "jpg"), "img-0001-2.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001", "jpg"), "img-0001-3.jpg");
         // A file left on disk by an earlier export into the same folder is skipped too.
         let on_disk = |c: &str| c == "img-0002.jpg";
-        assert_eq!(unique_bundle_name(&mut used, &on_disk, "img-0002"), "img-0002-2.jpg");
-        assert_eq!(unique_bundle_name(&mut used, &none, "other"), "other.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &on_disk, "img-0002", "jpg"), "img-0002-2.jpg");
+        assert_eq!(unique_bundle_name(&mut used, &none, "other", "jpg"), "other.jpg");
+        // Video extensions ride the same scheme without colliding with stills.
+        assert_eq!(unique_bundle_name(&mut used, &none, "clip-0001", "mp4"), "clip-0001.mp4");
+        assert_eq!(unique_bundle_name(&mut used, &none, "clip-0001", "mp4"), "clip-0001-2.mp4");
+        assert_eq!(unique_bundle_name(&mut used, &none, "img-0001", "mp4"), "img-0001.mp4");
     }
 
     #[test]

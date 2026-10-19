@@ -2,7 +2,7 @@
 
 On-device library management for photo and video. Tauri v2 + SvelteKit frontend, Swift engine sidecar (Vision, CoreML, AVFoundation), SQLite index. No cloud sync — the library never leaves the machine.
 
-Current capabilities: folder import with metadata enrichment, cleanup (exact-duplicate detection, blur scoring, Trash-based deletion), people clustering (on-device face detection + feature-print clustering), event clustering (time + GPS, with cached OpenStreetMap place names — the only network call), user-curated albums, per-event/per-album exports for Google Drive (full quality) and WhatsApp (1280px recode), and highlight-video slideshows.
+Current capabilities: folder import with metadata enrichment, cleanup (exact-duplicate detection, blur scoring, Trash-based deletion), people clustering (on-device face detection + feature-print clustering), event clustering (time + GPS, with cached OpenStreetMap place names — the only network call), user-curated albums, per-event/per-album exports for Google Drive (full quality) and WhatsApp (1280px recode, video included), and highlight-video slideshows mixing photos with video clips (original camera audio).
 
 ## Develop
 
@@ -20,8 +20,8 @@ Status against what has actually shipped (see git log):
 - **P2 Cleanup — partial.** Exact-duplicate groups (size-bucketed hashing), blur scoring (Laplacian variance), Trash-based deletion, review UI. Open: near-duplicate clustering, utility-shot detection (screenshots/docs), low-quality scoring, keeper score breakdown, batch confirm.
 - **P3 Intelligence — partial.** Face detection + feature-print clustering, albums. Open: named people, MobileCLIP2 embeddings + semantic search, VLM captions on demand.
 - **P4 Events & Summaries — partial.** Time + GPS event clustering with naming. Open: routine-vs-trip distinction, LLM text summaries, event stats (top people, days, places).
-- **P5 Highlight videos — partial.** Per-event photo-slideshow montage via the hardware encoder. Open: diversity-picked shots, Ken Burns pans, transitions, title cards, narration, export presets.
-- **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles. Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.
+- **P5 Highlight videos — partial.** Per-event mixed photo/video montage with original camera audio via the hardware encoder, capped at 60s. Open: diversity-picked shots, Ken Burns pans, transitions, title cards, narration, export presets.
+- **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles (photos and videos). Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.
 
 ## Architecture
 

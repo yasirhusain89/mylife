@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreGraphics
+import CoreImage
 import CryptoKit
 import Foundation
 import ImageIO
@@ -481,31 +482,41 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
 
 // MARK: - Highlight video
 
-/// Builds a highlight slideshow MP4 from photos with AVAssetWriter.
+/// Builds a highlight MP4 from photos and video clips with AVAssetWriter.
 ///
 /// Still images expose zero AVAssetTrack instances on the macOS 26 SDK, so a
-/// composition-based export cannot include them; frames are synthesized
-/// directly instead (3s per photo at 30fps, H.264). Video clips are counted and
-/// skipped for now — mixing their compressed samples with synthesized frames
-/// needs format-normalization work that lands in a follow-up.
+/// composition-based export cannot include them; photo frames are synthesized
+/// directly instead (3s per photo at 30fps, H.264). Video clips are decoded
+/// with AVAssetReader and their frames drawn onto the same 1920x1080 canvas
+/// (up to 3s per clip); a clip's camera audio rides along on an AAC track —
+/// original audio only, never added music. The whole timeline is capped at
+/// maxSeconds. Files that decode as neither photo nor video count as skipped.
 func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -> [String: Any] {
-    var photos: [CGImage] = []
-    var videosSkipped = 0
+    enum Clip { case photo(CGImage); case video(String) }
+    var clips: [Clip] = []
+    var skipped = 0
     for path in paths {
         let url = URL(fileURLWithPath: path)
         if let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
            let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-            photos.append(cg)
+            clips.append(.photo(cg))
+            continue
+        }
+        let asset = AVURLAsset(url: url)
+        if asset.tracks(withMediaType: .video).first != nil {
+            clips.append(.video(path))
         } else {
-            videosSkipped += 1
+            skipped += 1
         }
     }
-    guard !photos.isEmpty else { throw EngineError(message: "no decodable photos for highlight") }
+    guard !clips.isEmpty else { throw EngineError(message: "no decodable photos or videos for highlight") }
+    let cap = max(1.0, maxSeconds)
 
     // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
     let outW = 1920, outH = 1080
     let fps = 30
     let secondsPerPhoto = 3.0
+    let secondsPerClip = 3.0
     let framesPerPhoto = Int(secondsPerPhoto * Double(fps))
 
     let outURL = URL(fileURLWithPath: output)
@@ -527,6 +538,25 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         ])
     guard writer.canAdd(vInput) else { throw EngineError(message: "cannot add video input") }
     writer.add(vInput)
+
+    // Audio rides along only when at least one clip actually has an audio track.
+    var aInput: AVAssetWriterInput?
+    for clip in clips {
+        if case .video(let path) = clip,
+           AVURLAsset(url: URL(fileURLWithPath: path)).tracks(withMediaType: .audio).first != nil {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 128_000,
+            ])
+            ai.expectsMediaDataInRealTime = false
+            guard writer.canAdd(ai) else { throw EngineError(message: "cannot add audio input") }
+            writer.add(ai)
+            aInput = ai
+            break
+        }
+    }
 
     guard writer.startWriting() else {
         throw EngineError(message: "writer start failed: \(writer.error.map(String.init(describing:)) ?? "unknown")")
@@ -567,19 +597,118 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     }
 
     var frame: Int64 = 0
-    var appended = 0
-    for image in photos {
-        for _ in 0..<framesPerPhoto {
-            while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
-            let pb = try makePixelBuffer(image, index: frame)
-            let time = CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps))
-            if adaptor.append(pb, withPresentationTime: time) {
-                appended += 1
+    var photos = 0
+    var videosIncluded = 0
+    var cursor = CMTime.zero
+    let ciCtx = CIContext()
+
+    // Center-cropped CGImage covering the 16:9 canvas from a decoded frame.
+    func canvasCrop(_ sample: CVPixelBuffer) -> CGImage? {
+        let ci = CIImage(cvPixelBuffer: sample)
+        let w = ci.extent.width, h = ci.extent.height
+        guard w > 0, h > 0 else { return nil }
+        let scale = max(CGFloat(outW) / w, CGFloat(outH) / h)
+        let crop = CGRect(
+            x: (w - CGFloat(outW) / scale) / 2, y: (h - CGFloat(outH) / scale) / 2,
+            width: CGFloat(outW) / scale, height: CGFloat(outH) / scale)
+        return ciCtx.createCGImage(ci, from: crop)
+    }
+
+    // Streams one video clip (up to `take` seconds) onto the timeline:
+    // decoded frames drawn on the canvas, camera audio re-stamped after.
+    // Returns false when the clip contributed no frames.
+    func appendClip(path: String, take: Double) throws -> Bool {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        guard let vTrack = asset.tracks(withMediaType: .video).first else { return false }
+
+        // Audio first: a few seconds buffer cheaply; a failed audio read
+        // degrades to silent video instead of failing the clip.
+        var audioSamples: [CMSampleBuffer] = []
+        if let aInput, let aTrack = asset.tracks(withMediaType: .audio).first,
+           let aReader = try? AVAssetReader(asset: asset) {
+            let aOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
+            aReader.add(aOut)
+            if aReader.startReading() {
+                while let sb = aOut.copyNextSampleBuffer() {
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+                    if pts.seconds < 0 { continue } // encoder priming, not content
+                    if pts.seconds >= take { break }
+                    var timing = CMSampleTimingInfo(
+                        duration: CMSampleBufferGetDuration(sb),
+                        presentationTimeStamp: CMTimeAdd(cursor, pts),
+                        decodeTimeStamp: .invalid)
+                    var fresh: CMSampleBuffer?
+                    if CMSampleBufferCreateCopyWithNewTiming(
+                        allocator: kCFAllocatorDefault, sampleBuffer: sb,
+                        sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+                        sampleBufferOut: &fresh) == noErr, let f = fresh {
+                        audioSamples.append(f)
+                    }
+                }
             }
-            frame += 1
+        }
+
+        let vReader = try AVAssetReader(asset: asset)
+        let vOut = AVAssetReaderTrackOutput(track: vTrack, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        vReader.add(vOut)
+        guard vReader.startReading() else { return false }
+        var wroteAny = false
+            while let sb = vOut.copyNextSampleBuffer() {
+                let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+                if pts.seconds >= take { break }
+                guard let pb = CMSampleBufferGetImageBuffer(sb),
+                      let cg = canvasCrop(pb) else { continue }
+                // Native sample timing (no re-quantization): dense source
+                // framerates would otherwise collapse onto identical stamps
+                // and every append would fail.
+                let t = CMTimeAdd(cursor, pts)
+            while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+                let out = try makePixelBuffer(cg, index: frame)
+                adaptor.append(out, withPresentationTime: t)
+                frame += 1
+                wroteAny = true
+        }
+        // Video then audio per clip; the writer multiplexes by PTS at finish.
+        if let aInput {
+            for sb in audioSamples {
+                while !aInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+                aInput.append(sb)
+            }
+        }
+        return wroteAny
+    }
+
+    for clip in clips {
+        if cursor.seconds >= cap { break }
+        switch clip {
+        case .photo(let image):
+            let budget = Int((cap - cursor.seconds) * Double(fps))
+            for _ in 0..<min(framesPerPhoto, budget) {
+                while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+                let pb = try makePixelBuffer(image, index: frame)
+                adaptor.append(pb, withPresentationTime: cursor)
+                frame += 1
+                cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
+            }
+            photos += 1
+        case .video(let path):
+            let take = min(secondsPerClip, cap - cursor.seconds)
+            do {
+                if try appendClip(path: path, take: take) {
+                    videosIncluded += 1
+                } else {
+                    skipped += 1
+                }
+            } catch {
+                skipped += 1
+            }
+            cursor = CMTimeAdd(cursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
         }
     }
     vInput.markAsFinished()
+    aInput?.markAsFinished()
     let sem = DispatchSemaphore(value: 0)
     writer.finishWriting { sem.signal() }
     sem.wait()
@@ -590,9 +719,10 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     return [
         "output": output,
         "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
-        "seconds": Double(appended) / Double(fps),
-        "photos": photos.count,
-        "videosSkipped": videosSkipped,
+        "seconds": cursor.seconds,
+        "photos": photos,
+        "videosIncluded": videosIncluded,
+        "videosSkipped": skipped,
     ]
 }
 
@@ -620,6 +750,34 @@ func compressImage(path: String, output: String, maxPx: Int, quality: Double) th
         dest, cg, [kCGImageDestinationLossyCompressionQuality: min(max(quality, 0.1), 1.0)] as CFDictionary)
     guard CGImageDestinationFinalize(dest) else {
         throw EngineError(message: "cannot finalize: \(output)")
+    }
+    let attrs = try FileManager.default.attributesOfItem(atPath: output)
+    return [
+        "output": output,
+        "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
+    ]
+}
+
+/// Recodes one video to a bounded MP4 (WhatsApp-friendly: 1280x720 H.264,
+/// fast-start for network sharing). Throws when the source has no video
+/// track or the export session cannot complete.
+func compressVideo(path: String, output: String) throws -> [String: Any] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+    guard asset.tracks(withMediaType: .video).first != nil else {
+        throw EngineError(message: "no video track: \(path)")
+    }
+    guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset1280x720) else {
+        throw EngineError(message: "no export session for: \(path)")
+    }
+    try? FileManager.default.removeItem(atPath: output)
+    session.outputURL = URL(fileURLWithPath: output)
+    session.outputFileType = .mp4
+    session.shouldOptimizeForNetworkUse = true
+    let sem = DispatchSemaphore(value: 0)
+    session.exportAsynchronously { sem.signal() }
+    sem.wait()
+    guard session.status == .completed else {
+        throw EngineError(message: "video export failed: \(session.error.map(String.init(describing:)) ?? "unknown")")
     }
     let attrs = try FileManager.default.attributesOfItem(atPath: output)
     return [
@@ -787,6 +945,23 @@ func encodeJPEG(_ image: CGImage, quality: Double) -> String {
 /// Set by the read loop so streaming commands can tag their events.
 var requestID: Int = -1
 
+/// Runs AVFoundation-touching work on a background thread and blocks the
+/// caller for the result. Required because the synchronous track/reader APIs
+/// deadlock on macOS 26 when the fig inspector's callbacks need the calling
+/// thread's queue (sampled: `tracks(withMediaType:)` wedged in
+/// `_dispatch_group_wait` from main). The main thread stays free to service
+/// those callbacks while `done` is waited on here.
+func background<T>(_ work: @escaping () throws -> T) throws -> T {
+    var boxed: Result<T, Error>!
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        boxed = Result(catching: work)
+        done.signal()
+    }
+    done.wait()
+    return try boxed.get()
+}
+
 func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
     func str(_ key: String) -> String? { params[key] as? String }
     func flag(_ key: String, _ fallback: Bool) -> Bool {
@@ -864,12 +1039,18 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let output = str("output") else { throw EngineError(message: "compress requires 'output'") }
         return try compressImage(path: path, output: output, maxPx: int("maxPx", 1280), quality: dbl("quality", 0.72))
 
+    case "compress_video":
+        guard let path = str("path") else { throw EngineError(message: "compress_video requires 'path'") }
+        guard let output = str("output") else { throw EngineError(message: "compress_video requires 'output'") }
+        return try background { try compressVideo(path: path, output: output) }
+
     case "make_highlight":
         guard let paths = params["paths"] as? [String], !paths.isEmpty else {
             throw EngineError(message: "make_highlight requires a non-empty 'paths' array")
         }
         guard let output = str("output") else { throw EngineError(message: "make_highlight requires 'output'") }
-        return try makeHighlight(paths: paths, output: output, maxSeconds: dbl("maxSeconds", 60))
+        let maxSeconds = dbl("maxSeconds", 60)
+        return try background { try makeHighlight(paths: paths, output: output, maxSeconds: maxSeconds) }
 
     case "face_thumb":
         guard let path = str("path") else { throw EngineError(message: "face_thumb requires 'path'") }

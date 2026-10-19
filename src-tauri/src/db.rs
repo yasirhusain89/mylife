@@ -114,6 +114,53 @@ pub fn finish_scan(
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanRoot {
+    pub root: String,
+    pub scans: i64,
+    pub last_started_at: i64,
+    pub assets: i64,
+    pub missing: i64,
+}
+
+/// Escape for LIKE patterns: roots containing `%`/`_` must match literally.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Distinct indexed source folders (latest scan first), each with its live
+/// asset counts. No migration: derived from the existing scans/assets tables.
+pub fn scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>, String> {
+    let mut stmt = conn
+        .prepare("SELECT root, COUNT(*), MAX(started_at) FROM scans GROUP BY root ORDER BY MAX(started_at) DESC")
+        .map_err(|e| format!("prepare scan roots: {e}"))?;
+    let roots = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })
+        .map_err(|e| format!("query scan roots: {e}"))?;
+    let mut out = Vec::new();
+    for row in roots {
+        let (root, scans, last_started_at) = row.map_err(|e| format!("scan root row: {e}"))?;
+        // Equality covers a file directly AT the root; the LIKE arm needs the
+        // slash so `/photos2` never matches root `/photos`. Both slash
+        // variants of the root are accepted (`/photos` and `/photos/`).
+        let base = root.trim_end_matches('/');
+        let pattern = format!("{}/%", escape_like(base));
+        let (assets, missing): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(missing), 0) FROM assets
+                 WHERE path = ?1 OR path = ?2 OR path LIKE ?3 ESCAPE '\\'",
+                params![root, base, pattern],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("scan root counts: {e}"))?;
+        out.push(ScanRoot { root, scans, last_started_at, assets, missing });
+    }
+    Ok(out)
+}
+
 // MARK: - Assets
 
 /// Upserts one scanned asset. Returns true when the row was created or changed.
@@ -1745,6 +1792,35 @@ mod tests {
         let mut bad = asset("/x.jpg", 1, 1.0);
         bad.kind = "other".into();
         assert!(upsert_asset(&conn, &bad, scan).is_err(), "kind must be image or video");
+    }
+
+    #[test]
+    fn scan_roots_groups_scans_with_live_counts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let s1 = begin_scan(&conn, "/photos", true).unwrap();
+        upsert_asset(&conn, &asset("/photos/a.jpg", 1, 1.0), s1).unwrap();
+        upsert_asset(&conn, &asset("/photos/b.jpg", 1, 1.0), s1).unwrap();
+        // Rescan of the same root groups into one row.
+        let s2 = begin_scan(&conn, "/photos", true).unwrap();
+        upsert_asset(&conn, &asset("/photos/c.jpg", 1, 1.0), s2).unwrap();
+        let s3 = begin_scan(&conn, "/photos2", true).unwrap();
+        upsert_asset(&conn, &asset("/photos2/d.jpg", 1, 1.0), s3).unwrap();
+        // Special LIKE chars in a root must match literally.
+        let s4 = begin_scan(&conn, "/my%photos", true).unwrap();
+        upsert_asset(&conn, &asset("/my%photos/e.jpg", 1, 1.0), s4).unwrap();
+        conn.execute("UPDATE assets SET missing = 1 WHERE path = '/photos/b.jpg'", []).unwrap();
+
+        let roots = scan_roots(&conn).unwrap();
+        assert_eq!(roots.len(), 3);
+        let main = roots.iter().find(|r| r.root == "/photos").unwrap();
+        assert_eq!(main.scans, 2, "rescans group under one root");
+        assert_eq!(main.assets, 3, "/photos2 must not leak into /photos");
+        assert_eq!(main.missing, 1);
+        let plus = roots.iter().find(|r| r.root == "/photos2").unwrap();
+        assert_eq!((plus.assets, plus.missing), (1, 0));
+        let pct = roots.iter().find(|r| r.root == "/my%photos").unwrap();
+        assert_eq!(pct.assets, 1, "% in root matches literally");
     }
 
     #[test]
