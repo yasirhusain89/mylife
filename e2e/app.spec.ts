@@ -519,6 +519,28 @@ test("event member grid adds to an album via ＋Album", async ({ page }) => {
   await expect(card.getByText("VID_20261007_192001.mp4")).toBeVisible();
 });
 
+test("indexed folder adds everything to an album via ＋ All to album", async ({ page }) => {
+  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("FolderTarget");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("FolderTarget").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  const row = page.locator(".roots li", { hasText: "/photos" });
+  await row.getByLabel("Add everything under /photos to album").selectOption({ label: "FolderTarget" });
+  await row.getByRole("button", { name: "＋ All to album" }).click();
+  await expect(page.getByText("Added 8 photos from /photos to “FolderTarget”")).toBeVisible();
+
+  await page.getByRole("button", { name: /^Albums/ }).click();
+  const card = page.locator(".album-card", { hasText: "FolderTarget" });
+  await expect(card.getByText("8 photos")).toBeVisible();
+  await card.getByRole("button", { name: "Show photos" }).click();
+  await expect(card.getByText("IMG_20261007_185817.jpg")).toBeVisible();
+  await expect(card.getByText("VID_20261007_192001.mp4")).toBeVisible();
+});
+
 test("filtered library selection adds only the visible set", async ({ page }) => {
   await page.getByRole("button", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();

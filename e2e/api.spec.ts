@@ -40,3 +40,11 @@ test("stats header shows 6 photos + 2 videos", async ({ page }) => {
   await expect(page.getByRole("button", { name: /6 photos/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /2 videos/ })).toBeVisible();
 });
+
+test("root-assets lists every id under /photos", async ({ page }) => {
+  const ids = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/root-assets?root=${encodeURIComponent("/photos")}`);
+    return (await r.json()) as number[];
+  }, API!);
+  expect(ids).toHaveLength(8);
+});

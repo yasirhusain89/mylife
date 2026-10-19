@@ -53,6 +53,7 @@
     type LibraryMonth,
     libraryStats,
     scanRoots,
+    assetsInRoot,
     setFavorite,
     tagScenes,
     onTagProgress,
@@ -275,6 +276,7 @@
     months = await libraryMonths();
     try {
       roots = await scanRoots();
+      await ensureAlbumOptions();
     } catch {
       roots = [];
     }
@@ -769,6 +771,8 @@
   let inlineBusy = $state(false);
   let eventAlbumChoice = $state<Record<number, number | null>>({});
   let eventAlbumBusy = $state<number | null>(null);
+  let rootAlbumChoice = $state<Record<string, number | null>>({});
+  let rootAlbumBusy = $state<string | null>(null);
   let pickerFiltered = $derived(
     pickerSearch.trim() === ""
       ? pickerAssets
@@ -835,6 +839,13 @@
           }
         }
         eventAlbumChoice = next;
+        const nextRoots: Record<string, number | null> = { ...rootAlbumChoice };
+        for (const r of roots) {
+          if (nextRoots[r.root] == null || !albumOptions.some((a) => a.id === nextRoots[r.root])) {
+            nextRoots[r.root] = albumOptions[0].id;
+          }
+        }
+        rootAlbumChoice = nextRoots;
       }
     } catch {
       /* dropdown options are best-effort */
@@ -884,6 +895,30 @@
       error = String(e).replace(/^Error: /, "");
     } finally {
       eventAlbumBusy = null;
+    }
+  }
+
+  async function addRootToAlbum(root: string) {
+    const albumId = rootAlbumChoice[root];
+    if (albumId == null || rootAlbumBusy !== null) return;
+    rootAlbumBusy = root;
+    try {
+      const ids = await assetsInRoot(root);
+      if (ids.length === 0) {
+        toast = `No assets under ${root}`;
+        return;
+      }
+      const r = await albumAdd(albumId, ids);
+      const target = albumOptions.find((a) => a.id === albumId);
+      await loadAlbums();
+      toast =
+        target != null
+          ? `Added ${r.added} photo${r.added === 1 ? "" : "s"} from ${root} to “${target.name}”`
+          : `Added ${r.added} photo${r.added === 1 ? "" : "s"} to the album`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      rootAlbumBusy = null;
     }
   }
 
@@ -1617,6 +1652,33 @@
               {r.assets} asset{r.assets === 1 ? "" : "s"}{#if r.missing > 0} · {r.missing} unreachable{/if}
               · scanned {r.scans} time{r.scans === 1 ? "" : "s"} · {fmtDate(r.lastStartedAt)}
             </span>
+            {#if albumOptions.length > 0}
+              <span class="row-actions">
+                <select
+                  aria-label={`Add everything under ${r.root} to album`}
+                  onchange={(e) => {
+                    rootAlbumChoice = {
+                      ...rootAlbumChoice,
+                      [r.root]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
+                    };
+                  }}
+                >
+                  {#each albumOptions as a (a.id)}
+                    <option
+                      value={a.id}
+                      selected={(rootAlbumChoice[r.root] ?? albumOptions[0]?.id) === a.id}
+                    >{a.name}</option>
+                  {/each}
+                </select>
+                <button
+                  class="tiny"
+                  disabled={r.assets === 0 || (rootAlbumChoice[r.root] ?? albumOptions[0]?.id) == null || rootAlbumBusy !== null}
+                  onclick={() => void addRootToAlbum(r.root)}
+                >
+                  {rootAlbumBusy === r.root ? "Adding…" : "＋ All to album"}
+                </button>
+              </span>
+            {/if}
           </li>
         {/each}
       </ul>

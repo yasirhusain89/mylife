@@ -223,6 +223,10 @@ export function scanRoots(): Promise<ScanRoot[]> {
   return invoke("scan_roots");
 }
 
+export function assetsInRoot(root: string): Promise<number[]> {
+  return invoke("assets_in_root", { root });
+}
+
 export function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {
   return listen<ImportProgress>("import-progress", (e) => cb(e.payload));
 }

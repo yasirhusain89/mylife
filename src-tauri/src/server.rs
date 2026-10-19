@@ -129,6 +129,22 @@ async fn roots(State(state): State<ApiState>) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct RootAssetsParams {
+    root: String,
+}
+
+async fn root_assets(State(state): State<ApiState>, Query(p): Query<RootAssetsParams>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::asset_ids_in_root(&conn, &p.root) {
+        Ok(ids) => (cors(), Json(ids)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn clusters(State(state): State<ApiState>) -> Response {
     let conn = match lock(&state) {
         Ok(g) => g,
@@ -189,6 +205,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/library/months", get(library_months))
         .route("/api/stats", get(stats))
         .route("/api/roots", get(roots))
+        .route("/api/root-assets", get(root_assets))
         .route("/api/clusters", get(clusters))
         .route("/api/events", get(events))
         .route("/api/albums", get(albums))
@@ -304,6 +321,13 @@ mod tests {
                 .unwrap();
             assert_eq!(roots.len(), 1);
             assert_eq!(roots[0].get("root"), Some(&serde_json::json!("/photos")));
+            let ids: Vec<i64> = ureq::get(&format!("{base}/api/root-assets?root=%2Fphotos"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            assert_eq!(ids.len(), 8);
             // Unknown route: axum 404, still loopback-confined.
             let missing = ureq::get(&format!("{base}/api/nope")).call();
             assert!(missing.is_err());

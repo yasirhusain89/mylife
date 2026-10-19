@@ -166,6 +166,27 @@ pub fn scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>, String> {
     Ok(out)
 }
 
+/// Every asset id under a root (same match rule as `scan_roots` counts),
+/// for one-click "add entire folder to album". Capped: folders bigger than
+/// this need the filtered Library + batch bar instead.
+pub fn asset_ids_in_root(conn: &Connection, root: &str) -> Result<Vec<i64>, String> {
+    let base = root.trim_end_matches('/');
+    let pattern = format!("{}/%", escape_like(base));
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM assets
+             WHERE path = ?1 OR path = ?2 OR path LIKE ?3 ESCAPE '\\'
+             ORDER BY id LIMIT 20000",
+        )
+        .map_err(|e| format!("prepare root assets: {e}"))?;
+    let ids = stmt
+        .query_map(params![root, base, pattern], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("query root assets: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("root asset row: {e}"))?;
+    Ok(ids)
+}
+
 // MARK: - Assets
 
 /// Upserts one scanned asset. Returns true when the row was created or changed.
@@ -2842,6 +2863,28 @@ mod tests {
         assert_eq!((plus.assets, plus.missing), (1, 0));
         let pct = roots.iter().find(|r| r.root == "/my%photos").unwrap();
         assert_eq!(pct.assets, 1, "% in root matches literally");
+    }
+
+    #[test]
+    fn asset_ids_in_root_matches_scan_roots_rule() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let s1 = begin_scan(&conn, "/photos", true).unwrap();
+        upsert_asset(&conn, &asset("/photos/a.jpg", 1, 1.0), s1).unwrap();
+        upsert_asset(&conn, &asset("/photos/sub/b.jpg", 1, 1.0), s1).unwrap();
+        let s2 = begin_scan(&conn, "/photos2", true).unwrap();
+        upsert_asset(&conn, &asset("/photos2/d.jpg", 1, 1.0), s2).unwrap();
+        let s3 = begin_scan(&conn, "/my%photos", true).unwrap();
+        upsert_asset(&conn, &asset("/my%photos/e.jpg", 1, 1.0), s3).unwrap();
+
+        let ids = asset_ids_in_root(&conn, "/photos").unwrap();
+        assert_eq!(ids.len(), 2, "/photos2 must not leak into /photos");
+        let ids = asset_ids_in_root(&conn, "/photos/").unwrap();
+        assert_eq!(ids.len(), 2, "trailing slash accepted");
+        let ids = asset_ids_in_root(&conn, "/my%photos").unwrap();
+        assert_eq!(ids.len(), 1, "% in root matches literally");
+        let ids = asset_ids_in_root(&conn, "/nowhere").unwrap();
+        assert!(ids.is_empty());
     }
 
     #[test]

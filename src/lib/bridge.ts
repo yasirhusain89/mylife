@@ -55,6 +55,7 @@ export const libraryCount = pickRead("libraryCount");
 export const libraryMonths = pickRead("libraryMonths");
 export const libraryStats = pickRead("libraryStats");
 export const scanRoots = pickRead("scanRoots");
+export const assetsInRoot = pickRead("assetsInRoot");
 export const setFavorite = pick("setFavorite");
 export const tagScenes = pick("tagScenes");
 export const onTagProgress = pick("onTagProgress");

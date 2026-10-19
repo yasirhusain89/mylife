@@ -284,6 +284,13 @@ export async function scanRoots(): Promise<ScanRoot[]> {
   });
 }
 
+export async function assetsInRoot(root: string): Promise<number[]> {
+  const base = root.endsWith("/") ? root.slice(0, -1) : root;
+  return assets
+    .filter((a) => a.path === root || a.path === base || a.path.startsWith(`${base}/`))
+    .map((a) => a.id);
+}
+
 export async function enrichAssets(_maxAttempts = 3): Promise<EnrichSummary> {
   return { processed: assets.length, enriched: assets.length, failed: 0, pending: 0, elapsed: 0.2 };
 }

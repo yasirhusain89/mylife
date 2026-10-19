@@ -110,6 +110,10 @@ export function scanRoots(): Promise<ScanRoot[]> {
   return getJson<ScanRoot[]>("/api/roots");
 }
 
+export function assetsInRoot(root: string): Promise<number[]> {
+  return getJson<number[]>(`/api/root-assets?root=${encodeURIComponent(root)}`);
+}
+
 export function clustersList(): Promise<FaceClusterRow[]> {
   return getJson<FaceClusterRow[]>("/api/clusters");
 }

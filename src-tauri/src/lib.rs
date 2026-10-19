@@ -1852,6 +1852,13 @@ fn scan_roots(conn: tauri::State<'_, DbState>) -> Result<Vec<db::ScanRoot>, Stri
     db::scan_roots(&conn)
 }
 
+/// Asset ids under one indexed root, for one-click folder-to-album adds.
+#[tauri::command]
+fn assets_in_root(conn: tauri::State<'_, DbState>, root: String) -> Result<Vec<i64>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::asset_ids_in_root(&conn, &root)
+}
+
 // MARK: - Thumbnail disk cache
 
 /// Cap for the on-disk thumbnail cache: past this size the oldest entries
@@ -2138,6 +2145,7 @@ pub fn run() {
             library_months,
             library_stats,
             scan_roots,
+            assets_in_root,
             set_favorite
         ])
         .run(tauri::generate_context!())
