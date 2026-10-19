@@ -6,6 +6,8 @@ import type {
   ClusterEventsSummary,
   DuplicateGroup,
   DuplicateMember,
+  NearDupeSummary,
+  NearGroup,
   EnrichProgress,
   EnrichSummary,
   EventRow,
@@ -116,6 +118,18 @@ let groups: DuplicateGroup[] = [
 ];
 
 let blurredList: AssetRow[] = [assets[2]];
+
+let nearGroups: NearGroup[] = [
+  {
+    id: 1,
+    wasteBytes: 1_237_000,
+    keptId: 3,
+    members: [
+      { ...memberOf(assets[2]), qualityScore: 120 },
+      { ...memberOf(assets[3]), qualityScore: 210 }
+    ]
+  }
+];
 
 function memberOf(a: AssetRow): DuplicateMember {
   return {
@@ -280,6 +294,23 @@ export async function scoreQuality(): Promise<CleanupStats> {
 
 export async function duplicatesList(): Promise<DuplicateGroup[]> {
   return groups;
+}
+
+export async function findSimilar(): Promise<NearDupeSummary> {
+  return { hashed: 6, failed: 0, groups: nearGroups.length, wasteBytes: 1_237_000 };
+}
+
+export async function nearGroupsList(): Promise<NearGroup[]> {
+  return nearGroups;
+}
+
+export async function keepNearCopy(groupId: number, keepId: number): Promise<NearGroup[]> {
+  nearGroups = nearGroups.map((g) => (g.id === groupId ? { ...g, keptId: keepId } : g));
+  return nearGroups;
+}
+
+export function onNearProgress(_cb: (p: CleanupProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
 }
 
 export async function keepCopy(groupId: number, keepId: number): Promise<DuplicateGroup[]> {

@@ -253,6 +253,36 @@ export function scoreQuality(): Promise<CleanupStats> {
   return invoke("score_quality");
 }
 
+export type NearGroup = {
+  id: number;
+  wasteBytes: number;
+  keptId: number | null;
+  members: DuplicateMember[];
+};
+
+export type NearDupeSummary = {
+  hashed: number;
+  failed: number;
+  groups: number;
+  wasteBytes: number;
+};
+
+export function findSimilar(): Promise<NearDupeSummary> {
+  return invoke("near_dupes_run");
+}
+
+export function nearGroupsList(): Promise<NearGroup[]> {
+  return invoke("near_groups_list");
+}
+
+export function keepNearCopy(groupId: number, keepId: number): Promise<NearGroup[]> {
+  return invoke("near_keep", { groupId, keepId });
+}
+
+export function onNearProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
+  return listen<CleanupProgress>("near-progress", (e) => cb(e.payload));
+}
+
 export function duplicatesList(): Promise<DuplicateGroup[]> {
   return invoke("duplicates_list");
 }

@@ -17,6 +17,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, include_str!("../migrations/008_person_names.sql")),
     (9, include_str!("../migrations/009_scene_tags.sql")),
     (10, include_str!("../migrations/010_geofences.sql")),
+    (11, include_str!("../migrations/011_near_dupes.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -1559,6 +1560,262 @@ pub struct CleanupStats {
     pub blurred: i64,
 }
 
+// MARK: - Near duplicates (perceptual dHash grouping)
+
+/// Hamming distance between two 16-hex-char dHashes; None on malformed input.
+pub fn dhash_distance(a: &str, b: &str) -> Option<u32> {
+    if a.len() != 16 || b.len() != 16 {
+        return None;
+    }
+    let (x, y) = (u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(b, 16).ok()?);
+    Some((x ^ y).count_ones())
+}
+
+/// Pairs at or under this distance read as "visually the same shot".
+pub const NEAR_DUPE_THRESHOLD: u32 = 8;
+/// Pairwise grouping is O(n^2); above this many hashed images the pass
+/// refuses rather than wedging the app.
+pub const NEAR_DUPE_MAX_IMAGES: i64 = 20_000;
+
+pub fn dhash_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path FROM assets
+             WHERE kind = 'image' AND missing = 0 AND dhash IS NULL
+             ORDER BY id LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare dhash candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query dhash candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("dhash candidate row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn apply_dhash(conn: &Connection, id: i64, dhash: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE assets SET dhash = ?2, dhash_at = ?3, dhash_error = NULL,
+                dhash_attempts = dhash_attempts + 1
+         WHERE id = ?1",
+        params![id, dhash, now()],
+    )
+    .map_err(|e| format!("apply_dhash: {e}"))?;
+    Ok(())
+}
+
+pub fn apply_dhash_failure(conn: &Connection, id: i64, error: &str) -> Result<(), String> {
+    let message: String = error.chars().take(200).collect();
+    conn.execute(
+        "UPDATE assets SET dhash_error = ?2, dhash_attempts = dhash_attempts + 1 WHERE id = ?1",
+        params![id, message],
+    )
+    .map_err(|e| format!("apply_dhash_failure: {e}"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearGroup {
+    pub id: i64,
+    pub waste_bytes: i64,
+    pub kept_id: Option<i64>,
+    pub members: Vec<DuplicateMember>,
+}
+
+/// Rebuilds near-duplicate groups from dHashes with union-find over all
+/// pairs at or under NEAR_DUPE_THRESHOLD. Keeper order mirrors the exact
+/// system: favourite, then sharpness, then earliest capture, then lowest id.
+pub fn rebuild_near_groups(conn: &Connection) -> Result<(i64, i64), String> {
+    // (id, path, name, size, favorite, quality, taken_at, dhash)
+    let assets: Vec<(i64, String, String, i64, i64, Option<f64>, Option<f64>, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, name, size_bytes, favorite, quality_score, COALESCE(captured_at, modified), dhash
+                 FROM assets WHERE kind = 'image' AND missing = 0 AND dhash IS NOT NULL",
+            )
+            .map_err(|e| format!("prepare near assets: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
+                    r.get::<_, Option<f64>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| format!("query near assets: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("near asset row: {e}"))?);
+        }
+        v
+    };
+    if assets.len() as i64 > NEAR_DUPE_MAX_IMAGES {
+        return Err(format!(
+            "near-dupe pass refuses {} images (cap {}) — narrow the library first",
+            assets.len(),
+            NEAR_DUPE_MAX_IMAGES
+        ));
+    }
+
+    // Union-find over qualifying pairs.
+    let mut parent: Vec<usize> = (0..assets.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..assets.len() {
+        for j in (i + 1)..assets.len() {
+            let close = dhash_distance(&assets[i].7, &assets[j].7)
+                .map_or(false, |d| d <= NEAR_DUPE_THRESHOLD);
+            if close {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut components: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..assets.len() {
+        let r = find(&mut parent, i);
+        components.entry(r).or_default().push(i);
+    }
+    let mut groups: Vec<Vec<usize>> = components
+        .into_values()
+        .filter(|c| c.len() > 1)
+        .collect();
+    // Deterministic order: biggest groups first.
+    groups.sort_by_key(|c| std::cmp::Reverse(c.len()));
+
+    let tx = conn.unchecked_transaction().map_err(|e| format!("near tx: {e}"))?;
+    tx.execute("UPDATE assets SET near_group_id = NULL, is_near_duplicate = 0", [])
+        .map_err(|e| format!("reset near flags: {e}"))?;
+    tx.execute("DELETE FROM near_groups", [])
+        .map_err(|e| format!("clear near groups: {e}"))?;
+
+    let mut group_count = 0i64;
+    let mut waste_total = 0i64;
+    for comp in &groups {
+        // Keeper order: favourite, sharpness, earliest capture, lowest id.
+        let mut members: Vec<usize> = comp.clone();
+        members.sort_by(|&a, &b| {
+            assets[b]
+                .4
+                .cmp(&assets[a].4)
+                .then(assets[b].5.partial_cmp(&assets[a].5).unwrap_or(std::cmp::Ordering::Equal))
+                .then(assets[a].6.partial_cmp(&assets[b].6).unwrap_or(std::cmp::Ordering::Equal))
+                .then(assets[a].0.cmp(&assets[b].0))
+        });
+        let kept = assets[members[0]].0;
+        let waste: i64 = members[1..].iter().map(|&m| assets[m].3).sum();
+        tx.execute(
+            "INSERT INTO near_groups (kept_id, waste_bytes, created_at) VALUES (?1, ?2, ?3)",
+            params![kept, waste, now()],
+        )
+        .map_err(|e| format!("insert near group: {e}"))?;
+        let group_id = tx.last_insert_rowid();
+        for &m in &members {
+            let is_dup = i64::from(assets[m].0 != kept);
+            tx.execute(
+                "UPDATE assets SET near_group_id = ?2, is_near_duplicate = ?3 WHERE id = ?1",
+                params![assets[m].0, group_id, is_dup],
+            )
+            .map_err(|e| format!("mark near member: {e}"))?;
+        }
+        group_count += 1;
+        waste_total += waste;
+    }
+
+    tx.commit().map_err(|e| format!("near commit: {e}"))?;
+    Ok((group_count, waste_total))
+}
+
+pub fn near_groups(conn: &Connection) -> Result<Vec<NearGroup>, String> {
+    let groups: Vec<NearGroup> = {
+        let mut stmt = conn
+            .prepare("SELECT id, waste_bytes, kept_id FROM near_groups ORDER BY waste_bytes DESC, id")
+            .map_err(|e| format!("prepare list near groups: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(NearGroup { id: r.get(0)?, waste_bytes: r.get(1)?, kept_id: r.get(2)?, members: Vec::new() })
+            })
+            .map_err(|e| format!("list near groups: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("near group row: {e}"))?);
+        }
+        v
+    };
+
+    let mut out = Vec::new();
+    for mut g in groups {
+        let members: Vec<DuplicateMember> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, path, name, is_near_duplicate, captured_at, quality_score FROM assets
+                     WHERE near_group_id = ?1 ORDER BY is_near_duplicate ASC, captured_at ASC, id",
+                )
+                .map_err(|e| format!("prepare near members: {e}"))?;
+            let rows = stmt
+                .query_map(params![g.id], |r| {
+                    Ok(DuplicateMember {
+                        id: r.get(0)?,
+                        path: r.get(1)?,
+                        name: r.get(2)?,
+                        is_duplicate: r.get::<_, i64>(3)? == 1,
+                        captured_at: r.get(4)?,
+                        quality_score: r.get(5)?,
+                    })
+                })
+                .map_err(|e| format!("query near members: {e}"))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(|e| format!("near member row: {e}"))?);
+            }
+            v
+        };
+        g.members = members;
+        out.push(g);
+    }
+    Ok(out)
+}
+
+pub fn near_keep(conn: &Connection, group_id: i64, keep_id: i64) -> Result<(), String> {
+    let belongs: bool = conn
+        .query_row(
+            "SELECT 1 FROM assets WHERE id = ?1 AND near_group_id = ?2",
+            params![keep_id, group_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !belongs {
+        return Err(format!("asset {keep_id} is not part of near group {group_id}"));
+    }
+    conn.execute(
+        "UPDATE near_groups SET kept_id = ?2, resolved = 1 WHERE id = ?1",
+        params![group_id, keep_id],
+    )
+    .map_err(|e| format!("near keep: {e}"))?;
+    conn.execute(
+        "UPDATE assets SET is_near_duplicate = (id != ?2) WHERE near_group_id = ?1",
+        params![group_id, keep_id],
+    )
+    .map_err(|e| format!("near keep flags: {e}"))?;
+    Ok(())
+}
+
 // MARK: - Queries
 
 #[derive(Default)]
@@ -1855,10 +2112,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 10, "user_version tracks the highest applied migration");
+        assert_eq!(v, 11, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -1939,6 +2196,48 @@ mod tests {
         let page = library(&conn, &LibraryQuery { blurred_only: true, limit: 1, ..Default::default() }).unwrap();
         assert_eq!(page.len(), 1, "limit still applies alongside the filter");
         assert!(library(&conn, &LibraryQuery { kind: Some("video"), blurred_only: true, limit: 10, ..Default::default() }).unwrap().is_empty());
+    }
+
+    #[test]
+    fn near_dupes_group_by_hamming_distance() {
+        assert_eq!(dhash_distance("0000000000000000", "0000000000000000"), Some(0));
+        assert_eq!(dhash_distance("0000000000000000", "ffffffffffffffff"), Some(64));
+        assert_eq!(dhash_distance("0000000000000000", "00000000000000ff"), Some(8));
+        assert!(dhash_distance("zz", "0000000000000000").is_none(), "malformed rejected");
+        assert!(dhash_distance("short", "0000000000000000").is_none(), "short rejected");
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // a-b differ by 5 bits, b-c by 5, a-c by 10: one transitive group.
+        upsert_asset(&conn, &asset("/a.jpg", 100, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 200, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/c.jpg", 400, 3.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/far.jpg", 800, 4.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        apply_dhash(&conn, id_for("/a.jpg"), "0000000000000000").unwrap();
+        apply_dhash(&conn, id_for("/b.jpg"), "000000000000001f").unwrap();
+        apply_dhash(&conn, id_for("/c.jpg"), "00000000000003ff").unwrap();
+        apply_dhash(&conn, id_for("/far.jpg"), "ffffffffffffffff").unwrap();
+        set_favorite(&conn, id_for("/c.jpg"), true).unwrap();
+
+        let (groups, waste) = rebuild_near_groups(&conn).unwrap();
+        assert_eq!(groups, 1, "transitive chain forms one group");
+        assert_eq!(waste, 300, "non-keeper sizes summed");
+        let list = near_groups(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].members.len(), 3);
+        assert_eq!(list[0].kept_id, Some(id_for("/c.jpg")), "favourite wins keeper");
+
+        // Rebuild is idempotent; keeper can move.
+        let (groups2, _) = rebuild_near_groups(&conn).unwrap();
+        assert_eq!(groups2, 1);
+        near_keep(&conn, list[0].id, id_for("/a.jpg")).unwrap();
+        assert_eq!(near_groups(&conn).unwrap()[0].kept_id, Some(id_for("/a.jpg")));
+        assert!(near_keep(&conn, list[0].id, 9999).is_err(), "outsider keeper rejected");
     }
 
     #[test]

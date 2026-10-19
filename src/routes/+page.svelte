@@ -29,6 +29,10 @@
     facesInCluster,
     duplicatesList,
     engineThumb,
+    findSimilar,
+    nearGroupsList,
+    keepNearCopy,
+    onNearProgress,
     enrichAssets,
     findDuplicates,
     runPostImport,
@@ -64,6 +68,7 @@
     type GeocodeProgress,
     type FaceRow,
     type DuplicateGroup,
+    type NearGroup,
     type EnrichProgress,
     type ImportProgress,
     type LibraryStats,
@@ -180,6 +185,9 @@
   let enrichState = $state<EnrichProgress | null>(null);
   let cleanup = $state<CleanupStats | null>(null);
   let groups = $state<DuplicateGroup[]>([]);
+  let nearGroups = $state<NearGroup[]>([]);
+  let nearing = $state(false);
+  let nearState = $state<CleanupProgress | null>(null);
   let blurred = $state<AssetRow[]>([]);
   let hashing = $state(false);
   let scoring = $state(false);
@@ -560,6 +568,14 @@
     blurred = await blurredAssets(36);
     void loadThumbs(blurred);
     for (const g of groups) {
+      for (const m of g.members) void loadThumbs([{ path: m.path } as AssetRow]);
+    }
+    try {
+      nearGroups = await nearGroupsList();
+    } catch {
+      nearGroups = [];
+    }
+    for (const g of nearGroups) {
       for (const m of g.members) void loadThumbs([{ path: m.path } as AssetRow]);
     }
   }
@@ -964,6 +980,31 @@
     }
   }
 
+  async function runFindSimilar() {
+    nearing = true;
+    nearState = null;
+    try {
+      const summary = await findSimilar();
+      toast =
+        summary.groups === 0
+          ? "No similar photos found"
+          : `${summary.groups} similar group${summary.groups === 1 ? "" : "s"} · ${fmtBytes(summary.wasteBytes)} recoverable`;
+      await refreshCleanup();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      nearing = false;
+    }
+  }
+
+  async function chooseNearKeeper(groupId: number, keepId: number) {
+    try {
+      nearGroups = await keepNearCopy(groupId, keepId);
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
   async function runScoreQuality() {
     scoring = true;
     qualityState = null;
@@ -1084,6 +1125,9 @@
       onQualityProgress((p) => {
         if (scoring) qualityState = p;
       }),
+      onNearProgress((p) => {
+        if (nearing) nearState = p;
+      }),
       onClusterProgress((p) => {
         if (peopleLoading && clusterState) {
           clusterState = { processed: p.processed, total: p.total };
@@ -1158,10 +1202,16 @@
         <button onclick={() => void runScoreQuality()} disabled={scoring}>
           {scoring ? "Scoring…" : "Score sharpness"}
         </button>
+        <button onclick={() => void runFindSimilar()} disabled={nearing}>
+          {nearing ? "Comparing…" : "Find similar photos"}
+        </button>
       </div>
 
       {#if hashState}
         <p class="hint">{hashState.hashed ?? 0} hashed across {hashState.buckets ?? 0} size buckets</p>
+      {/if}
+      {#if nearState}
+        <p class="hint">{nearState.hashed ?? 0} perceptual hashes computed</p>
       {/if}
       {#if qualityState}
         <p class="hint">{qualityState.scored ?? 0} scored · {qualityState.blurred ?? 0} look blurred</p>
@@ -1223,6 +1273,55 @@
               <button
                 class="tiny danger"
                 onclick={() => (confirm = { ids: group.members.filter((m) => m.id !== group.keptId).map((m) => m.id), label: `${group.members.length - 1} duplicates` })}
+              >
+                Move {group.members.length - 1} extra {group.members.length - 1 === 1 ? "copy" : "copies"} to Trash
+              </button>
+            {/if}
+          </article>
+        {/each}
+      {/if}
+
+      {#if nearGroups.length}
+        <h3 class="sub">Similar photos</h3>
+        <p class="hint">Perceptual matches (resaves, crops, resizes) — review before trashing.</p>
+        {#each nearGroups as group (group.id)}
+          <article class="group">
+            <header>
+              <span>{group.members.length} similar · keep 1</span>
+              <span class="waste">free {fmtBytes(group.wasteBytes)}</span>
+            </header>
+            <div class="members">
+              {#each group.members as member (member.id)}
+                <figure class:keeper={member.id === group.keptId}>
+                  <div class="thumb small">
+                    {#if thumbs[member.path]}
+                      <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                    {:else}
+                      <span class="placeholder">IMG</span>
+                    {/if}
+                  </div>
+                  <figcaption>
+                    <span class="name" title={member.path}>{member.name}</span>
+                    {#if member.id === group.keptId}
+                      <span class="badge keep">keeper</span>
+                    {:else}
+                      <span class="row-actions">
+                        <button class="tiny" onclick={() => void chooseNearKeeper(group.id, member.id)}>
+                          Keep this
+                        </button>
+                        <button class="tiny danger" onclick={() => (confirm = { ids: [member.id], label: member.name })}>
+                          Trash
+                        </button>
+                      </span>
+                    {/if}
+                  </figcaption>
+                </figure>
+              {/each}
+            </div>
+            {#if group.members.length > 1}
+              <button
+                class="tiny danger"
+                onclick={() => (confirm = { ids: group.members.filter((m) => m.id !== group.keptId).map((m) => m.id), label: `${group.members.length - 1} similar photos` })}
               >
                 Move {group.members.length - 1} extra {group.members.length - 1 === 1 ? "copy" : "copies"} to Trash
               </button>

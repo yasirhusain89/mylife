@@ -806,6 +806,54 @@ func hashBatch(paths: [String]) -> [String: Any] {
     return ["count": paths.count, "results": results]
 }
 
+/// 64-bit difference hash: 9x8 grayscale thumbnail, one bit per adjacent
+/// column pair. Invariant to resize/re-encode; Hamming distance <= 8 reads
+/// as "visually the same shot". Pure ImageIO, no model, milliseconds.
+func dHash(path: String) throws -> String {
+    guard let src = CGImageSourceCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    else { throw EngineError(message: "not an image: \(path)") }
+    let thumbOpts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: 64,
+    ]
+    guard let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary) else {
+        throw EngineError(message: "cannot decode image: \(path)")
+    }
+    let w = 9, h = 8
+    var pixels = [UInt8](repeating: 0, count: w * h)
+    let colorSpace = CGColorSpaceCreateDeviceGray()
+    guard let ctx = CGContext(
+        data: &pixels, width: w, height: h, bitsPerComponent: 8,
+        bytesPerRow: w, space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.none.rawValue)
+    else { throw EngineError(message: "cannot rasterize: \(path)") }
+    ctx.interpolationQuality = .high
+    ctx.draw(thumb, in: CGRect(x: 0, y: 0, width: w, height: h))
+    var hash: UInt64 = 0
+    for y in 0..<h {
+        for x in 0..<(w - 1) {
+            hash <<= 1
+            if pixels[y * w + x] > pixels[y * w + x + 1] { hash |= 1 }
+        }
+    }
+    return String(format: "%016llx", hash)
+}
+
+func dHashBatch(paths: [String]) -> [String: Any] {
+    var results: [[String: Any]] = []
+    results.reserveCapacity(paths.count)
+    for path in paths {
+        do {
+            results.append(["path": path, "ok": true, "dhash": try dHash(path: path)])
+        } catch {
+            results.append(["path": path, "ok": false, "error": "\(error)"])
+        }
+    }
+    return ["count": paths.count, "results": results]
+}
+
 // MARK: - Image quality
 
 /// Variance of the Laplacian over a downscaled luma image: the classic focus /
@@ -1030,6 +1078,15 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
             throw EngineError(message: "hash_batch accepts at most 500 paths, got \(paths.count)")
         }
         return hashBatch(paths: paths)
+
+    case "dhash_batch":
+        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
+            throw EngineError(message: "dhash_batch requires a non-empty 'paths' array")
+        }
+        if paths.count > 500 {
+            throw EngineError(message: "dhash_batch accepts at most 500 paths, got \(paths.count)")
+        }
+        return dHashBatch(paths: paths)
 
     case "faces":
         guard let path = str("path") else { throw EngineError(message: "faces requires 'path'") }

@@ -54,6 +54,10 @@ export const enrichAssets = pick("enrichAssets");
 export const onEnrichProgress = pick("onEnrichProgress");
 export const findDuplicates = pick("findDuplicates");
 export const scoreQuality = pick("scoreQuality");
+export const findSimilar = pick("findSimilar");
+export const nearGroupsList = pick("nearGroupsList");
+export const keepNearCopy = pick("keepNearCopy");
+export const onNearProgress = pick("onNearProgress");
 export const duplicatesList = pick("duplicatesList");
 export const keepCopy = pick("keepCopy");
 export const cleanupStats = pick("cleanupStats");
@@ -120,6 +124,8 @@ export type {
   DuplicateGroup,
   DuplicateMember,
   EnrichProgress,
+  NearDupeSummary,
+  NearGroup,
   EnrichSummary,
   EventAssetRow,
   EventRow,

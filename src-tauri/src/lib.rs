@@ -421,6 +421,98 @@ async fn score_quality(app: tauri::AppHandle) -> Result<db::CleanupStats, String
     .map_err(|e| format!("quality task join failed: {e}"))?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearDupeSummary {
+    pub hashed: i64,
+    pub failed: i64,
+    pub groups: i64,
+    pub waste_bytes: i64,
+}
+
+/// Backfills perceptual hashes in batches of 100, then rebuilds the
+/// near-duplicate groups. O(n^2) grouping refuses past NEAR_DUPE_MAX_IMAGES.
+pub fn run_near_dupes(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    mut on_progress: impl FnMut(i64, i64, i64),
+) -> Result<(i64, i64, i64, i64), String> {
+    let (mut hashed, mut failed) = (0i64, 0i64);
+    loop {
+        let batch = db::dhash_candidates(conn, 100)?;
+        if batch.is_empty() {
+            break;
+        }
+        let paths: Vec<String> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let reply = engine::call_blocking(
+            engine_state,
+            "dhash_batch",
+            Some(json!({ "paths": paths })),
+            Duration::from_secs(300),
+        )?;
+        let results = reply
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or("dhash_batch returned no results array")?;
+        if results.len() != batch.len() {
+            return Err(format!(
+                "dhash_batch returned {} results for {} paths",
+                results.len(),
+                batch.len()
+            ));
+        }
+        for ((id, _), result) in batch.iter().zip(results) {
+            if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                if let Some(dhash) = result.get("dhash").and_then(Value::as_str) {
+                    db::apply_dhash(conn, *id, dhash)?;
+                    hashed += 1;
+                    continue;
+                }
+            }
+            let message = result.get("error").and_then(Value::as_str).unwrap_or("dhash failed");
+            db::apply_dhash_failure(conn, *id, message)?;
+            failed += 1;
+        }
+        on_progress(hashed, failed, 0);
+    }
+    let (groups, waste) = db::rebuild_near_groups(conn)?;
+    Ok((hashed, failed, groups, waste))
+}
+
+#[tauri::command]
+async fn near_dupes_run(app: tauri::AppHandle) -> Result<NearDupeSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        let (hashed, failed, groups, waste_bytes) =
+            run_near_dupes(&conn, &engine_state, |hashed, failed, _| {
+                let _ = app.emit("near-progress", json!({ "hashed": hashed, "failed": failed }));
+            })?;
+        Ok(NearDupeSummary { hashed, failed, groups, waste_bytes })
+    })
+    .await
+    .map_err(|e| format!("near-dupe task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn near_groups_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::NearGroup>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::near_groups(&conn)
+}
+
+/// Marks a keeper for a near-duplicate group. Never deletes.
+#[tauri::command]
+fn near_keep(
+    conn: tauri::State<'_, DbState>,
+    group_id: i64,
+    keep_id: i64,
+) -> Result<Vec<db::NearGroup>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::near_keep(&conn, group_id, keep_id)?;
+    db::near_groups(&conn)
+}
+
 #[tauri::command]
 fn duplicates_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::DuplicateGroup>, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
@@ -1701,6 +1793,9 @@ pub fn run() {
             enrich_assets,
             hash_candidates_run,
             score_quality,
+            near_dupes_run,
+            near_groups_list,
+            near_keep,
             tag_scenes,
             run_post_import_cmd,
             scene_tags,

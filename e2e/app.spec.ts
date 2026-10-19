@@ -41,6 +41,13 @@ test("cleanup surfaces the seeded duplicate group", async ({ page }) => {
   await expect(page.getByText("IMG_20261007_191434.jpg")).toBeVisible();
 });
 
+test("similar photos surface the seeded near-duplicate group", async ({ page }) => {
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find similar photos" }).click();
+  await expect(page.getByRole("heading", { name: "Similar photos" })).toBeVisible();
+  await expect(page.getByText("IMG_20261007_185824.jpg").first()).toBeVisible();
+});
+
 test("import via typed path adds assets", async ({ page }) => {
   await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
   await page.getByRole("button", { name: "Scan" }).click();
