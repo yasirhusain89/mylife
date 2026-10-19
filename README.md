@@ -10,6 +10,49 @@ Current capabilities: folder import with metadata enrichment, cleanup (exact-dup
 - `pnpm build:engine` — rebuild the Swift sidecar (`scripts/build-engine.sh`)
 - `cargo test` (in `src-tauri/`) — Rust suite; `pnpm check` — svelte-check
 
+## Plan — capabilities by phase
+
+Status against what has actually shipped (see git log):
+
+- **P1 Import & Library — shipped, with gaps.** Folder import, thumbnails, SQLite catalog, EXIF/GPS enrichment, pagination, month/location/person filters, missing-file verification. Open: drag-and-drop import, osxphotos import from Apple Photos, LQIP placeholders.
+- **P2 Cleanup — partial.** Exact-duplicate groups (size-bucketed hashing), blur scoring (Laplacian variance), Trash-based deletion, review UI. Open: near-duplicate clustering, utility-shot detection (screenshots/docs), low-quality scoring, keeper score breakdown, batch confirm.
+- **P3 Intelligence — partial.** Face detection + feature-print clustering, albums. Open: named people, MobileCLIP2 embeddings + semantic search, VLM captions on demand.
+- **P4 Events & Summaries — partial.** Time + GPS event clustering with naming. Open: routine-vs-trip distinction, LLM text summaries, event stats (top people, days, places).
+- **P5 Highlight videos — partial.** Per-event photo-slideshow montage via the hardware encoder. Open: diversity-picked shots, Ken Burns pans, transitions, title cards, narration, export presets.
+- **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles. Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.
+
+## Architecture
+
+Leveraging M4 Pro + macOS software layers:
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  Tauri v2 (Rust core)         │ Svelte 5 + TS frontend     │
+│  • SQLite (assets, faces,     │  library grid / events /   │
+│    embeddings, groups)        │  cleanup review / share    │
+│  • Pipeline scheduler,        │  audience builder          │
+│    EXIF, hashing, clustering, │                            │
+│    semantic search (dot-prod) │                            │
+└───────────────┬────────────────────────────────────────────┘
+                │ JSON-lines over stdio (sidecar, one engine process)
+┌───────────────▼────────────────────────────────────────────┐
+│  Swift "engine" sidecar (native macOS layers)              │
+│  • Vision: FeaturePrint similarity, aesthetic/tech scores  │
+│    (macOS 15+ CalculateImageAestheticsScoresRequest),      │
+│    lens smudge, face detect + landmarks, OCR               │
+│  • Core ML / ANE: MobileFaceNet-style face embeddings      │
+│  • MLX Swift: VLM captions (SmolVLM2) + LLM summaries      │
+│  • AVFoundation: montage/highlight video rendering         │
+│    (AVMutableComposition, hw encoders, Ken Burns, charts)  │
+│  • `say` CLI render for narration audio tracks             │
+└────────────────────────────────────────────────────────────┘
+  Optional CLI integrations: osxphotos (import from Apple
+  Photos with full metadata), AppleScript Photos.app export,
+  ffmpeg w/ VideoToolbox (fallback encoder)
+```
+
+**Why Swift sidecar + Rust core:** Vision/Core ML/AVFoundation/MLX have no usable Rust bindings; a single Swift engine process keeps all Apple silicon paths (ANE + Metal + Accelerate) first-class, while Rust keeps state, scheduling, search, and DB — the same split bppicker/Flick-class apps converge on. 64 GB unified memory means we can hold SmolVLM2 (or 4–8B VLMs 4-bit), embeddings index for ~200k assets, and render video simultaneously.
+
 ## Original research
 
 What the tier-1 consumer apps actually ship (the bar to meet), the on-device model landscape, and the pipeline blueprints this project builds on.
@@ -162,3 +205,79 @@ Creators:
 ```
 
 > One caveat on the OSS pile: the beat-sync/montage repos (beat-synced-edit, ai-montage-agent, clipforge, CutAI/MIT) are excellent blueprints for the logic, but they're Python/ffmpeg desktop stacks — port the decision layer (EDL + scoring) to Swift/Kotlin and render natively.
+
+### 6. Addendum: on-device VLM inference + distribution & cleanup management
+
+#### A. On-device VLM (vision-language model) inference
+
+Model landscape (what actually runs on phones today):
+
+| Model | Size class | Modalities | Notes |
+| --- | --- | --- | --- |
+| SmolVLM2 (HF) | 256M / 500M / 2.2B | image + video + text | 500M is the smallest credible phone VLM; MLX Swift from day zero; HuggingSnap ships it as a fully local iOS camera app (object recognition, translation, plant/animal ID, summarization) (huggingface.co/blog/smolvlm2; deepwiki HuggingSnap) |
+| Moondream 2/3 | ~0.6–2B | image + text | strong for pure captioning/QA, quantizes well, popular in ExecuTorch/MLX mobile demos |
+| Gemma 3n E2B/E4B | 2B/4B active (~3.4 GB int4 on disk) | text + image + audio | LiteRT-LM on Metal/QNN; one model does captioning, transcription, translation (AccessEye ships it offline on iOS) |
+| AFM 3 Core / Core Advanced (Apple, via Foundation Models framework) | ~3B dense / 20B sparse (1–4B active, flash-resident) | text + image | free, offline, guided generation + tool calling; the only "platform" VLM — API-level, not weights (developer.apple.com/foundation-models-framework) |
+| Qwen2.5-VL / Qwen3-VL small variants | 2–3B quantized | image + text | best multilingual OCR-in-image performance at mobile size; runs via MLX/ExecuTorch/QNN conversions |
+| FastViT (paired w/ text head = MobileCLIP2) | 3.6–43M | image | 0.5–2.8 ms/frame on iPhone 16 Pro — this is what bulk indexing uses, not a VLM (developer.apple.com/machine-learning/models) |
+
+**The key architectural insight: tiered inference, not VLM-everywhere.** A VLM at phone scale costs ~0.5–3 s and 2–4 W per image. You cannot run it over a 50,000-photo library during indexing. The leading-edge pattern is:
+
+- **Bulk pass (cheap)** — specialized small models on NPU: MobileCLIP2/SigLIP2 embeddings (~5–15 ms), faces/pets, Nima-quality, OCR (Vision OCR / LiteRT). Every asset gets an embedding + tags, once, in a cancelable background batch (Flick's pipeline: SQLite-cached features, batch background coordinator, skip iCloud placeholder files — mahui.me/en/blog/on-device-photo-similarity/).
+- **VLM on demand (expensive)** — one of:
+  - *Just-in-time descriptions:* when a user opens an asset, asks "what is in this?", or shares it → run VLM captioning once for that asset, cache the text into the semantic index. Costs amortize to the ~1% of library that users actually interact with.
+  - *Event-level batching:* when creating a memory movie/recap, run the VLM over the ~20–50 candidate keyframes only (already pre-selected by embedding + quality scores) — 40 VLM calls to caption a year-in-review is affordable; 40,000 are not.
+  - *Query-time re-ranking:* cheap embedding search returns top-100 → VLM verifies/answers "which of these show grandma's birthday cake?" Talk through LLM function calling. This is exactly how cloud Ask-Photos zooms work, done locally.
+
+**VLM-specific use cases worth shipping:**
+
+- Rich captions & alt-text (accessibility + search seed text)
+- Synthetic captions for video — SmolVLM2-500M watches a clip and writes a summary; drives frame-level video search and recap scripts (huggingface blog: "system prompt bends the model to describe key dramatic action")
+- Complex zero-shot concepts the teacher embeddings miss — "the photo where everyone is laughing", "contains a prescription", "interest group photo"
+- Scriptwriting for recaps / narration — VLM reads the event's asset summaries and writes chapter text (guided generation for strict JSON)
+- Edit intent parsing — "make the海滩 warmer and crop out the person on the left" → structured edit plan (Samsung One UI 8.5 Photo Assist text prompts and Google's Help-me-edit set this UX expectation)
+- Cleanup adjudication — VLM as final judge for ambiguous cases ("is this shot of the floor actually someone's pet?" / "is this a meaningful screenshot or junk?"), below the specialized detectors
+- Privacy-parse before share — VLM + OCR flag ID cards, addresses, sensitive text in a photo the user is about to share
+
+**Runtimes to target:** MLX (iOS, Swift — HuggingSnap pattern), LiteRT-LM (Android + iOS via .litertlm, JIT-compiled to Hexagon/Metal), ExecuTorch (cross-platform, QNN/CoreML/XNNPACK delegates), Foundation Models (iOS platform path). Budget: expect 2–5 GB RAM ceilings → Increased Memory Limit entitlement on iOS; Gemma 3n E2B int4 needs 8 GB-RAM devices.
+
+#### B. Distribution management, selection & cleanup
+
+**The gap this fills.** "Manage" (browse/search) vs "distribute" (share/export) are different jobs. Nobody in tier-1 ships a strong on-device distribution layer; it's mostly raw share-sheet. This is a real product surface:
+
+- **Selection-for-distribution** — "pick the 6 best from this trip album": composite scoring from the curation stack (NIMA + faces + sharpness) + diversity constraints (per-day caps, per-person quotas, no two near-dups) + # of slots. bppicker's greedy selection with tunable weights is the working reference; Google's Recap "souvenirs" define the UX (ready-to-post sub-clips + collages).
+- **Privacy-preserving export** — this is where on-device wins are concretely user-facing:
+  - EXIF/GPS stripping toggle (both platforms ship strip-on-share now; leading edge is selective strip: keep camera settings, drop GPS)
+  - Sensitive-content redaction pre-share — OCR + VLM detect license plates, screen text, faces of non-group members → offer blur
+  - Blur-based anonymization for shared copies only (originals intact)
+- **Resizing / derivatives** — the leading edge is never shipping libraries like ffmpeg onto phones:
+  - iOS: Core Image / CGImageSource (kCGImageSourceCreateThumbnailWithTransform) for downscales; hardware HEIC/JPEG re-encode via PhotoKit requestExportSession; AVFoundation for video transcodes (HEVC/hw)
+  - Android: Media3 Transformer + ImageDecoder, hardware JPEG/HEIF/AVIF
+  - Ship quality/size presets (full-bandwidth, "chat size", story 1080×1920 crop) computed with subject-aware reframe (salient-face-center crop, not center crop) — the Samsung My FanCam primitive reused statically
+  - Watermarks/branding baked at export time only
+- **Cleanup management (duplicates/bad pictures)** — now genuinely production-grade on-device, and partly platform-provided:
+
+| Signal | On-device implementation | Source |
+| --- | --- | --- |
+| Exact/near duplicates | dHash LSH bucketing + Vision FeaturePrint distance (VNGenerateImageFeaturePrintRequest) | iphone-cleaner, Flick |
+| Best-of-group keeper | Laplacian-variance sharpness (vImage/vDSP, few ms/image) + feature-print centrality + face quality + exposure, weighted composite → suggested keeper, show score breakdown, batch-delete via PHAssetChangeRequest.deleteAssets (never bypass system dialog) | PhotoSift (github.com/Hayden1629/photosift) |
+| Aesthetic/technical low-quality | VNCalculateImageAestheticsScoresRequest (iOS 18+) — Apple ships the -1→1 score + utility-image classification (screenshots/receipts/QRCodes) on the Neural Engine | apple_vision_aesthetics (dev-ale) |
+| Lens-smudge detection | VNDetectLensSmudgeRequest (iOS 26+) | iphone-cleaner |
+| Blurry-delete suggestions | Google-patented approach: ML model predicts percentage blurriness (incl. % of blurred faces), Metadata+ pixel based, suggest deletion above threshold | tdcommons publication |
+| Text-junk / screenshots | mediaSubtypes + OCR-coverage-ratio heuristic + utility classifier (iOS) or a tiny TFLite screenshot/UnoC labeler (Android) | iphone-cleaner |
+| Burst grouping | time-window walk (10–60 s configurable) — no ML needed, near-instant | PhotoSift |
+
+**UX patterns that matter as much as the models:** caret-style review (swipe cards), suggested-keeper with why indicators, "freed X MB" summary, placeholder-aware (never force iCloud downloads to score a thumbnail — read metadata only), cancellation-safe batch pipelines, and system-constrained deletion (PhotoKit confirmation; on Android via appop/MANAGE_MEDIA or intent flows).
+
+**Android parity note:** no Vision-framework equivalent → same stack assembled from NIMA (aesthetic), NIP-quality TID2013 variant (technical), Laplacian (via RenderScript/NEON), LSH dedup hashing, YOLO-nano screenshot/pet detector. The quality of cleanup parity is achieved; you just own more models.
+
+**How it plugs into the earlier pipeline:**
+
+```text
+Prune/cleanup pass   (dedup groups → composite keeper → junk classes → review UI → batch delete)
+        ↓ survivors only
+Distribution pass    (selection w/ diversity + quotas → subject-aware resize/HEIC-AVIF encode
+                      → EXIF policy → sensitive-redact via OCR+VLM → share-sheet / direct post)
+```
+
+The cheap cleanup to distinguish: selection-for-keep (curation quality score, per-group argmax, diversity caps) — and don't confuse it with selection-for-share (higher weight on faces/subject salience/aspect-fit, dedup stronger nearly-duplicates).
