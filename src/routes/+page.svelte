@@ -708,7 +708,8 @@
   }
 
   function doRenameCluster(cluster: FaceClusterRow) {
-    askName("Person name", cluster.name ?? "", "Rename", (n) => void renameClusterTo(cluster.id, n));
+    const known = [...new Set(people.map((p) => p.name).filter((n): n is string => !!n && n !== cluster.name))];
+    askName("Person name", cluster.name ?? "", "Rename", (n) => void renameClusterTo(cluster.id, n), known);
   }
 
   async function renameClusterTo(clusterId: number, name: string) {
@@ -791,13 +792,13 @@
 
   // In-app dialogs: the app WebView suppresses native prompt()/confirm(),
   // which made album create/delete and every rename silently do nothing.
-  type NameDialog = { title: string; initial: string; okLabel: string; run: (name: string) => void };
+  type NameDialog = { title: string; initial: string; okLabel: string; run: (name: string) => void; suggestions: string[] };
   let nameDialog = $state<NameDialog | null>(null);
   let nameValue = $state("");
   let deleteAlbumTarget = $state<AlbumRow | null>(null);
 
-  function askName(title: string, initial: string, okLabel: string, run: (name: string) => void) {
-    nameDialog = { title, initial, okLabel, run };
+  function askName(title: string, initial: string, okLabel: string, run: (name: string) => void, suggestions: string[] = []) {
+    nameDialog = { title, initial, okLabel, run, suggestions };
     nameValue = initial;
   }
 
@@ -2607,6 +2608,14 @@
           maxlength={80}
           autofocus
         />
+        {#if nameDialog.suggestions.length > 0}
+          <p class="hint">Known people — select instead of retyping:</p>
+          <div class="suggest-row">
+            {#each nameDialog.suggestions as s (s)}
+              <button type="button" class="tiny ghost" onclick={() => (nameValue = s)}>{s}</button>
+            {/each}
+          </div>
+        {/if}
         <div class="dialog-actions">
           <button type="button" class="ghost" onclick={() => (nameDialog = null)}>Cancel</button>
           <button type="submit" disabled={nameValue.trim() === ""}>{nameDialog.okLabel}</button>
@@ -2899,8 +2908,10 @@
     color: #7b8496;
   }
   .members {
+    /* auto-fill (not fit): empty tracks are kept, so a one-photo group
+       stays one small tile instead of stretching full-width. */
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(6rem, 100%), 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(6rem, 100%), 1fr));
     gap: 0.5rem;
     margin-bottom: 0.5rem;
   }
@@ -3110,6 +3121,12 @@
     font: inherit;
     font-size: 0.9rem;
     padding: 0.4rem 0.6rem;
+  }
+  .suggest-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
   }
   .toast {
     position: fixed;

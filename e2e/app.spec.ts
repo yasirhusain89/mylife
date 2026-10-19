@@ -399,6 +399,25 @@ test("renaming a cluster persists in the UI", async ({ page }) => {
   await expect(page.getByText("Ada").first()).toBeVisible();
 });
 
+test("rename offers known people to select instead of retyping", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  // Name cluster 1 first so cluster 2's dialog has a suggestion.
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
+  let dialog = page.getByRole("dialog", { name: "Person name" });
+  await dialog.getByLabel("Person name").fill("Ada");
+  await dialog.getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByText("Ada").first()).toBeVisible();
+  // Cluster 2's dialog suggests Ada; selecting it fills the input.
+  await page.getByRole("button", { name: "Cluster 2", exact: true }).click();
+  dialog = page.getByRole("dialog", { name: "Person name" });
+  await expect(dialog.getByText("Known people — select instead of retyping:")).toBeVisible();
+  await dialog.getByRole("button", { name: "Ada" }).click();
+  await expect(dialog.getByLabel("Person name")).toHaveValue("Ada");
+  await dialog.getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByText("Cluster 2")).toBeHidden();
+});
+
 test("cluster source photos expand", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
