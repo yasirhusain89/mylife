@@ -455,6 +455,40 @@ test("removing a face that doesn't belong shrinks the cluster", async ({ page })
   await expect(page.getByText("Cluster 1")).toBeVisible();
 });
 
+test("removing a face keeps the collapsed preview compact", async ({ page }) => {
+  // Two imports put 12 faces in cluster 1; the collapsed card previews 8.
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/trip");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await expect(page.getByText("12 faces")).toBeVisible();
+  const card = page.locator("article", { hasText: "Cluster 1" });
+  await expect(card.locator("figure")).toHaveCount(8);
+  // Removing one must not explode the preview to the full list.
+  await card.getByRole("button", { name: "Remove this face from Cluster 1" }).first().click();
+  await expect(page.getByText("Removed that face from this person")).toBeVisible();
+  await expect(page.getByText("11 faces")).toBeVisible();
+  await expect(card.locator("figure")).toHaveCount(8);
+});
+
+test("faces on unreadable files say so instead of loading forever", async ({ page }) => {
+  // Import from a root whose files cannot be decoded (mock mirrors the
+  // engine's "cannot decode image" failure for UNREADABLE paths).
+  await page.getByPlaceholder("…or paste a folder path").fill("/UNREADABLE");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await expect(page.getByText("Showing 12 of 12")).toBeVisible();
+
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  // Face grids render for every loaded cluster; all 4 UNREADABLE faces (2 in
+  // cluster 1, 2 in cluster 2) report unreadable while healthy faces render.
+  await expect(page.getByTitle("Source file unreadable")).toHaveCount(4);
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+});
+
 test("view-in-library filters to the selected person", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();

@@ -569,13 +569,16 @@ export async function sightingsList(): Promise<PetSighting[]> {
 }
 
 export async function faceThumb(
-  _path: string,
+  path: string,
   _x: number,
   _y: number,
   _width: number,
   _height: number,
   _maxPx = 256,
 ): Promise<{ image: string }> {
+  // Mirrors the engine's "cannot decode image" failure for files on dead
+  // volumes so the unreadable-face UI state is testable in web mode.
+  if (path.includes("UNREADABLE")) throw new Error(`cannot decode image: ${path}`);
   return { image: svgThumb("face") };
 }
 

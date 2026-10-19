@@ -678,6 +678,7 @@
   }
 
   let peopleFaces = $state<Record<number, FaceRow[]>>({});
+  let deadFaces = $state<Set<number>>(new Set());
   let clusterState = $state<{ processed: number; total: number } | null>(null);
 
   async function runVerify() {
@@ -735,6 +736,11 @@
     try {
       const faces = await facesInCluster(cluster.id);
       peopleFaces = { ...peopleFaces, [cluster.id]: faces };
+      // Fresh attempt: drop stale unreadable flags for these faces (a
+      // reconnected volume reads fine again).
+      const alive = new Set(deadFaces);
+      for (const f of faces) alive.delete(f.id);
+      deadFaces = alive;
       const seen = new Set<string>();
       const rows = faces
         .filter((f) => {
@@ -782,7 +788,12 @@
     try {
       await unassignFace(faceId);
       people = await clustersList();
-      peopleFaces = { ...peopleFaces, [clusterId]: await facesInCluster(clusterId) };
+      // Preserve the card's display mode: a collapsed card previews the
+      // first 8 faces (like loadClusterFaces); refetching the full list
+      // here would explode the grid from 8 tiles to the whole cluster.
+      const all = await facesInCluster(clusterId);
+      const shown = openClusterId === clusterId ? all : all.slice(0, 8);
+      peopleFaces = { ...peopleFaces, [clusterId]: shown };
       void loadPersonOptions();
       toast = "Removed that face from this person";
     } catch (e) {
@@ -1082,6 +1093,7 @@
 
   async function loadClusterFaces() {
     const next: Record<number, FaceRow[]> = {};
+    deadFaces = new Set();
     for (const c of people) {
       try {
         next[c.id] = (await facesInCluster(c.id)).slice(0, 8);
@@ -1139,7 +1151,9 @@
       const { image } = await faceThumb(f.path, f.x, f.y, f.width, f.height, 160);
       if (image) thumbs[key] = thumbSrc(image);
     } catch {
-      /* unreadable face crop */
+      // Source file unreadable (dead volume): remember so the tile says so
+      // instead of looking forever like a pending load.
+      deadFaces = new Set(deadFaces).add(f.id);
     }
   }
 
@@ -2084,7 +2098,10 @@
                       {#if thumbs[`face:${face.id}`]}
                         <img src={thumbs[`face:${face.id}`]} alt="detected face" loading="lazy" />
                       {:else}
-                        <span class="placeholder">…</span>
+                        <span
+                          class="placeholder"
+                          title={deadFaces.has(face.id) ? "Source file unreadable" : "Loading face…"}
+                        >{deadFaces.has(face.id) ? "unreadable" : "…"}</span>
                       {/if}
                     </div>
                     <figcaption>
