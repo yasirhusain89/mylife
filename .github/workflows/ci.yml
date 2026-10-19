@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Full macOS suite; superseded runs are cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    name: full suite (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # package.json has no `packageManager` pin, so use pnpm 9.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (svelte-check)
+        run: pnpm check
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # scripts/build-engine.sh takes no flags; it picks swiftc via
+      # $SWIFTC > xcrun > ~/toolchains fallback and emits
+      # src-tauri/binaries/engine-<target>. macOS runners ship Xcode CLT.
+      - name: Build Swift engine sidecar
+        run: bash scripts/build-engine.sh
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      # Both Playwright configs only define the chromium project, so install
+      # chromium only. No --with-deps: that flag installs apt packages and is
+      # Linux-only; macOS runners already carry the system dependencies.
+      - name: Install Playwright chromium
+        run: pnpm exec playwright install chromium
+
+      - name: E2E tests (web mode)
+        run: pnpm test:e2e
+
+      - name: E2E tests (Rust read API)
+        run: pnpm test:e2e:api
+
+      # Neither Playwright config sets `reporter`, so the default `list`
+      # reporter is used and no playwright-report/ HTML dir is written.
+      # Traces (on-first-retry / on-first-failure) land in test-results/.
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: test-results/
+          if-no-files-found: warn
