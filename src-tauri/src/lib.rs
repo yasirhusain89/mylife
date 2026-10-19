@@ -1,5 +1,6 @@
 mod db;
 mod engine;
+mod geofences;
 
 use serde::Serialize;
 use rusqlite::params;
@@ -863,6 +864,22 @@ fn reverse_geocode_nominatim(lat: f64, lon: f64) -> Result<serde_json::Value, St
         .map_err(|e| format!("geocode body: {e}"))
 }
 
+/// Nominatim `boundingbox`: [south, north, west, east] as strings.
+/// Rejects inverted or degenerate boxes so junk never becomes a fence.
+fn parse_nominatim_bbox(body: &serde_json::Value) -> Option<(f64, f64, f64, f64)> {
+    let b = body.get("boundingbox")?.as_array()?;
+    if b.len() != 4 {
+        return None;
+    }
+    let n = |i: usize| b.get(i)?.as_str()?.parse::<f64>().ok();
+    let (s, n_, w, e) = (n(0)?, n(1)?, n(2)?, n(3)?);
+    if s <= n_ && w <= e && (n_ - s) < 180.0 && (e - w) < 360.0 {
+        Some((s, n_, w, e))
+    } else {
+        None
+    }
+}
+
 /// Fills `events.place` for every event that has coordinates but no name yet.
 /// Cache-first per ~100m cell; network lookups are throttled to one per
 /// second. A single failed lookup never aborts the run — it is counted and
@@ -902,6 +919,27 @@ async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, S
                         Some(p)
                     }
                     None => {
+                        // Geofence reuse: a cached bounding box covering this
+                        // point answers without a network round-trip.
+                        if let Ok(Some(p)) =
+                            db::geocode_covering(&conn, t.latitude, t.longitude)
+                        {
+                            cached += 1;
+                            // Pin the exact cell too, so the next lookup and
+                            // the cluster-time naming hit it directly.
+                            let _ = db::geocode_cache_store(&conn, lat_key, lon_key, &p, None);
+                            seen.insert(cell, Some(p.clone()));
+                            Some(p)
+                        } else if let Some(label) = geofences::static_geofence(t.latitude, t.longitude) {
+                            // Offline basic categorization (state/country).
+                            // Deliberately NOT pinned to the cache: the coarse
+                            // label stays on this event, while precise network
+                            // results keep flowing into their own cells.
+                            cached += 1;
+                            let label = label.to_string();
+                            seen.insert(cell, Some(label.clone()));
+                            Some(label)
+                        } else {
                         if let Some(prev) = last_request {
                             let elapsed = prev.elapsed();
                             if elapsed < GEOCODE_MIN_GAP {
@@ -909,11 +947,12 @@ async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, S
                             }
                         }
                         last_request = Some(std::time::Instant::now());
-                        let fetched: Option<String> =
+                        let fetched: Option<(String, Option<(f64, f64, f64, f64)>)> =
                             match reverse_geocode_nominatim(t.latitude, t.longitude) {
                                 Ok(body) => body
                                     .get("address")
-                                    .and_then(db::format_place_nominatim),
+                                    .and_then(db::format_place_nominatim)
+                                    .map(|p| (p, parse_nominatim_bbox(&body))),
                                 Err(e) => {
                                     let _ = app.emit(
                                         "geocode-error",
@@ -923,10 +962,10 @@ async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, S
                                 }
                             };
                         match fetched {
-                            Some(p) => {
+                            Some((p, bbox)) => {
                                 resolved += 1;
                                 // A poisoned cache write must not fail the run.
-                                let _ = db::geocode_cache_store(&conn, lat_key, lon_key, &p);
+                                let _ = db::geocode_cache_store(&conn, lat_key, lon_key, &p, bbox);
                                 seen.insert(cell, Some(p.clone()));
                                 Some(p)
                             }
@@ -936,6 +975,7 @@ async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, S
                                 None
                             }
                         }
+                        } // end fence-miss: network path above
                     }
                 },
             };
@@ -1906,6 +1946,7 @@ mod export_tests {
 #[cfg(test)]
 mod geocode_tests {
     use super::reverse_geocode_nominatim;
+    use crate::parse_nominatim_bbox;
 
     /// Live check of the Nominatim request path (TLS, headers, JSON shape).
     /// Ignored by default so the suite stays hermetic; run explicitly to
@@ -1919,5 +1960,36 @@ mod geocode_tests {
             .and_then(crate::db::format_place_nominatim)
             .expect("address formats to a label");
         assert!(place.contains("San Francisco"), "unexpected label: {place}");
+    }
+
+    #[test]
+    fn static_geofences_categorize_offline() {
+        use crate::geofences::static_geofence;
+        assert_eq!(
+            static_geofence(37.7749, -122.4194),
+            Some("California, United States")
+        );
+        assert_eq!(static_geofence(13.0827, 80.2707), Some("India"));
+        assert_eq!(static_geofence(48.8566, 2.3522), Some("France"));
+        assert_eq!(
+            static_geofence(0.0, -140.0),
+            None,
+            "open Pacific matches no fence"
+        );
+    }
+
+    #[test]
+    fn nominatim_bbox_parses_and_rejects_junk() {
+        let body = serde_json::json!({"boundingbox": ["37.7", "37.8", "-122.5", "-122.4"]});
+        assert_eq!(
+            parse_nominatim_bbox(&body),
+            Some((37.7, 37.8, -122.5, -122.4))
+        );
+        let bad = serde_json::json!({"boundingbox": ["37.8", "37.7", "-122.4", "-122.5"]});
+        assert_eq!(parse_nominatim_bbox(&bad), None, "inverted box rejected");
+        let short = serde_json::json!({"boundingbox": ["1", "2"]});
+        assert_eq!(parse_nominatim_bbox(&short), None, "truncated box rejected");
+        let none = serde_json::json!({});
+        assert_eq!(parse_nominatim_bbox(&none), None, "missing box rejected");
     }
 }

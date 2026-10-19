@@ -2,7 +2,7 @@
 
 On-device library management for photo and video. Tauri v2 + SvelteKit frontend, Swift engine sidecar (Vision, CoreML, AVFoundation), SQLite index. No cloud sync — the library never leaves the machine.
 
-Current capabilities: folder import with metadata enrichment, cleanup (exact-duplicate detection, blur scoring, Trash-based deletion), people clustering (on-device face detection + feature-print clustering), event clustering (time + GPS, with cached OpenStreetMap place names — the only network call), user-curated albums, per-event/per-album exports for Google Drive (full quality) and WhatsApp (1280px recode, video included), and highlight-video slideshows mixing photos with video clips (original camera audio).
+Current capabilities: folder import with metadata enrichment, cleanup (exact-duplicate detection, blur scoring, Trash-based deletion), people clustering (on-device face detection + feature-print clustering), event clustering (time + GPS, with offline state/country fences plus cached OpenStreetMap place names — the only network call), user-curated albums, per-event/per-album exports for Google Drive (full quality) and WhatsApp (1280px recode, video included), and highlight-video slideshows mixing photos with video clips (original camera audio).
 
 ## Develop
 

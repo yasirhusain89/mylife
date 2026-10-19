@@ -16,6 +16,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, include_str!("../migrations/007_geocode.sql")),
     (8, include_str!("../migrations/008_person_names.sql")),
     (9, include_str!("../migrations/009_scene_tags.sql")),
+    (10, include_str!("../migrations/010_geofences.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -932,15 +933,39 @@ pub fn geocode_cache_store(
     lat_key: f64,
     lon_key: f64,
     place: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
 ) -> Result<(), String> {
+    let (min_lat, max_lat, min_lon, max_lon) = match bbox {
+        Some((a, b, c, d)) => (Some(a), Some(b), Some(c), Some(d)),
+        None => (None, None, None, None),
+    };
     conn.execute(
-        "INSERT INTO geocode_cache (lat_key, lon_key, place, fetched_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (lat_key, lon_key) DO UPDATE SET place = excluded.place, fetched_at = excluded.fetched_at",
-        params![lat_key, lon_key, place, now()],
+        "INSERT INTO geocode_cache (lat_key, lon_key, place, fetched_at, min_lat, max_lat, min_lon, max_lon)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (lat_key, lon_key) DO UPDATE SET place = excluded.place, fetched_at = excluded.fetched_at,
+             min_lat = excluded.min_lat, max_lat = excluded.max_lat,
+             min_lon = excluded.min_lon, max_lon = excluded.max_lon",
+        params![lat_key, lon_key, place, now(), min_lat, max_lat, min_lon, max_lon],
     )
     .map_err(|e| format!("geocode store: {e}"))?;
     Ok(())
+}
+
+/// Geofence reuse: the cached place whose bounding box contains the point,
+/// smallest box wins (a neighbourhood beats its city). None when no cached
+/// box covers the point — the caller then hits the network.
+pub fn geocode_covering(conn: &Connection, lat: f64, lon: f64) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT place FROM geocode_cache
+         WHERE min_lat IS NOT NULL AND ?1 BETWEEN min_lat AND max_lat
+           AND ?2 BETWEEN min_lon AND max_lon
+         ORDER BY (max_lat - min_lat) * (max_lon - min_lon) ASC, fetched_at DESC
+         LIMIT 1",
+        params![lat, lon],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("geocode covering: {e}"))
 }
 
 pub fn set_event_place(conn: &Connection, event_id: i64, place: &str) -> Result<(), String> {
@@ -1804,10 +1829,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 9, "user_version tracks the highest applied migration");
+        assert_eq!(v, 10, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -2178,7 +2203,7 @@ mod tests {
             [],
         )
         .unwrap();
-        geocode_cache_store(&conn, round_coord(37.7749), round_coord(-122.4194), "San Francisco, California")
+        geocode_cache_store(&conn, round_coord(37.7749), round_coord(-122.4194), "San Francisco, California", None)
             .unwrap();
 
         let (events, _) = cluster_events(&conn, 48.0, 500.0).unwrap();
@@ -2301,7 +2326,7 @@ mod tests {
         assert!((round_coord(-122.41944) - -122.419).abs() < 1e-9);
 
         assert!(geocode_cache_lookup(&conn, 37.775, -122.419).unwrap().is_none());
-        geocode_cache_store(&conn, 37.775, -122.419, "San Francisco, California").unwrap();
+        geocode_cache_store(&conn, 37.775, -122.419, "San Francisco, California", None).unwrap();
         assert_eq!(
             geocode_cache_lookup(&conn, 37.775, -122.419).unwrap().as_deref(),
             Some("San Francisco, California")
@@ -2326,6 +2351,34 @@ mod tests {
         assert_eq!(format_place_nominatim(&addr).as_deref(), Some("Singapore"), "no doubled locality");
         let addr = serde_json::json!({"road": "Some Street"});
         assert!(format_place_nominatim(&addr).is_none(), "street alone is not a place label");
+    }
+
+    #[test]
+    fn geocode_covering_reuses_fences() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        geocode_cache_store(
+            &conn, 37.775, -122.419, "Mission District",
+            Some((37.76, 37.78, -122.43, -122.41)),
+        )
+        .unwrap();
+        // Same neighbourhood, different 100m cell: the fence answers.
+        assert_eq!(
+            geocode_covering(&conn, 37.771, -122.415).unwrap().as_deref(),
+            Some("Mission District")
+        );
+        // Elsewhere: no fence.
+        assert!(geocode_covering(&conn, 40.7128, -74.006).unwrap().is_none());
+        // Overlapping boxes: the smallest wins.
+        geocode_cache_store(
+            &conn, 37.7, -122.4, "San Francisco, California",
+            Some((37.0, 38.0, -123.0, -122.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            geocode_covering(&conn, 37.771, -122.415).unwrap().as_deref(),
+            Some("Mission District")
+        );
     }
 }
 
