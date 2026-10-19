@@ -473,6 +473,20 @@ test("removing a face keeps the collapsed preview compact", async ({ page }) => 
   await expect(card.locator("figure")).toHaveCount(8);
 });
 
+test("cluster review steps through every photo with per-photo reject", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Review all" }).first().click();
+  await expect(page.getByText("1 of 4 · reviewing Cluster 1")).toBeVisible();
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("2 of 4 · reviewing Cluster 1")).toBeVisible();
+  await page.getByRole("button", { name: /Not Cluster 1/ }).click();
+  await expect(page.getByText(/Removed .* from Cluster 1/)).toBeVisible();
+  await expect(page.getByText("2 of 3 · reviewing Cluster 1")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("3 faces")).toBeVisible();
+});
+
 test("faces on unreadable files say so instead of loading forever", async ({ page }) => {
   // Import from a root whose files cannot be decoded (mock mirrors the
   // engine's "cannot decode image" failure for UNREADABLE paths).

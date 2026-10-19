@@ -223,8 +223,11 @@
   let eventMembers = $state<Record<number, EventAssetRow[]>>({});
   let resolvingPlaces = $state(false);
   let geocodeState = $state<GeocodeProgress | null>(null);
-  // Lightbox viewer over the current library page (index into `assets`).
+  // Lightbox viewer over the current library page (index into `assets`),
+  // or over an explicit list (cluster review mode).
   let viewer = $state<{ index: number } | null>(null);
+  let viewerList = $state<AssetRow[] | null>(null);
+  let reviewCluster = $state<{ id: number; name: string } | null>(null);
   let viewerSrc = $state<string | null>(null);
   let viewerError = $state<string | null>(null);
   let viewerTags = $state<SceneTag[]>([]);
@@ -484,13 +487,78 @@
   }
 
   // Lightbox viewer: full-size image via the engine, video via asset URL.
+  function viewerRows(): AssetRow[] {
+    return viewerList ?? assets;
+  }
+
   function openViewer(index: number) {
     if (index < 0 || index >= assets.length) return;
     viewer = { index };
+    viewerList = null;
+    reviewCluster = null;
     viewerSrc = null;
     viewerError = null;
     viewerTags = [];
     void loadViewer(assets[index]);
+  }
+
+  // Cluster review: step through every source photo full-size to accept
+  // (tag once on the card) or reject (per-photo removal below) the person.
+  function openReview(cluster: FaceClusterRow) {
+    const paths = clusterSourcePaths(cluster.id);
+    if (paths.length === 0) {
+      error = "No photos to review in this cluster yet — expand Show photos first.";
+      return;
+    }
+    viewerList = paths.map((path) => {
+      const row = assets.find((a) => a.path === path);
+      if (row) return row;
+      const name = path.split("/").pop() ?? path;
+      return {
+        id: -1, path, name, ext: name.split(".").pop() ?? "", kind: "image" as const,
+        mime: null, sizeBytes: 0, modified: 0, capturedAt: null, width: null,
+        height: null, duration: null, favorite: 0, missing: 0, sha256: null
+      };
+    });
+    reviewCluster = { id: cluster.id, name: cluster.name ?? `Cluster ${cluster.id}` };
+    viewer = { index: 0 };
+    viewerSrc = null;
+    viewerError = null;
+    viewerTags = [];
+    void loadViewer(viewerList[0]);
+  }
+
+  async function removePhotoFromReview() {
+    const list = viewerList;
+    const rc = reviewCluster;
+    if (!viewer || !list || !rc) return;
+    const photo = list[viewer.index];
+    try {
+      const faces = (peopleFaces[rc.id] ?? []).filter((f) => f.path === photo.path);
+      let removed = 0;
+      for (const f of faces) {
+        await unassignFace(f.id);
+        removed++;
+      }
+      people = await clustersList();
+      peopleFaces = { ...peopleFaces, [rc.id]: await facesInCluster(rc.id) };
+      void loadPersonOptions();
+      const next = list.filter((a) => a.path !== photo.path);
+      if (next.length === 0) {
+        closeViewer();
+        toast = "Removed the last photo — cluster is empty";
+        return;
+      }
+      viewerList = next;
+      viewer = { index: Math.min(viewer.index, next.length - 1) };
+      viewerSrc = null;
+      viewerError = null;
+      viewerTags = [];
+      void loadViewer(next[viewer.index]);
+      toast = `Removed ${photo.name} (${removed} face${removed === 1 ? "" : "s"}) from ${rc.name}`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
   }
 
   async function loadViewer(a: AssetRow) {
@@ -518,14 +586,17 @@
   }
 
   function stepViewer(delta: number) {
-    if (!viewer || assets.length === 0) return;
-    const next = (viewer.index + delta + assets.length) % assets.length;
+    const rows = viewerRows();
+    if (!viewer || rows.length === 0) return;
+    const next = (viewer.index + delta + rows.length) % rows.length;
     viewer = { index: next };
-    void loadViewer(assets[next]);
+    void loadViewer(rows[next]);
   }
 
   function closeViewer() {
     viewer = null;
+    viewerList = null;
+    reviewCluster = null;
     viewerSrc = null;
     viewerError = null;
   }
@@ -2065,6 +2136,13 @@
               <button class="tiny" onclick={() => void toggleClusterPhotos(cluster)}>
                 {openClusterId === cluster.id ? "Hide photos" : "Show photos"}
               </button>
+              <button
+                class="tiny"
+                title="Step through every photo full-size to accept or reject"
+                onclick={() => void openReview(cluster)}
+              >
+                Review all
+              </button>
               <button class="tiny" onclick={() => void doRenameCluster(cluster)}>
                 {cluster.name ? "Rename" : "Tag name"}
               </button>
@@ -2494,7 +2572,8 @@
   {/if}
 
   {#if viewer}
-    {@const current = assets[viewer.index]}
+    {@const rows = viewerRows()}
+    {@const current = rows[viewer.index]}
     {#if current}
       <div
         class="scrim"
@@ -2505,23 +2584,33 @@
       >
         <div class="viewer">
           <div class="viewer-bar">
-            <span class="hint">{viewer.index + 1} of {assets.length}</span>
+            <span class="hint">{viewer.index + 1} of {rows.length}{reviewCluster ? ` · reviewing ${reviewCluster.name}` : ""}</span>
             <span class="viewer-name" title={current.name}>{current.name}</span>
             <button
               type="button"
               class="star"
               class:on={current.favorite !== 0}
-              title={current.favorite !== 0 ? "Unstar" : "Star"}
+              title={current.id < 0 ? "Reopen from the Library to star" : current.favorite !== 0 ? "Unstar" : "Star"}
               aria-pressed={current.favorite !== 0}
+              disabled={current.id < 0}
               onclick={() => void toggleFavorite(current)}
             >★</button>
-            <button
-              type="button"
-              class="tiny"
-              aria-label={`Similar to ${current.name}`}
-              title="More like this photo"
-              onclick={() => void openSimilar(current)}
-            >Similar</button>
+            {#if !reviewCluster}
+              <button
+                type="button"
+                class="tiny"
+                aria-label={`Similar to ${current.name}`}
+                title="More like this photo"
+                onclick={() => void openSimilar(current)}
+              >Similar</button>
+            {:else}
+              <button
+                type="button"
+                class="tiny"
+                title={`Remove this photo from ${reviewCluster.name}`}
+                onclick={() => void removePhotoFromReview()}
+              >Not {reviewCluster.name} — remove</button>
+            {/if}
             <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
           </div>
           <div class="viewer-stage">
