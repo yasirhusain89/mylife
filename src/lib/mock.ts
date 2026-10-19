@@ -6,6 +6,8 @@ import type {
   ClusterEventsSummary,
   DuplicateGroup,
   DuplicateMember,
+  EmbedProgress,
+  EmbedSummary,
   NearDupeSummary,
   NearGroup,
   EnrichProgress,
@@ -31,6 +33,7 @@ import type {
   ScanRoot,
   SceneTag,
   SceneTagCount,
+  SimilarHit,
   TagProgress,
   TagScenesSummary,
   ClusterProgress
@@ -344,6 +347,33 @@ export function onNearProgress(_cb: (p: CleanupProgress) => void): Promise<() =>
   return Promise.resolve(() => {});
 }
 
+/**
+ * Deterministic placeholder for visual similarity: the web mock has no
+ * engine vectors, so neighbours rank by id distance to the query (closest
+ * ids first, ties broken by id). The query photo itself is always excluded.
+ */
+export async function similarTo(assetId: number, limit = 12): Promise<SimilarHit[]> {
+  return assets
+    .filter((a) => a.id !== assetId)
+    .map((a) => ({
+      id: a.id,
+      path: a.path,
+      name: a.name,
+      kind: a.kind,
+      score: 1 / (1 + Math.abs(a.id - assetId))
+    }))
+    .sort((x, y) => y.score - x.score || x.id - y.id)
+    .slice(0, limit);
+}
+
+export async function embedLibrary(): Promise<EmbedSummary> {
+  return { embedded: assets.length, failed: 0 };
+}
+
+export function onEmbedProgress(_cb: (p: EmbedProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
 export async function keepCopy(groupId: number, keepId: number): Promise<DuplicateGroup[]> {
   groups = groups.map((g) => (g.id === groupId ? { ...g, keptId: keepId } : g));
   return groups;
@@ -395,7 +425,7 @@ export async function assetTags(assetId: number): Promise<SceneTag[]> {
 }
 
 export async function runPostImport(): Promise<PipelineSummary> {
-  return { enriched: 8, hashed: 8, scored: 8, events: 1, tagged: 2, places: 0, failed: 0 };
+  return { enriched: 8, hashed: 8, scored: 8, events: 1, tagged: 2, embedded: 8, places: 0, failed: 0 };
 }
 
 export function onPipelineProgress(_cb: (p: PipelineProgress) => void): Promise<() => void> {

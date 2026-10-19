@@ -73,6 +73,9 @@ export const findSimilar = pick("findSimilar");
 export const nearGroupsList = pick("nearGroupsList");
 export const keepNearCopy = pick("keepNearCopy");
 export const onNearProgress = pick("onNearProgress");
+export const similarTo = pick("similarTo");
+export const embedLibrary = pick("embedLibrary");
+export const onEmbedProgress = pick("onEmbedProgress");
 export const duplicatesList = pick("duplicatesList");
 export const keepCopy = pick("keepCopy");
 export const cleanupStats = pick("cleanupStats");
@@ -142,6 +145,8 @@ export type {
   ClusterProgress,
   DuplicateGroup,
   DuplicateMember,
+  EmbedProgress,
+  EmbedSummary,
   EnrichProgress,
   NearDupeSummary,
   NearGroup,
@@ -167,6 +172,7 @@ export type {
   ScanRoot,
   SceneTag,
   SceneTagCount,
+  SimilarHit,
   TagProgress,
   TagScenesSummary
 } from "./library";

@@ -189,6 +189,7 @@ export type PipelineSummary = {
   scored: number;
   events: number;
   tagged: number;
+  embedded: number;
   places: number;
   failed: number;
 };
@@ -327,6 +328,39 @@ export function keepNearCopy(groupId: number, keepId: number): Promise<NearGroup
 
 export function onNearProgress(cb: (p: CleanupProgress) => void): Promise<() => void> {
   return listen<CleanupProgress>("near-progress", (e) => cb(e.payload));
+}
+
+// MARK: - Visual similarity (similar-photos v1: image-query neighbours)
+
+export type SimilarHit = {
+  id: number;
+  path: string;
+  name: string;
+  kind: string;
+  score: number;
+};
+
+export type EmbedSummary = {
+  embedded: number;
+  failed: number;
+};
+
+export type EmbedProgress = {
+  processed: number;
+  embedded: number;
+  failed: number;
+};
+
+export function similarTo(assetId: number, limit = 12): Promise<SimilarHit[]> {
+  return invoke("similar_to", { assetId, limit });
+}
+
+export function embedLibrary(): Promise<EmbedSummary> {
+  return invoke("embed_library");
+}
+
+export function onEmbedProgress(cb: (p: EmbedProgress) => void): Promise<() => void> {
+  return listen<EmbedProgress>("embed-progress", (e) => cb(e.payload));
 }
 
 export function duplicatesList(): Promise<DuplicateGroup[]> {

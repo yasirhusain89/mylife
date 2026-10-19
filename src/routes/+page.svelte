@@ -34,6 +34,7 @@
     duplicatesList,
     engineThumb,
     findSimilar,
+    similarTo,
     nearGroupsList,
     keepNearCopy,
     onNearProgress,
@@ -79,6 +80,7 @@
     type EnrichProgress,
     type ImportProgress,
     type LibraryStats,
+    type SimilarHit,
     type PipelineProgress,
     type ScanRoot,
     type SceneTag,
@@ -223,6 +225,9 @@
   let viewerSrc = $state<string | null>(null);
   let viewerError = $state<string | null>(null);
   let viewerTags = $state<SceneTag[]>([]);
+  // Image-query visual neighbours ("more like this photo").
+  let similar = $state<{ assetId: number; name: string; rows: SimilarHit[] } | null>(null);
+  let similarLoading = $state(false);
   // Library multi-select: checkbox set + batch actions.
   let selectMode = $state(false);
   let selected = $state<Set<number>>(new Set());
@@ -521,6 +526,21 @@
     viewerError = null;
   }
 
+  async function openSimilar(a: AssetRow) {
+    similarLoading = true;
+    similar = { assetId: a.id, name: a.name, rows: [] };
+    try {
+      const rows = await similarTo(a.id, 12);
+      similar = { assetId: a.id, name: a.name, rows };
+      void loadThumbs(rows.map((m) => ({ path: m.path }) as AssetRow));
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+      similar = null;
+    } finally {
+      similarLoading = false;
+    }
+  }
+
   function viewerKey(e: KeyboardEvent) {
     if (!viewer) return;
     if (e.key === "Escape") closeViewer();
@@ -563,6 +583,7 @@
         `${summary.scored} scored`,
         `${summary.events} events`,
         `${summary.tagged} tagged`,
+        `${summary.embedded} embedded`,
         summary.places > 0 ? `${summary.places} places` : null,
         summary.failed > 0 ? `${summary.failed} failed` : null
       ].filter((b) => b !== null);
@@ -1914,6 +1935,15 @@
                 {#if asset.width && asset.height} · {asset.width}×{asset.height}{/if}
                 · {fmtBytes(asset.sizeBytes)}
               </span>
+              <span class="row-actions">
+                <button
+                  type="button"
+                  class="tiny"
+                  aria-label={`Similar to ${asset.name}`}
+                  title="More like this photo"
+                  onclick={() => void openSimilar(asset)}
+                >Similar</button>
+              </span>
             </figcaption>
           </figure>
         {/each}
@@ -2428,6 +2458,13 @@
               aria-pressed={current.favorite !== 0}
               onclick={() => void toggleFavorite(current)}
             >★</button>
+            <button
+              type="button"
+              class="tiny"
+              aria-label={`Similar to ${current.name}`}
+              title="More like this photo"
+              onclick={() => void openSimilar(current)}
+            >Similar</button>
             <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
           </div>
           <div class="viewer-stage">
@@ -2460,6 +2497,46 @@
         </div>
       </div>
     {/if}
+  {/if}
+
+  {#if similar}
+    <div
+      class="scrim"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Similar to ${similar.name}`}
+      tabindex={-1}
+    >
+      <div class="dialog wide">
+        <h3>Similar to {similar.name}</h3>
+        {#if similarLoading}
+          <p class="hint">Finding similar photos…</p>
+        {:else if similar.rows.length}
+          <div class="members">
+            {#each similar.rows as m (m.id)}
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[m.path]}
+                    <img src={thumbs[m.path]} alt={m.name} loading="lazy" />
+                  {:else}
+                    <span class="placeholder">IMG</span>
+                  {/if}
+                </div>
+                <figcaption>
+                  <span class="name" title={m.path}>{m.name}</span>
+                  <span class="meta">{Math.round(m.score * 100)}% match</span>
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">No similar photos yet — they appear after the library is embedded.</p>
+        {/if}
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (similar = null)}>Back to Library</button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if nameDialog}

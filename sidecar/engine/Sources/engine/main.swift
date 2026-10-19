@@ -894,6 +894,69 @@ func dHashBatch(paths: [String]) -> [String: Any] {
     return ["count": paths.count, "results": results]
 }
 
+// MARK: - Visual similarity embeddings
+
+/// Image-query similarity encoder: Apple's built-in Vision feature print
+/// (VNGenerateImageFeaturePrint, 2048 f32, zero download — the v1 pick over
+/// MobileCLIP per docs/plans/similar-photos.md). Returned as base64 of the
+/// raw float bytes plus the element count, so the Rust side can
+/// cosine-compare without re-decoding images.
+func embedImage(path: String) throws -> [String: Any] {
+    guard
+        let src = CGImageSourceCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+        let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+    else { throw EngineError(message: "cannot decode image: \(path)") }
+    let req = VNGenerateImageFeaturePrintRequest()
+    do {
+        try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+    } catch {
+        throw EngineError(message: "feature print failed: \(error)")
+    }
+    guard let obs = req.results?.first as? VNFeaturePrintObservation else {
+        throw EngineError(message: "no feature print for: \(path)")
+    }
+    let raw = obs.data
+    let dim = obs.elementCount
+    if obs.elementType == .double {
+        // Normalize doubles to f32 so the wire format is always f32 LE.
+        let count = raw.count / 8
+        var floats = [Float](repeating: 0, count: count)
+        raw.withUnsafeBytes { ptr in
+            let doubles = ptr.bindMemory(to: Double.self)
+            for i in 0..<count { floats[i] = Float(doubles[i]) }
+        }
+        let bytes = floats.withUnsafeBytes { Data($0) }
+        return ["path": path, "dim": count, "vector": bytes.base64EncodedString()]
+    }
+    guard obs.elementType == .float, raw.count == dim * 4 else {
+        throw EngineError(message: "unsupported feature-print element type for: \(path)")
+    }
+    return ["path": path, "dim": dim, "vector": raw.base64EncodedString()]
+}
+
+/// Batch encoder mirroring dHashBatch, with scan-style progress events so
+/// the Rust side can stream `embed-progress` per flush.
+func embedBatch(paths: [String]) -> [String: Any] {
+    var results: [[String: Any]] = []
+    results.reserveCapacity(paths.count)
+    for (i, path) in paths.enumerated() {
+        do {
+            var entry = try embedImage(path: path)
+            entry["ok"] = true
+            results.append(entry)
+        } catch {
+            results.append(["path": path, "ok": false, "error": "\(error)"])
+        }
+        if (i + 1) % 20 == 0 || i + 1 == paths.count {
+            write(makeEvent(id: requestID, event: "progress", data: [
+                "processed": i + 1, "total": paths.count,
+            ]))
+        }
+    }
+    return ["count": paths.count, "results": results]
+}
+
 // MARK: - Image quality
 
 /// Variance of the Laplacian over a downscaled luma image: the classic focus /
@@ -1127,6 +1190,19 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
             throw EngineError(message: "dhash_batch accepts at most 500 paths, got \(paths.count)")
         }
         return dHashBatch(paths: paths)
+
+    case "embed":
+        guard let path = str("path") else { throw EngineError(message: "embed requires 'path'") }
+        return try embedImage(path: path)
+
+    case "embed_batch":
+        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
+            throw EngineError(message: "embed_batch requires a non-empty 'paths' array")
+        }
+        if paths.count > 500 {
+            throw EngineError(message: "embed_batch accepts at most 500 paths, got \(paths.count)")
+        }
+        return embedBatch(paths: paths)
 
     case "faces":
         guard let path = str("path") else { throw EngineError(message: "faces requires 'path'") }

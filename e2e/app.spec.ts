@@ -691,3 +691,36 @@ test("empty search result shows the no-assets hint", async ({ page }) => {
   await expect(page.getByText("No assets yet — add a folder to build the index.")).toBeVisible();
   await expect(page.locator(".grid figure")).toHaveCount(0);
 });
+
+// ---------------------------------------------------------------------------
+// Area 5: Visual similarity (image-query "more like this photo")
+// ---------------------------------------------------------------------------
+
+test("similar button opens results that exclude the query photo", async ({ page }) => {
+  await page.getByRole("button", { name: "Similar to IMG_20261007_185817.jpg" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Similar to IMG_20261007_185817.jpg" });
+  await expect(dialog).toBeVisible();
+  // Neighbours render; the query photo itself is never a result.
+  await expect(dialog.getByText("IMG_20261007_185822.jpg")).toBeVisible();
+  await expect(dialog.locator("figure", { hasText: "IMG_20261007_185817.jpg" })).toHaveCount(0);
+  await expect(dialog.locator("figure")).toHaveCount(7);
+  await dialog.getByRole("button", { name: "Back to Library" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+});
+
+test("viewer similar button opens results and closing returns", async ({ page }) => {
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  const viewer = page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" });
+  await expect(viewer).toBeVisible();
+  await viewer.getByRole("button", { name: "Similar to IMG_20261007_185817.jpg" }).click();
+  const dialog = page.getByRole("dialog", { name: "Similar to IMG_20261007_185817.jpg" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("figure")).toHaveCount(7);
+  await dialog.getByRole("button", { name: "Back to Library" }).click();
+  await expect(dialog).toBeHidden();
+  // The viewer underneath is untouched; Escape still closes it.
+  await page.keyboard.press("Escape");
+  await expect(viewer).toBeHidden();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+});

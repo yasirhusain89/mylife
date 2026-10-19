@@ -623,6 +623,113 @@ async fn tag_scenes(app: tauri::AppHandle) -> Result<TagScenesSummary, String> {
     .map_err(|e| format!("tag task join failed: {e}"))?
 }
 
+// MARK: - Visual similarity (similar-photos v1)
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedSummary {
+    pub embedded: i64,
+    pub failed: i64,
+}
+
+/// Backfills Vision feature-print vectors for readable images missing one.
+/// One engine round-trip per batch of 100; a single bad file never aborts.
+/// One attempt per asset per invocation: failures stay vector-less (and are
+/// retried on the next call) instead of spinning the loop.
+pub fn run_embed_library(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    mut on_progress: impl FnMut(i64, i64),
+) -> Result<EmbedSummary, String> {
+    let (mut embedded, mut failed) = (0i64, 0i64);
+    // A failed embed leaves no row, so without this guard the same broken
+    // file would be retried forever (mirrors run_enrich/run_quality).
+    let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    loop {
+        let batch: Vec<(i64, String)> = db::embed_candidates(conn, db::VECTOR_MODEL, 100)?
+            .into_iter()
+            .filter(|(id, _)| !attempted.contains(id))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        let paths: Vec<String> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let reply = engine::call_with_events(
+            engine_state,
+            "embed_batch",
+            Some(json!({ "paths": paths })),
+            Duration::from_secs(300),
+            &mut |name, data| {
+                if name == "progress" {
+                    let done = data.get("processed").and_then(Value::as_i64).unwrap_or(0);
+                    on_progress(embedded + done, failed);
+                }
+            },
+        )?;
+        let results = reply
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or("embed_batch returned no results array")?;
+        if results.len() != batch.len() {
+            return Err(format!(
+                "embed_batch returned {} results for {} paths",
+                results.len(),
+                batch.len()
+            ));
+        }
+        for ((id, _), result) in batch.iter().zip(results) {
+            attempted.insert(*id);
+            let vector: Option<(Vec<f32>, i64)> =
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    result
+                        .get("vector")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b64_decode(b).ok())
+                        .and_then(|bytes| db::bytes_to_floats(&bytes))
+                        .zip(result.get("dim").and_then(Value::as_i64))
+                } else {
+                    None
+                };
+            match vector {
+                Some((vec, dim)) => match db::save_vector(conn, *id, db::VECTOR_MODEL, dim, &vec) {
+                    Ok(()) => embedded += 1,
+                    Err(_) => failed += 1,
+                },
+                None => failed += 1,
+            }
+        }
+        on_progress(embedded, failed);
+    }
+    Ok(EmbedSummary { embedded, failed })
+}
+
+#[tauri::command]
+async fn embed_library(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        run_embed_library(&conn, &engine_state, |embedded, failed| {
+            let _ = app.emit(
+                "embed-progress",
+                json!({ "processed": embedded + failed, "embedded": embedded, "failed": failed }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("embed task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn similar_to(
+    conn: tauri::State<'_, DbState>,
+    asset_id: i64,
+    limit: Option<i64>,
+) -> Result<Vec<db::SimilarHit>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::similar_to(&conn, asset_id, db::VECTOR_MODEL, limit.unwrap_or(12).clamp(1, 100))
+}
+
 // MARK: - Post-import pipeline
 
 #[derive(Serialize, Clone)]
@@ -641,6 +748,7 @@ pub struct PipelineSummary {
     pub scored: i64,
     pub events: i64,
     pub tagged: i64,
+    pub embedded: i64,
     pub places: i64,
     pub failed: i64,
 }
@@ -746,6 +854,19 @@ pub fn run_post_import(
         }
     };
 
+    let embedded = match run_embed_library(conn, engine_state, |e, f| {
+        emit("embed", e + f, 0);
+    }) {
+        Ok(s) => {
+            failed += s.failed;
+            s.embedded
+        }
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
     let places = match run_fill_cached_places(conn) {
         Ok(n) => {
             emit("places", n, n);
@@ -758,7 +879,7 @@ pub fn run_post_import(
     };
 
     emit("done", 0, 0);
-    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, places, failed })
+    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, embedded, places, failed })
 }
 
 #[tauri::command]
@@ -2111,6 +2232,8 @@ pub fn run() {
             near_keep,
             tag_scenes,
             run_post_import_cmd,
+            embed_library,
+            similar_to,
             scene_tags,
             asset_tags,
             duplicates_list,
@@ -2672,6 +2795,129 @@ mod tests {
             assert_eq!(b64_decode(&b64_encode(&bytes)).unwrap(), bytes, "len {len}");
         }
         assert!(b64_decode("!!!").is_err(), "junk is rejected");
+    }
+
+    /// Writes a 24-bit BMP (ImageIO decodes it; hand-rolled so the test needs
+    /// no image crate): `pixel(x, y)` returns (r, g, b).
+    fn write_bmp(path: &std::path::Path, w: u32, h: u32, mut pixel: impl FnMut(u32, u32) -> (u8, u8, u8)) {
+        let row_stride = ((w * 3 + 3) / 4) * 4;
+        let mut px = vec![0u8; (row_stride * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = pixel(x, y);
+                let o = ((h - 1 - y) * row_stride + x * 3) as usize;
+                px[o] = b;
+                px[o + 1] = g;
+                px[o + 2] = r;
+            }
+        }
+        let mut hdr = [0u8; 54];
+        hdr[0] = b'B';
+        hdr[1] = b'M';
+        hdr[2..6].copy_from_slice(&(54 + px.len() as u32).to_le_bytes());
+        hdr[10] = 54;
+        hdr[14..18].copy_from_slice(&40u32.to_le_bytes());
+        hdr[18..22].copy_from_slice(&w.to_le_bytes());
+        hdr[22..26].copy_from_slice(&h.to_le_bytes());
+        hdr[26..28].copy_from_slice(&1u16.to_le_bytes());
+        hdr[28..30].copy_from_slice(&24u16.to_le_bytes());
+        hdr[34..38].copy_from_slice(&(px.len() as u32).to_le_bytes());
+        let mut out = hdr.to_vec();
+        out.extend_from_slice(&px);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Embeds one file through the engine and decodes the f32 vector.
+    fn embed_vec(state: &engine::EngineState, path: &str) -> (Vec<f32>, i64) {
+        let reply = engine::call_blocking(
+            state,
+            "embed",
+            Some(json!({ "path": path })),
+            Duration::from_secs(120),
+        )
+        .unwrap_or_else(|e| panic!("embed {path}: {e}"));
+        let b64 = reply.get("vector").and_then(Value::as_str).expect("vector field");
+        let dim = reply.get("dim").and_then(Value::as_i64).expect("dim field");
+        let vec = db::bytes_to_floats(&b64_decode(b64).expect("valid base64")).expect("f32 blob");
+        assert_eq!(vec.len() as i64, dim, "dim matches the decoded length");
+        (vec, dim)
+    }
+
+    #[test]
+    fn embed_is_deterministic_and_orders_variants_first() {
+        let dir = std::env::temp_dir().join("ff-embed-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Query: the real icon. Variant: an engine JPEG recode of it (same
+        // pixels, different bytes/size). Unrelated: deterministic noise.
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        assert!(favicon.exists(), "static/favicon.png must exist for the embed test");
+        let query = dir.join("query.png");
+        std::fs::copy(&favicon, &query).unwrap();
+        let variant = dir.join("variant.jpg");
+        let noise = dir.join("noise.bmp");
+        // Xorshift32: deterministic, no RNG dependency.
+        let mut s = 0x12345678u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s >> 8) as u8
+        };
+        write_bmp(&noise, 128, 128, |x, y| (next(), next(), next().wrapping_add((x + y) as u8)));
+
+        let state = engine_state();
+        engine::call_blocking(
+            &state,
+            "compress",
+            Some(json!({
+                "path": query.to_str().unwrap(),
+                "output": variant.to_str().unwrap(),
+                "maxPx": 64,
+                "quality": 0.72,
+            })),
+            Duration::from_secs(60),
+        )
+        .expect("engine compress for the resized variant");
+
+        // Determinism: the same file twice embeds to cosine 1.0.
+        let (v1, dim) = embed_vec(&state, query.to_str().unwrap());
+        let (v2, _) = embed_vec(&state, query.to_str().unwrap());
+        assert!(dim > 0, "the encoder reports a real dimension, got {dim}");
+        assert_eq!(db::cosine(&v1, &v2), 1.0, "identical files embed identically");
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        let summary = run_embed_library(&conn, &state, |_, _| {}).unwrap();
+        assert_eq!((summary.embedded, summary.failed), (3, 0), "all three images embed");
+
+        // A rerun finds no candidates: embedding is idempotent.
+        let again = run_embed_library(&conn, &state, |_, _| {}).unwrap();
+        assert_eq!((again.embedded, again.failed), (0, 0));
+
+        let qid: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path LIKE '%query.png'", [], |r| r.get(0))
+            .unwrap();
+        let hits = db::similar_to(&conn, qid, db::VECTOR_MODEL, 10).unwrap();
+        assert_eq!(hits.len(), 2, "the query photo is excluded");
+        assert!(
+            hits[0].path.ends_with("variant.jpg"),
+            "the resized variant ranks first, got {} @ {}",
+            hits[0].path,
+            hits[0].score
+        );
+        assert!(
+            hits[0].score > hits[1].score,
+            "variant {} beats noise {}",
+            hits[0].score,
+            hits[1].score
+        );
+        eprintln!(
+            "embed ordering: variant={:.4} noise={:.4} dim={dim}",
+            hits[0].score, hits[1].score
+        );
     }
 }
 

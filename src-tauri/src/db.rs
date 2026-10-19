@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (10, include_str!("../migrations/010_geofences.sql")),
     (11, include_str!("../migrations/011_near_dupes.sql")),
     (12, include_str!("../migrations/012_pets.sql")),
+    (13, include_str!("../migrations/013_vectors.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -1920,6 +1921,149 @@ pub fn near_keep(conn: &Connection, group_id: i64, keep_id: i64) -> Result<(), S
     Ok(())
 }
 
+// MARK: - Visual similarity vectors (similar-photos v1)
+
+/// Encoder model shipped in v1: Apple's built-in Vision feature print
+/// (zero download). Stored per row so an opt-in upgrade never re-keys.
+pub const VECTOR_MODEL: &str = "vn-featureprint";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarHit {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub score: f64,
+}
+
+/// Cosine similarity in f64; 0.0 when either side is degenerate so a broken
+/// vector sorts last instead of poisoning the ranking with NaN.
+pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for i in 0..a.len() {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na <= 0.0 || nb <= 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Little-endian f32 bytes, the on-disk form of `vec`.
+pub fn floats_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of `floats_to_bytes`; None on a truncated blob.
+pub fn bytes_to_floats(b: &[u8]) -> Option<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Inserts or replaces one asset's vector for `model`. Re-embedding the same
+/// file is idempotent: the row is overwritten, never duplicated.
+pub fn save_vector(
+    conn: &Connection,
+    asset_id: i64,
+    model: &str,
+    dim: i64,
+    vec: &[f32],
+) -> Result<(), String> {
+    if vec.len() as i64 != dim {
+        return Err(format!(
+            "vector dim mismatch for asset {asset_id}: got {}, want {dim}",
+            vec.len()
+        ));
+    }
+    conn.execute(
+        "INSERT INTO asset_vectors (asset_id, model, dim, vec) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (asset_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, vec = excluded.vec",
+        params![asset_id, model, dim, floats_to_bytes(vec)],
+    )
+    .map_err(|e| format!("save vector: {e}"))?;
+    Ok(())
+}
+
+/// Readable images with no vector for `model` yet, for the embed backfill.
+/// Failures leave no row, so they are retried on the next pass.
+pub fn embed_candidates(conn: &Connection, model: &str, limit: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.path FROM assets a
+             WHERE a.kind = 'image' AND a.missing = 0
+               AND NOT EXISTS (SELECT 1 FROM asset_vectors v WHERE v.asset_id = a.id AND v.model = ?1)
+             ORDER BY a.id LIMIT ?2",
+        )
+        .map_err(|e| format!("prepare embed candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![model, limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query embed candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("embed candidate row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Brute-force cosine over the stored BLOBs for `model`, best first, query
+/// excluded. Libraries here are ≤ ~50k assets: fast enough with no index.
+pub fn similar_to(conn: &Connection, asset_id: i64, model: &str, limit: i64) -> Result<Vec<SimilarHit>, String> {
+    let query: Vec<f32> = conn
+        .query_row(
+            "SELECT vec FROM asset_vectors WHERE asset_id = ?1 AND model = ?2",
+            params![asset_id, model],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("similar query vector: {e}"))?
+        .and_then(|b| bytes_to_floats(&b))
+        .ok_or_else(|| format!("asset {asset_id} has no '{model}' vector yet"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.path, a.name, a.kind, v.vec FROM asset_vectors v
+             JOIN assets a ON a.id = v.asset_id
+             WHERE v.model = ?1 AND v.asset_id != ?2 AND a.missing = 0",
+        )
+        .map_err(|e| format!("prepare similar: {e}"))?;
+    let rows = stmt
+        .query_map(params![model, asset_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .map_err(|e| format!("query similar: {e}"))?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let (id, path, name, kind, blob) = row.map_err(|e| format!("similar row: {e}"))?;
+        let Some(other) = bytes_to_floats(&blob) else { continue };
+        hits.push(SimilarHit { id, path, name, kind, score: cosine(&query, &other) });
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    hits.truncate(limit.max(0) as usize);
+    Ok(hits)
+}
+
 // MARK: - Queries
 
 #[derive(Default)]
@@ -2224,10 +2368,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 12, "user_version tracks the highest applied migration");
+        assert_eq!(v, 13, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -2350,6 +2494,71 @@ mod tests {
         near_keep(&conn, list[0].id, id_for("/a.jpg")).unwrap();
         assert_eq!(near_groups(&conn).unwrap()[0].kept_id, Some(id_for("/a.jpg")));
         assert!(near_keep(&conn, list[0].id, 9999).is_err(), "outsider keeper rejected");
+    }
+
+    #[test]
+    fn vectors_cascade_with_assets() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        let aid: i64 =
+            conn.query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0)).unwrap();
+
+        // Unknown asset ids are rejected; the vector itself round-trips.
+        assert!(save_vector(&conn, 9999, VECTOR_MODEL, 2, &[1.0, 0.0]).is_err());
+        save_vector(&conn, aid, VECTOR_MODEL, 2, &[1.0, 0.0]).unwrap();
+        assert!(save_vector(&conn, aid, VECTOR_MODEL, 3, &[1.0, 0.0]).is_err(), "dim is checked");
+        // Re-embedding overwrites instead of duplicating.
+        save_vector(&conn, aid, VECTOR_MODEL, 2, &[0.0, 1.0]).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM asset_vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+
+        // Deleting the asset cascades to its vector.
+        conn.execute("DELETE FROM assets WHERE id = ?1", params![aid]).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM asset_vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn similar_to_ranks_by_cosine_and_excludes_self() {
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0]), 1.0, "identical vectors score 1.0");
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), 0.0, "orthogonal scores 0.0");
+        assert_eq!(cosine(&[], &[]), 0.0, "empty is degenerate, not NaN");
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0, "zero norm sorts last");
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0, "length mismatch scores 0.0");
+        let bytes = floats_to_bytes(&[1.0, -0.5]);
+        assert_eq!(bytes_to_floats(&bytes).unwrap(), vec![1.0, -0.5]);
+        assert!(bytes_to_floats(&[1, 2, 3]).is_none(), "truncated blobs rejected");
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/c.jpg", 1, 3.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        save_vector(&conn, id_for("/a.jpg"), VECTOR_MODEL, 2, &[1.0, 0.0]).unwrap();
+        save_vector(&conn, id_for("/b.jpg"), VECTOR_MODEL, 2, &[0.9, 0.1]).unwrap();
+        save_vector(&conn, id_for("/c.jpg"), VECTOR_MODEL, 2, &[0.0, 1.0]).unwrap();
+
+        // "b" is missing-gated below; the ranking itself is cosine order.
+        let hits = similar_to(&conn, id_for("/a.jpg"), VECTOR_MODEL, 10).unwrap();
+        assert_eq!(hits.len(), 2, "the query photo is excluded");
+        assert_eq!(hits[0].path, "/b.jpg");
+        assert_eq!(hits[1].path, "/c.jpg");
+        assert!(hits[0].score > 0.99, "near-parallel scores ~1, got {}", hits[0].score);
+        assert_eq!(hits[1].score, 0.0);
+        assert!(similar_to(&conn, 9999, VECTOR_MODEL, 10).is_err(), "unembedded query errors");
+
+        conn.execute("UPDATE assets SET missing = 1 WHERE path = '/b.jpg'", []).unwrap();
+        let gated = similar_to(&conn, id_for("/a.jpg"), VECTOR_MODEL, 10).unwrap();
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].path, "/c.jpg");
     }
 
     #[test]
