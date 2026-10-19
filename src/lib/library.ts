@@ -62,6 +62,7 @@ export type LibraryFilters = {
   favoriteOnly?: boolean;
   sceneTag?: string;
   query?: string;
+  hasPet?: boolean;
 };
 
 export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
@@ -75,7 +76,8 @@ export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
     capturedMax: opts.capturedMax ?? null,
     favoriteOnly: opts.favoriteOnly ?? null,
     sceneTag: opts.sceneTag ?? null,
-    query: opts.query?.trim() ? opts.query.trim() : null
+    query: opts.query?.trim() ? opts.query.trim() : null,
+    hasPet: opts.hasPet ?? null
   });
 }
 
@@ -88,12 +90,52 @@ export function libraryCount(opts: Omit<LibraryFilters, "offset" | "limit"> = {}
     capturedMax: opts.capturedMax ?? null,
     favoriteOnly: opts.favoriteOnly ?? null,
     sceneTag: opts.sceneTag ?? null,
-    query: opts.query?.trim() ? opts.query.trim() : null
+    query: opts.query?.trim() ? opts.query.trim() : null,
+    hasPet: opts.hasPet ?? null
   });
 }
 
 export function setFavorite(assetId: number, favorite: boolean): Promise<void> {
   return invoke("set_favorite", { assetId, favorite });
+}
+
+export type PetSighting = {
+  id: number;
+  path: string;
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+};
+
+export type PetProgress = {
+  processed: number;
+  total: number;
+  sightings: number;
+};
+
+export type DetectPetsSummary = {
+  images: number;
+  sightings: number;
+  missing: number;
+};
+
+export function detectPets(): Promise<DetectPetsSummary> {
+  return invoke("detect_pets");
+}
+
+export function onPetProgress(cb: (p: PetProgress) => void): Promise<() => void> {
+  return listen<PetProgress>("pet-progress", (e) => cb(e.payload));
+}
+
+export function onPetError(cb: (message: string) => void): Promise<() => void> {
+  return listen<string>("pet-error", (e) => cb(e.payload));
+}
+
+export function sightingsList(): Promise<PetSighting[]> {
+  return invoke("sightings_list");
 }
 
 export type TagProgress = {

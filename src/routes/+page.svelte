@@ -6,6 +6,10 @@
     clustersList,
     renameCluster,
     mergeClusters,
+    detectPets,
+    onPetProgress,
+    onPetError,
+    sightingsList,
     clusterEvents,
     eventsList,
     eventAssets,
@@ -63,6 +67,8 @@
     type CleanupProgress,
     type CleanupStats,
     type FaceClusterRow,
+    type PetProgress,
+    type PetSighting,
     type EventRow,
     type EventAssetRow,
     type GeocodeProgress,
@@ -108,6 +114,7 @@
 
   let filter = $state<"all" | "image" | "video">("all");
   let favFilter = $state(false);
+  let petFilter = $state(false);
   let searchText = $state("");
   let searchQuery = $state<string | null>(null);
   let recentSearches = $state<string[]>(loadRecentSearches());
@@ -163,6 +170,7 @@
     return {
       kind: filter === "all" ? undefined : filter,
       favoriteOnly: favFilter || undefined,
+      hasPet: petFilter || undefined,
       sceneTag: sceneFilter ?? undefined,
       query: searchQuery ?? undefined,
       personCluster: personFilter ?? undefined,
@@ -180,6 +188,9 @@
   let thumbs = $state<Record<string, string>>({});
   let people = $state<FaceClusterRow[]>([]);
   let mergeSelect = $state<Set<number>>(new Set());
+  let pets = $state<PetSighting[]>([]);
+  let petsLoading = $state(false);
+  let petState = $state<PetProgress | null>(null);
   let typedPath = $state("");
   let enriching = $state(false);
   let enrichState = $state<EnrichProgress | null>(null);
@@ -864,6 +875,43 @@
     }
   }
 
+  async function loadPets() {
+    resetThumbs();
+    petsLoading = true;
+    pets = [];
+    try {
+      pets = await sightingsList();
+      for (const s of pets) {
+        const key = `pet:${s.id}`;
+        if (thumbs[key]) continue;
+        try {
+          const { image } = await faceThumb(s.path, s.x, s.y, s.width, s.height, 160);
+          if (image) thumbs[key] = thumbSrc(image);
+        } catch {
+          /* unreadable pet crop */
+        }
+      }
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      petsLoading = false;
+    }
+  }
+
+  async function findPets() {
+    petsLoading = true;
+    petState = { processed: 0, total: 0, sightings: 0 };
+    try {
+      await detectPets();
+      await loadPets();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      petsLoading = false;
+      petState = null;
+    }
+  }
+
   async function loadFaceThumb(f: FaceRow) {
     const key = `face:${f.id}`;
     if (thumbs[key]) return;
@@ -1133,6 +1181,12 @@
           clusterState = { processed: p.processed, total: p.total };
         }
       }),
+      onPetProgress((p) => {
+        if (petsLoading) petState = p;
+      }),
+      onPetError((m) => {
+        error = m;
+      }),
       onGeocodeProgress((p) => {
         if (resolvingPlaces) geocodeState = p;
       }),
@@ -1168,7 +1222,7 @@
     <button class="tab" class:on={tab === "cleanup"} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
     </button>
-    <button class="tab" class:on={tab === "people"} onclick={() => { tab = "people"; void loadPeople(); }}>
+    <button class="tab" class:on={tab === "people"} onclick={() => { tab = "people"; void loadPeople(); void loadPets(); }}>
       People{#if people.length > 0}&nbsp;{people.length}{/if}
     </button>
     <button class="tab" class:on={tab === "events"} onclick={() => { tab = "events"; void loadEvents(); }}>
@@ -1456,6 +1510,9 @@
         <button class="chip" class:on={favFilter} onclick={() => { favFilter = !favFilter; void refresh(); }} aria-pressed={favFilter}>
           ★ Favorites
         </button>
+        <button class="chip" class:on={petFilter} onclick={() => { petFilter = !petFilter; void refresh(); }} aria-pressed={petFilter}>
+          Pets
+        </button>
         <span class="total">{fmtBytes(stats.bytes)} indexed</span>
       </div>
 
@@ -1654,7 +1711,13 @@
         <button onclick={findPeople} disabled={peopleLoading}>
           {peopleLoading ? "Scanning faces…" : "Find people in library"}
         </button>
+        <button class="ghost" onclick={() => void findPets()} disabled={petsLoading}>
+          {petsLoading ? "Sniffing…" : "Find pets"}
+        </button>
       </div>
+      {#if petState && petsLoading}
+        <p class="hint">{petState.processed} of {petState.total} images · {petState.sightings} pets</p>
+      {/if}
       {#if clusterState}
         <p class="hint">{clusterState.processed}/{clusterState.total} images scanned…</p>
       {/if}
@@ -1715,6 +1778,28 @@
         {/each}
       {:else if !peopleLoading}
         <p class="hint">No people clusters yet — scan the library to detect faces.</p>
+      {/if}
+      {#if pets.length}
+        <h3 class="sub">Pets</h3>
+        <div class="members">
+          {#each pets as s (s.id)}
+            <figure>
+              <div class="thumb small">
+                {#if thumbs[`pet:${s.id}`]}
+                  <img src={thumbs[`pet:${s.id}`]} alt={`${s.label} in ${s.path}`} loading="lazy" />
+                {:else}
+                  <span class="placeholder">…</span>
+                {/if}
+              </div>
+              <figcaption>
+                <span class="name">{s.label} · {Math.round(s.confidence * 100)}%</span>
+                <span class="meta" title={s.path}>{s.path.split("/").pop()}</span>
+              </figcaption>
+            </figure>
+          {/each}
+        </div>
+      {:else if !petsLoading}
+        <p class="hint">No pets spotted yet — dogs and cats only; birds stay tag-level.</p>
       {/if}
     </section>
   {/if}

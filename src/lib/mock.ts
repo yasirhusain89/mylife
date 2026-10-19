@@ -22,6 +22,9 @@ import type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  PetProgress,
+  PetSighting,
+  DetectPetsSummary,
   PipelineProgress,
   PipelineSummary,
   ResolvePlacesSummary,
@@ -183,6 +186,13 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
   if (opts.capturedMin !== undefined) out = out.filter((a) => (a.capturedAt ?? 0) >= opts.capturedMin!);
   if (opts.capturedMax !== undefined) out = out.filter((a) => (a.capturedAt ?? 0) < opts.capturedMax!);
   if (opts.favoriteOnly) out = out.filter((a) => a.favorite !== 0);
+  if (opts.hasPet !== undefined) {
+    out = out.filter((a) =>
+      opts.hasPet
+        ? sightings.some((s) => s.path === a.path)
+        : !sightings.some((s) => s.path === a.path),
+    );
+  }
   if (opts.sceneTag !== undefined) {
     out = out.filter((a) => (assetTagMap.get(a.id) ?? []).some((t) => t.tag === opts.sceneTag));
   }
@@ -198,6 +208,7 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
           a.path.toLowerCase().includes(needle) ||
           (assetTagMap.get(a.id) ?? []).some((t) => t.tag.includes(needle)) ||
           eventHit ||
+          sightings.some((s) => s.path === a.path && s.label.toLowerCase().includes(needle)) ||
           [...clusterMembers.entries()].some(
             ([cid, ids]) => ids.has(a.id) && (clusterNames.get(cid) ?? "").toLowerCase().includes(needle),
           ),
@@ -459,6 +470,37 @@ export async function facesCount(): Promise<number> {
   let total = 0;
   for (const list of facesByCluster.values()) total += list.length;
   return total;
+}
+
+let sightings: PetSighting[] = [];
+
+export async function detectPets(): Promise<DetectPetsSummary> {
+  const images = assets.filter((a) => a.kind === "image");
+  sightings = [
+    {
+      id: 1,
+      path: "/photos/IMG_20261007_191433.jpg",
+      label: "Dog",
+      x: 0.2,
+      y: 0.3,
+      width: 0.4,
+      height: 0.4,
+      confidence: 0.93
+    }
+  ];
+  return { images: images.length, sightings: sightings.length, missing: 0 };
+}
+
+export function onPetProgress(_cb: (p: PetProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
+export function onPetError(_cb: (message: string) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
+export async function sightingsList(): Promise<PetSighting[]> {
+  return sightings;
 }
 
 export async function faceThumb(

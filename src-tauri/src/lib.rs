@@ -993,6 +993,92 @@ fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
     db::faces_count(&conn)
 }
 
+// MARK: - Pet detection
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PetProgress {
+    pub processed: i64,
+    pub total: i64,
+    pub sightings: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectPetsSummary {
+    pub images: i64,
+    pub sightings: i64,
+    pub missing: i64,
+}
+
+/// Runs the engine's cat/dog detector over readable images and stores the
+/// sightings (replacing any from a previous run). No identity tracking.
+#[tauri::command]
+async fn detect_pets(app: tauri::AppHandle) -> Result<DetectPetsSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+
+        let all_paths: Vec<String> = conn
+            .prepare("SELECT path FROM assets WHERE kind = 'image' AND missing = 0")
+            .map_err(|e| format!("image paths: {e}"))?
+            .query_map([], |r| r.get(0))
+            .map_err(|e| format!("image paths: {e}"))?
+            .filter_map(Result::ok)
+            .collect();
+        let readable: Vec<String> = all_paths
+            .iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .cloned()
+            .collect();
+        let missing = (all_paths.len() - readable.len()) as i64;
+        let total = readable.len() as i64;
+        let mut sightings = 0i64;
+        let mut processed = 0i64;
+        for path in &readable {
+            let reply = engine::call_blocking(
+                &engine_state,
+                "detect_animals",
+                Some(json!({ "path": path })),
+                Duration::from_secs(120),
+            );
+            match reply {
+                Ok(body) => {
+                    let list: Vec<Value> = body
+                        .get("animals")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !list.is_empty() {
+                        sightings += db::save_sightings(&conn, path, &list)?.len() as i64;
+                    } else {
+                        // Clear stale sightings when nothing is found now.
+                        db::save_sightings(&conn, path, &[])?;
+                    }
+                }
+                Err(e) => {
+                    let _ = app.emit("pet-error", format!("{path}: {e}"));
+                }
+            }
+            processed += 1;
+            let _ = app.emit(
+                "pet-progress",
+                PetProgress { processed, total, sightings },
+            );
+        }
+        Ok(DetectPetsSummary { images: total, sightings, missing })
+    })
+    .await
+    .map_err(|e| format!("pet task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn sightings_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::PetSighting>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::sightings_list(&conn)
+}
+
 #[tauri::command]
 fn rename_cluster(
     conn: tauri::State<'_, DbState>,
@@ -1604,6 +1690,7 @@ fn library_list(
     favorite_only: Option<bool>,
     scene_tag: Option<String>,
     query: Option<String>,
+    has_pet: Option<bool>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
@@ -1621,6 +1708,7 @@ fn library_list(
             favorite_only,
             scene_tag: scene_tag.as_deref(),
             query: query.as_deref(),
+            has_pet,
             offset: offset.unwrap_or(0).max(0),
             limit: limit.unwrap_or(200).clamp(1, 1000),
         },
@@ -1639,6 +1727,7 @@ fn library_count(
     favorite_only: Option<bool>,
     scene_tag: Option<String>,
     query: Option<String>,
+    has_pet: Option<bool>,
 ) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
     let kind = kind.filter(|k| k == "image" || k == "video");
@@ -1654,6 +1743,7 @@ fn library_count(
             favorite_only,
             scene_tag: scene_tag.as_deref(),
             query: query.as_deref(),
+            has_pet,
             ..Default::default()
         },
     )
@@ -1811,6 +1901,8 @@ pub fn run() {
             faces_count,
             rename_cluster,
             merge_clusters,
+            detect_pets,
+            sightings_list,
             cluster_events,
             events_list,
             event_assets,

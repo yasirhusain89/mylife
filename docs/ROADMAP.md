@@ -35,4 +35,4 @@
 
 - Memory-movie style chapters with narrative arc and recap/souvenir sharing pipeline (Apple/Google pattern in README appendix).
 - Conversational search with follow-ups and query-time re-ranking over the embedding index (Ask Photos pattern; needs the vector index above first).
-- Video depth: adjustable-length Auto Trim fit-to-length plus subject-tracked reframe; pet face clustering and NIMA aesthetic scoring as curation upgrades (all appendix themes, none committed).
+- Video depth: adjustable-length Auto Trim fit-to-length plus subject-tracked reframe; pet identity tracking and NIMA aesthetic scoring as curation upgrades (all appendix themes, none committed).

@@ -349,6 +349,46 @@ func detectFaces(path: String) throws -> [String: Any] {
     return ["path": path, "count": faces.count, "faces": faces]
 }
 
+/// Pet detection (dogs and cats — the only animals VNRecognizeAnimalsRequest
+/// supports per the macOS SDK headers). Same box convention as faces so the
+/// UI reuses the crop pipeline. Birds and other animals are NOT detectable
+/// with system frameworks; they stay tag-level via `classify`.
+func detectAnimals(path: String) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: path)
+    guard FileManager.default.fileExists(atPath: path) else {
+        throw EngineError(message: "file not found (volume unmounted?): \(path)")
+    }
+    guard
+        let src = CGImageSourceCreateWithURL(
+            url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    else { throw EngineError(message: "not an image: \(path)") }
+    guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        throw EngineError(message: "cannot decode image: \(path)")
+    }
+
+    let req = VNRecognizeAnimalsRequest()
+    do {
+        try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+    } catch {
+        throw EngineError(message: "animal detection failed: \(error)")
+    }
+
+    var animals: [[String: Any]] = []
+    for obs in req.results ?? [] {
+        guard let label = obs.labels.first?.identifier else { continue }
+        let b = obs.boundingBox
+        animals.append([
+            "label": label,
+            "x": Double(b.origin.x),
+            "y": Double(1.0 - b.origin.y - b.height),
+            "width": Double(b.width),
+            "height": Double(b.height),
+            "confidence": Double(obs.confidence),
+        ])
+    }
+    return ["path": path, "count": animals.count, "animals": animals]
+}
+
 /// Clusters faces across a set of images into "people" using Vision's own
 /// feature-print distance. Needs no downloaded model weights: VNGenerateImageFeaturePrintRequest
 /// is part of the OS. Returns one cluster per detected person; singletons are
@@ -1091,6 +1131,10 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
     case "faces":
         guard let path = str("path") else { throw EngineError(message: "faces requires 'path'") }
         return try detectFaces(path: path)
+
+    case "detect_animals":
+        guard let path = str("path") else { throw EngineError(message: "detect_animals requires 'path'") }
+        return try detectAnimals(path: path)
 
     case "cluster_faces":
         guard let paths = params["paths"] as? [String], !paths.isEmpty else {

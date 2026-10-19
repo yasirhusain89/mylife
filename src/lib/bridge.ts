@@ -70,6 +70,10 @@ export const onClusterProgress = pick("onClusterProgress");
 export const clustersList = pick("clustersList");
 export const renameCluster = pick("renameCluster");
 export const mergeClusters = pick("mergeClusters");
+export const detectPets = pick("detectPets");
+export const onPetProgress = pick("onPetProgress");
+export const onPetError = pick("onPetError");
+export const sightingsList = pick("sightingsList");
 export const facesInCluster = pick("facesInCluster");
 export const facesCount = pick("facesCount");
 export const clusterEvents = pick("clusterEvents");
@@ -139,6 +143,9 @@ export type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  PetProgress,
+  PetSighting,
+  DetectPetsSummary,
   PipelineProgress,
   PipelineSummary,
   ResolvePlacesSummary,

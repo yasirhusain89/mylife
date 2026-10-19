@@ -18,7 +18,7 @@ Status against what has actually shipped (see git log):
 
 - **P1 Import & Library — shipped, with gaps.** Folder import, thumbnails, SQLite catalog, EXIF/GPS enrichment, pagination, month/location/person filters, missing-file verification. Open: drag-and-drop import, osxphotos import from Apple Photos, LQIP placeholders.
 - **P2 Cleanup — partial.** Exact-duplicate groups (size-bucketed hashing), blur scoring (Laplacian variance), Trash-based deletion, review UI. Open: near-duplicate clustering, utility-shot detection (screenshots/docs), low-quality scoring, keeper score breakdown, batch confirm.
-- **P3 Intelligence — partial.** Face detection + feature-print clustering, albums. Open: named people, MobileCLIP2 embeddings + semantic search, VLM captions on demand.
+- **P3 Intelligence — partial.** Face detection + feature-print clustering, named people, albums, pet (dog/cat) detection with sightings. Open: MobileCLIP2 embeddings + semantic search, VLM captions on demand.
 - **P4 Events & Summaries — partial.** Time + GPS event clustering with naming. Open: routine-vs-trip distinction, LLM text summaries, event stats (top people, days, places).
 - **P5 Highlight videos — partial.** Per-event mixed photo/video montage with original camera audio via the hardware encoder, capped at 60s. Open: diversity-picked shots, Ken Burns pans, transitions, title cards, narration, export presets.
 - **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles (photos and videos). Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.

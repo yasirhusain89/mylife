@@ -88,6 +88,18 @@ test("people can be named and merged", async ({ page }) => {
   await expect(page.getByText("Cluster 2")).toBeHidden();
 });
 
+test("pet detection surfaces sightings and filters", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find pets" }).click();
+  await expect(page.getByRole("heading", { name: "Pets" })).toBeVisible();
+  await expect(page.getByText("Dog · 93%")).toBeVisible();
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: "Pets", exact: true }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await page.getByRole("searchbox", { name: "Search library" }).fill("dog");
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+});
+
 test("indexed folders list every scanned root", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Indexed folders" })).toBeVisible();
   await expect(page.getByText("/photos", { exact: true })).toBeVisible();

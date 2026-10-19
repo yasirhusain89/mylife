@@ -18,6 +18,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (9, include_str!("../migrations/009_scene_tags.sql")),
     (10, include_str!("../migrations/010_geofences.sql")),
     (11, include_str!("../migrations/011_near_dupes.sql")),
+    (12, include_str!("../migrations/012_pets.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -438,6 +439,88 @@ pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRo
 pub fn faces_count(conn: &Connection) -> Result<i64, String> {
     conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
         .map_err(|e| format!("faces_count: {e}"))
+}
+
+// MARK: - Pet sightings (dogs/cats; no identity tracking yet)
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PetSighting {
+    pub id: i64,
+    pub path: String,
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub confidence: f64,
+}
+
+pub fn save_sightings(
+    conn: &Connection,
+    path: &str,
+    sightings: &[serde_json::Value],
+) -> Result<Vec<i64>, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("sightings tx: {e}"))?;
+    tx.execute("DELETE FROM animal_sightings WHERE path = ?1", params![path])
+        .map_err(|e| format!("clear sightings: {e}"))?;
+    let mut ids = Vec::new();
+    for s in sightings {
+        let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("animal");
+        tx.execute(
+            "INSERT INTO animal_sightings (path, label, x, y, width, height, confidence, detected_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                path,
+                label,
+                s.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                s.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                s.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                s.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                s.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                now(),
+            ],
+        )
+        .map_err(|e| format!("insert sighting: {e}"))?;
+        let id: i64 = tx.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .map_err(|e| format!("last row id: {e}"))?;
+        ids.push(id);
+    }
+    tx.commit().map_err(|e| format!("sightings commit: {e}"))?;
+    Ok(ids)
+}
+
+pub fn sightings_list(conn: &Connection) -> Result<Vec<PetSighting>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path, label, x, y, width, height, confidence FROM animal_sightings
+             ORDER BY confidence DESC, id",
+        )
+        .map_err(|e| format!("prepare sightings: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(PetSighting {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                label: r.get(2)?,
+                x: r.get(3)?,
+                y: r.get(4)?,
+                width: r.get(5)?,
+                height: r.get(6)?,
+                confidence: r.get(7)?,
+            })
+        })
+        .map_err(|e| format!("query sightings: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("sighting row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn sightings_count(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(*) FROM animal_sightings", [], |r| r.get(0))
+        .map_err(|e| format!("sightings_count: {e}"))
 }
 
 // MARK: - Queries
@@ -1833,6 +1916,8 @@ pub struct LibraryQuery<'a> {
     pub favorite_only: Option<bool>,
     /// Only assets carrying this scene tag (from `tag_scenes`).
     pub scene_tag: Option<&'a str>,
+    /// Some(true) = photos with a detected pet only.
+    pub has_pet: Option<bool>,
     /// Substring match on file name or path (search box). The LIKE pattern
     /// (with `%`/`_` escaped) is built inside library()/library_count().
     pub query: Option<&'a str>,
@@ -1855,13 +1940,17 @@ const LIBRARY_WHERE: &str = "WHERE (?1 IS NULL OR kind = ?1) AND missing = 0
     OR EXISTS (SELECT 1 FROM event_assets ea JOIN events e ON e.id = ea.event_id
                WHERE ea.asset_id = a.id AND (e.name LIKE ?9 ESCAPE '\\' OR e.place LIKE ?9 ESCAPE '\\'))
     OR EXISTS (SELECT 1 FROM faces f JOIN face_clusters fc ON fc.id = f.cluster_id
-               WHERE f.path = a.path AND fc.name LIKE ?9 ESCAPE '\\'))";
+               WHERE f.path = a.path AND fc.name LIKE ?9 ESCAPE '\\')
+    OR EXISTS (SELECT 1 FROM animal_sightings s
+               WHERE s.path = a.path AND s.label LIKE ?9 ESCAPE '\\'))
+  AND (?10 IS NULL OR ((?10 = 1) = EXISTS (SELECT 1 FROM animal_sightings s WHERE s.path = a.path)))";
 
 /// Relevance tier for search results; inert (all zero) without a query.
 /// Name/path hits outrank tag, event, and person hits; recency breaks ties.
 const LIBRARY_RANK: &str = "CASE WHEN ?9 IS NULL THEN 0
   WHEN a.name LIKE ?9 ESCAPE '\\' OR a.path LIKE ?9 ESCAPE '\\' THEN 0
   WHEN EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id AND t.tag LIKE ?9 ESCAPE '\\') THEN 1
+  WHEN EXISTS (SELECT 1 FROM animal_sightings s WHERE s.path = a.path AND s.label LIKE ?9 ESCAPE '\\') THEN 1
   WHEN EXISTS (SELECT 1 FROM event_assets ea JOIN events e ON e.id = ea.event_id
                WHERE ea.asset_id = a.id AND (e.name LIKE ?9 ESCAPE '\\' OR e.place LIKE ?9 ESCAPE '\\')) THEN 2
   WHEN EXISTS (SELECT 1 FROM faces f JOIN face_clusters fc ON fc.id = f.cluster_id
@@ -1876,7 +1965,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 FROM assets a
                 {LIBRARY_WHERE}
                 ORDER BY {LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC
-                LIMIT ?10 OFFSET ?11"
+                LIMIT ?11 OFFSET ?12"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
@@ -1891,6 +1980,7 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 q.favorite_only.map(i64::from),
                 q.scene_tag,
                 like.as_deref(),
+                q.has_pet.map(i64::from),
                 q.limit,
                 q.offset
             ],
@@ -1937,7 +2027,8 @@ pub fn library_count(conn: &Connection, q: &LibraryQuery) -> Result<i64, String>
             q.captured_max,
             q.favorite_only.map(i64::from),
             q.scene_tag,
-            like.as_deref()
+            like.as_deref(),
+            q.has_pet.map(i64::from)
         ],
         |r| r.get(0),
     )
@@ -2112,10 +2203,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 11, "user_version tracks the highest applied migration");
+        assert_eq!(v, 12, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -2271,6 +2362,52 @@ mod tests {
 
         let stats = faces_count(&conn).unwrap();
         assert_eq!(stats, 1);
+    }
+
+    #[test]
+    fn pet_sightings_store_filter_and_search() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/dog.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/plain.jpg", 1, 2.0), scan).unwrap();
+
+        let ids = save_sightings(
+            &conn,
+            "/dog.jpg",
+            &[serde_json::json!({"label": "Dog", "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.92})],
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 1);
+        // Re-saving replaces: no duplicates on rescan.
+        save_sightings(&conn, "/dog.jpg", &[]).unwrap();
+        assert_eq!(sightings_count(&conn).unwrap(), 0);
+        save_sightings(
+            &conn,
+            "/dog.jpg",
+            &[serde_json::json!({"label": "Dog", "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.92})],
+        )
+        .unwrap();
+
+        let pets = LibraryQuery { has_pet: Some(true), limit: 10, ..Default::default() };
+        let rows = library(&conn, &pets).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/dog.jpg");
+        assert_eq!(library_count(&conn, &pets).unwrap(), 1);
+        let nopets = LibraryQuery { has_pet: Some(false), limit: 10, ..Default::default() };
+        assert_eq!(library(&conn, &nopets).unwrap().len(), 1);
+
+        // Labels are searchable like everything else.
+        fn q(s: &str) -> LibraryQuery<'_> {
+            LibraryQuery { query: Some(s), limit: 10, ..Default::default() }
+        }
+        let found = library(&conn, &q("dog")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "/dog.jpg");
+
+        let list = sightings_list(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label, "Dog");
     }
 
     #[test]
