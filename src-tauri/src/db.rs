@@ -574,12 +574,35 @@ pub fn cluster_events(
         v
     };
 
+    // Snapshot manual names/places before the rebuild wipes them: new
+    // events that overlap an old one by member majority inherit them.
+    let old_events: Vec<(String, Option<String>, std::collections::HashSet<i64>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.name, e.place, ea.asset_id FROM events e
+                 LEFT JOIN event_assets ea ON ea.event_id = e.id",
+            )
+            .map_err(|e| format!("prepare old events: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?)))
+            .map_err(|e| format!("query old events: {e}"))?;
+        let mut by_name: std::collections::HashMap<(String, Option<String>), std::collections::HashSet<i64>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (name, place, asset) = row.map_err(|e| format!("old event row: {e}"))?;
+            let entry = by_name.entry((name, place)).or_default();
+            if let Some(id) = asset {
+                entry.insert(id);
+            }
+        }
+        by_name.into_iter().map(|((name, place), members)| (name, place, members)).collect()
+    };
+
     let tx = conn.unchecked_transaction().map_err(|e| format!("events tx: {e}"))?;
     tx.execute("DELETE FROM event_assets", [])
         .map_err(|e| format!("clear event_assets: {e}"))?;
     tx.execute("DELETE FROM events", [])
         .map_err(|e| format!("clear events: {e}"))?;
-
     let gap_seconds = gap_hours * 3600.0;
     let mut event_count = 0i64;
     let mut current: Option<i64> = None;
@@ -693,6 +716,60 @@ pub fn cluster_events(
         }
         conn.execute("UPDATE events SET name = ?2 WHERE id = ?1", params![eid, name])
             .map_err(|e| format!("name event: {e}"))?;
+    }
+
+    // Carry manual names/places across rebuilds: a new event whose members
+    // overlap an old one by majority on both sides inherits them. Each old
+    // event matches at most once; leftovers keep their fresh default names.
+    if !old_events.is_empty() {
+        let mut new_sets: Vec<(i64, std::collections::HashSet<i64>)> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT event_id, asset_id FROM event_assets")
+                .map_err(|e| format!("prepare new members: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| format!("query new members: {e}"))?;
+            let mut by_event: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (eid, aid) = row.map_err(|e| format!("new member row: {e}"))?;
+                by_event.entry(eid).or_default().insert(aid);
+            }
+            new_sets = by_event.into_iter().collect();
+            new_sets.sort_by_key(|(eid, _)| *eid);
+        }
+        let mut used_old = vec![false; old_events.len()];
+        for (eid, members) in &new_sets {
+            if members.is_empty() {
+                continue;
+            }
+            let mut best: Option<usize> = None;
+            let mut best_score = 0i64;
+            for (k, (_, _, old_members)) in old_events.iter().enumerate() {
+                if used_old[k] || old_members.is_empty() {
+                    continue;
+                }
+                let inter: i64 = members.intersection(old_members).count() as i64;
+                // Majority on both sides, then best overlap wins.
+                if inter * 2 >= members.len() as i64
+                    && inter * 2 >= old_members.len() as i64
+                    && inter > best_score
+                {
+                    best_score = inter;
+                    best = Some(k);
+                }
+            }
+            if let Some(k) = best {
+                used_old[k] = true;
+                let (name, place, _) = &old_events[k];
+                conn.execute(
+                    "UPDATE events SET name = ?2, place = ?3 WHERE id = ?1",
+                    params![eid, name, place],
+                )
+                .map_err(|e| format!("carry event name: {e}"))?;
+            }
+        }
     }
 
     Ok((event_count, candidates.len() as i64))
@@ -2123,7 +2200,40 @@ mod tests {
         let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
         assert_eq!(events, 2, "narrow gap splits the days again");
         let rows = events_list(&conn).unwrap();
-        assert!(rows.iter().all(|r| !r.name.contains('–')), "single-day names have no span");
+        // The first half inherits the old span name (majority overlap);
+        // the second half, with its old match taken, gets a fresh bare date.
+        assert_eq!(rows.iter().filter(|r| r.name.contains('–')).count(), 1);
+        assert_eq!(rows.iter().filter(|r| !r.name.contains('–')).count(), 1);
+    }
+
+    #[test]
+    fn cluster_events_preserves_names_and_places_across_rebuilds() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1_700_000_000.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 1_700_000_000.0 + 1800.0), scan).unwrap();
+
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let first = events_list(&conn).unwrap();
+        assert_eq!(first.len(), 1);
+        rename_event(&conn, first[0].id, "Maya's birthday").unwrap();
+        set_event_place(&conn, first[0].id, "San Francisco, California").unwrap();
+
+        // Rebuild with identical members: manual name and place survive.
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let second = events_list(&conn).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].name, "Maya's birthday");
+        assert_eq!(second[0].place.as_deref(), Some("San Francisco, California"));
+
+        // Rebuild with disjoint membership: no match, fresh default name.
+        upsert_asset(&conn, &asset("/z.jpg", 1, 1_800_000_000.0), scan).unwrap();
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let third = events_list(&conn).unwrap();
+        assert_eq!(third.len(), 2);
+        assert!(third.iter().any(|r| r.name == "Maya's birthday"), "overlapping event keeps its name");
+        assert!(third.iter().any(|r| r.name != "Maya's birthday"), "disjoint event gets a fresh name");
     }
 
     #[test]
