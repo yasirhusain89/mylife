@@ -1111,6 +1111,13 @@ fn faces_in_cluster(
     db::faces_in_cluster(&conn, cluster_id)
 }
 
+/// Detaches one face from its person cluster. Returns the cluster id.
+#[tauri::command]
+fn unassign_face(conn: tauri::State<'_, DbState>, face_id: i64) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::unassign_face(&conn, face_id)
+}
+
 #[tauri::command]
 fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
@@ -2247,6 +2254,7 @@ pub fn run() {
             faces_count,
             rename_cluster,
             merge_clusters,
+            unassign_face,
             detect_pets,
             sightings_list,
             cluster_events,

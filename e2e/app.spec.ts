@@ -386,7 +386,7 @@ test("renaming a cluster persists in the UI", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
-  await page.getByRole("button", { name: "Cluster 1" }).click();
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Person name" });
   await expect(dialog).toBeVisible();
   await dialog.getByLabel("Person name").fill("Ada");
@@ -423,6 +423,17 @@ test("merging clusters adds counts and drops the loser", async ({ page }) => {
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await expect(page.getByText("6 faces", { exact: true })).toBeVisible();
   await expect(page.getByText(/Merged into one person \(6 faces\)/)).toBeVisible();
+});
+
+test("removing a face that doesn't belong shrinks the cluster", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  await expect(page.getByText("4 faces")).toBeVisible();
+  await page.getByRole("button", { name: "Remove this face from Cluster 1" }).first().click();
+  await expect(page.getByText("Removed that face from this person")).toBeVisible();
+  await expect(page.getByText("3 faces")).toBeVisible();
+  await expect(page.getByText("Cluster 1")).toBeVisible();
 });
 
 test("view-in-library filters to the selected person", async ({ page }) => {
@@ -609,7 +620,7 @@ test("person filter narrows to one cluster", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
-  await page.getByRole("button", { name: "Cluster 1" }).click();
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
   const rename = page.getByRole("dialog", { name: "Person name" });
   await rename.getByLabel("Person name").fill("FilterMe");
   await rename.getByRole("button", { name: "Rename" }).click();

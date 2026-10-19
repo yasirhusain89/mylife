@@ -455,6 +455,10 @@ export function facesInCluster(clusterId: number): Promise<FaceRow[]> {
   return invoke("faces_in_cluster", { clusterId });
 }
 
+export function unassignFace(faceId: number): Promise<number> {
+  return invoke("unassign_face", { faceId });
+}
+
 export function facesCount(): Promise<number> {
   return invoke("faces_count");
 }

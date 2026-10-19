@@ -429,6 +429,32 @@ pub fn merge_clusters(conn: &Connection, from_id: i64, into_id: i64) -> Result<i
     Ok(count)
 }
 
+/// Detaches one face from its cluster (the photo is untouched; the face
+/// becomes unassigned). Recounts the cluster. Returns the cluster id so
+/// callers can refresh. Errors when the face is unknown or already free.
+pub fn unassign_face(conn: &Connection, face_id: i64) -> Result<i64, String> {
+    let cluster: Option<Option<i64>> = conn
+        .query_row("SELECT cluster_id FROM faces WHERE id = ?1", params![face_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| format!("face lookup: {e}"))?;
+    let cluster_id = match cluster {
+        None => return Err(format!("face {face_id} not found")),
+        Some(None) => return Err(format!("face {face_id} is not assigned to any cluster")),
+        Some(Some(id)) => id,
+    };
+    let tx = conn.unchecked_transaction().map_err(|e| format!("unassign tx: {e}"))?;
+    tx.execute("UPDATE faces SET cluster_id = NULL WHERE id = ?1", params![face_id])
+        .map_err(|e| format!("unassign face: {e}"))?;
+    tx.execute(
+        "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM faces WHERE cluster_id = ?1)
+         WHERE id = ?1",
+        params![cluster_id],
+    )
+    .map_err(|e| format!("unassign recount: {e}"))?;
+    tx.commit().map_err(|e| format!("unassign commit: {e}"))?;
+    Ok(cluster_id)
+}
+
 pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRow>, String> {
     let mut stmt = conn
         .prepare(
@@ -2670,6 +2696,31 @@ mod tests {
 
         assert!(merge_clusters(&conn, b, b).is_err(), "self-merge rejected");
         assert!(merge_clusters(&conn, b, 9999).is_err(), "missing target errors");
+    }
+
+    #[test]
+    fn unassign_face_detaches_and_recounts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()
+        };
+        let ids = mk("/a.jpg");
+        let cid = save_cluster(&conn, &ids).unwrap();
+
+        // Detaching shrinks the cluster and empties its member list.
+        assert_eq!(unassign_face(&conn, ids[0]).unwrap(), cid);
+        assert!(faces_in_cluster(&conn, cid).unwrap().is_empty());
+        assert_eq!(clusters_list(&conn).unwrap()[0].face_count, 0);
+
+        // Repeats, ghosts, and double-detaches fail cleanly.
+        assert!(unassign_face(&conn, ids[0]).is_err(), "already unassigned errors");
+        assert!(unassign_face(&conn, 9999).is_err(), "unknown face errors");
     }
 
     #[test]

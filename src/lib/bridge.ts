@@ -96,6 +96,7 @@ export const onClusterProgress = pick("onClusterProgress");
 export const clustersList = pickRead("clustersList");
 export const renameCluster = pick("renameCluster");
 export const mergeClusters = pick("mergeClusters");
+export const unassignFace = pick("unassignFace");
 export const detectPets = pick("detectPets");
 export const onPetProgress = pick("onPetProgress");
 export const onPetError = pick("onPetError");

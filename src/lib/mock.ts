@@ -517,6 +517,20 @@ export async function facesInCluster(clusterId: number): Promise<FaceRow[]> {
   return facesByCluster.get(clusterId) ?? [];
 }
 
+export async function unassignFace(faceId: number): Promise<number> {
+  for (const [cid, list] of facesByCluster) {
+    if (list.some((f) => f.id === faceId)) {
+      facesByCluster.set(
+        cid,
+        list.filter((f) => f.id !== faceId)
+      );
+      clusters = clusters.map((c) => (c.id === cid ? { ...c, faceCount: c.faceCount - 1 } : c));
+      return cid;
+    }
+  }
+  throw new Error(`face ${faceId} is not assigned to any cluster`);
+}
+
 export async function facesCount(): Promise<number> {
   let total = 0;
   for (const list of facesByCluster.values()) total += list.length;

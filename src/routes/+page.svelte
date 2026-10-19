@@ -6,6 +6,7 @@
     clustersList,
     renameCluster,
     mergeClusters,
+    unassignFace,
     detectPets,
     onPetProgress,
     onPetError,
@@ -57,8 +58,9 @@
     assetsInRoot,
     setFavorite,
     tagScenes,
-    onTagProgress,
-    sceneTags,
+    onTagProgress,    sceneTags,
+    embedLibrary,
+    onEmbedProgress,
     assetTags,
     onImportError,
     onImportProgress,
@@ -85,7 +87,8 @@
     type ScanRoot,
     type SceneTag,
     type SceneTagCount,
-    type TagProgress
+    type TagProgress,
+    type EmbedProgress
   } from "$lib/bridge";
   import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
 
@@ -228,6 +231,7 @@
   // Image-query visual neighbours ("more like this photo").
   let similar = $state<{ assetId: number; name: string; rows: SimilarHit[] } | null>(null);
   let similarLoading = $state(false);
+  let embedState = $state<EmbedProgress | null>(null);
   // Library multi-select: checkbox set + batch actions.
   let selectMode = $state(false);
   let selected = $state<Set<number>>(new Set());
@@ -528,16 +532,26 @@
 
   async function openSimilar(a: AssetRow) {
     similarLoading = true;
+    embedState = null;
     similar = { assetId: a.id, name: a.name, rows: [] };
     try {
-      const rows = await similarTo(a.id, 12);
-      similar = { assetId: a.id, name: a.name, rows };
-      void loadThumbs(rows.map((m) => ({ path: m.path }) as AssetRow));
+      try {
+        similar = { assetId: a.id, name: a.name, rows: await similarTo(a.id, 12) };
+      } catch (e) {
+        // First run on a library imported before vectors existed: embed
+        // everything once (one-time cost, progress shown), then retry.
+        if (!/has no '.*' vector yet/.test(String(e))) throw e;
+        const summary = await embedLibrary();
+        similar = { assetId: a.id, name: a.name, rows: await similarTo(a.id, 12) };
+        toast = `Embedded ${summary.embedded} photo${summary.embedded === 1 ? "" : "s"} for similarity`;
+      }
+      void loadThumbs(similar.rows.map((m) => ({ path: m.path }) as AssetRow));
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
       similar = null;
     } finally {
       similarLoading = false;
+      embedState = null;
     }
   }
 
@@ -758,6 +772,18 @@
       void loadClusterFaces();
       void loadPersonOptions();
       toast = `Merged into one person (${people.find((c) => c.id === into)?.faceCount ?? 0} faces)`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function removeFaceFromCluster(faceId: number, clusterId: number) {
+    try {
+      await unassignFace(faceId);
+      people = await clustersList();
+      peopleFaces = { ...peopleFaces, [clusterId]: await facesInCluster(clusterId) };
+      void loadPersonOptions();
+      toast = "Removed that face from this person";
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
@@ -1397,6 +1423,9 @@
       onTagProgress((p) => {
         if (tagging) tagState = p;
       }),
+      onEmbedProgress((p) => {
+        if (similarLoading) embedState = p;
+      }),
       onPipelineProgress((p) => {
         if (pipelining) pipelineState = p;
       })
@@ -1988,6 +2017,7 @@
         </p>
       {/if}
       {#if people.length}
+        <p class="hint">Tick two clusters to merge them · click a name to tag it · ✕ removes a face that doesn't belong.</p>
         {#if mergeSelect.size >= 2}
           <div class="enrich batch-bar">
             <span class="hint">{mergeSelect.size} selected</span>
@@ -2019,6 +2049,9 @@
             <div class="row-actions">
               <button class="tiny" onclick={() => void toggleClusterPhotos(cluster)}>
                 {openClusterId === cluster.id ? "Hide photos" : "Show photos"}
+              </button>
+              <button class="tiny" onclick={() => void doRenameCluster(cluster)}>
+                {cluster.name ? "Rename" : "Tag name"}
               </button>
               <button class="tiny" onclick={() => viewPersonInLibrary(cluster.id)}>
                 View in Library
@@ -2055,6 +2088,12 @@
                     </div>
                     <figcaption>
                       <span class="name" title={face.path}>{face.path.split("/").pop()}</span>
+                      <button
+                        class="tiny ghost"
+                        aria-label={`Remove this face from ${cluster.name ?? `Cluster ${cluster.id}`}`}
+                        title="Not this person — remove from cluster"
+                        onclick={() => void removeFaceFromCluster(face.id, cluster.id)}
+                      >✕</button>
                     </figcaption>
                   </figure>
                 {/each}
@@ -2510,7 +2549,13 @@
       <div class="dialog wide">
         <h3>Similar to {similar.name}</h3>
         {#if similarLoading}
-          <p class="hint">Finding similar photos…</p>
+          <p class="hint">
+            {#if embedState}
+              First run: embedding library for similarity… {embedState.processed} processed
+            {:else}
+              Finding similar photos…
+            {/if}
+          </p>
         {:else if similar.rows.length}
           <div class="members">
             {#each similar.rows as m (m.id)}
