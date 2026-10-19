@@ -3,6 +3,11 @@ import * as realEngine from "./engine";
 import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import * as mock from "./mock";
+import * as api from "./api";
+import { isApiMode } from "./api";
+
+export { isApiMode };
+export const isApi = isApiMode();
 
 /**
  * Web-mode selector: `?web=1` ( Playwright) or VITE_FOTOFLOW_WEB=1 serves
@@ -27,24 +32,33 @@ export function isWebMode(): boolean {
 }
 
 const WEB = isWebMode();
+const API = isApiMode();
 
 type RealLibrary = typeof realLibrary;
 type MockLibrary = typeof mock;
+type ApiLibrary = typeof api;
 
 function pick<K extends keyof RealLibrary & keyof MockLibrary>(key: K): RealLibrary[K] {
   return (WEB ? mock[key] : realLibrary[key]) as RealLibrary[K];
 }
 
+function pickRead<K extends keyof RealLibrary & keyof MockLibrary & keyof ApiLibrary>(
+  key: K
+): RealLibrary[K] {
+  if (API) return api[key] as unknown as RealLibrary[K];
+  return pick(key);
+}
+
 export const importFolder = pick("importFolder");
-export const libraryList = pick("libraryList");
-export const libraryCount = pick("libraryCount");
-export const libraryMonths = pick("libraryMonths");
-export const libraryStats = pick("libraryStats");
-export const scanRoots = pick("scanRoots");
+export const libraryList = pickRead("libraryList");
+export const libraryCount = pickRead("libraryCount");
+export const libraryMonths = pickRead("libraryMonths");
+export const libraryStats = pickRead("libraryStats");
+export const scanRoots = pickRead("scanRoots");
 export const setFavorite = pick("setFavorite");
 export const tagScenes = pick("tagScenes");
 export const onTagProgress = pick("onTagProgress");
-export const sceneTags = pick("sceneTags");
+export const sceneTags = pickRead("sceneTags");
 export const assetTags = pick("assetTags");
 export const runPostImport = pick("runPostImport");
 export const onPipelineProgress = pick("onPipelineProgress");
@@ -67,7 +81,7 @@ export const faceThumb = pick("faceThumb");
 export const runFaceClustering = pick("runFaceClustering");
 export const verifyLibrary = pick("verifyLibrary");
 export const onClusterProgress = pick("onClusterProgress");
-export const clustersList = pick("clustersList");
+export const clustersList = pickRead("clustersList");
 export const renameCluster = pick("renameCluster");
 export const mergeClusters = pick("mergeClusters");
 export const detectPets = pick("detectPets");
@@ -77,13 +91,13 @@ export const sightingsList = pick("sightingsList");
 export const facesInCluster = pick("facesInCluster");
 export const facesCount = pick("facesCount");
 export const clusterEvents = pick("clusterEvents");
-export const eventsList = pick("eventsList");
+export const eventsList = pickRead("eventsList");
 export const eventAssets = pick("eventAssets");
 export const renameEvent = pick("renameEvent");
 export const resolvePlaces = pick("resolvePlaces");
 export const onGeocodeProgress = pick("onGeocodeProgress");
 export const onGeocodeError = pick("onGeocodeError");
-export const albumsList = pick("albumsList");
+export const albumsList = pickRead("albumsList");
 export const albumCreate = pick("albumCreate");
 export const albumRename = pick("albumRename");
 export const albumDelete = pick("albumDelete");
