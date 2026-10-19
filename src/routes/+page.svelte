@@ -140,6 +140,9 @@
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
   let eventsLoading = $state(false);
+  let gapHours = $state(4);
+  let openEventId = $state<number | null>(null);
+  let eventMembers = $state<Record<number, EventAssetRow[]>>({});
   let resolvingPlaces = $state(false);
   let geocodeState = $state<GeocodeProgress | null>(null);
   // Lightbox viewer over the current library page (index into `assets`).
@@ -771,7 +774,7 @@
   async function runClusterEvents() {
     eventsLoading = true;
     try {
-      await clusterEvents(4, 500);
+      await clusterEvents(gapHours, 500);
       events = await eventsList();
       toast = `Grouped into ${events.length} event${events.length === 1 ? "" : "s"}`;
     } catch (e) {
@@ -779,6 +782,21 @@
     } finally {
       eventsLoading = false;
     }
+  }
+
+  async function loadEventMembers(eventId: number) {
+    try {
+      const rows = await eventAssets(eventId);
+      eventMembers = { ...eventMembers, [eventId]: rows };
+      void loadThumbs(rows.map((m) => ({ path: m.path }) as AssetRow));
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function toggleEvent(event: EventRow) {
+    openEventId = openEventId === event.id ? null : event.id;
+    if (openEventId !== null) void loadEventMembers(event.id);
   }
 
   async function runResolvePlaces() {
@@ -1474,6 +1492,20 @@
         <button onclick={runClusterEvents} disabled={eventsLoading}>
           {eventsLoading ? "Clustering…" : "Cluster events by time & place"}
         </button>
+        <label class="gap-label" title="Photos closer than this stay in one event — raise it to group multi-day trips">
+          Max gap
+          <input
+            type="number"
+            class="gap-input"
+            min="1"
+            max="168"
+            step="1"
+            bind:value={gapHours}
+            disabled={eventsLoading}
+            aria-label="Maximum hours between photos in one event"
+          />
+          h
+        </label>
         <button onclick={runResolvePlaces} disabled={resolvingPlaces || eventsLoading}>
           {resolvingPlaces ? "Resolving…" : "Resolve place names"}
         </button>
@@ -1492,7 +1524,7 @@
             {#each g.events as event (event.id)}
           <article class="group event-card">
             <header>
-              <button class="ename" title="Click to rename" onclick={() => void doRename(event)}>{event.name}</button>
+              <button class="ename" title="Click to show photos" onclick={() => toggleEvent(event)}>{event.name}</button>
               <span class="waste">
                 {new Date(event.startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                 – {new Date(event.endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
@@ -1506,6 +1538,9 @@
                 : "no location")}
             </p>
             <div class="row-actions">
+              <button class="tiny" onclick={() => toggleEvent(event)}>
+                {openEventId === event.id ? "Hide photos" : "Show photos"}
+              </button>
               <button class="tiny" onclick={() => void doRename(event)}>Rename</button>
               <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>
                 {exportBusy === `e${event.id}-drive` ? "Copying…" : "For Google Drive"}
@@ -1530,6 +1565,26 @@
                 Exported {exportResult.exported} to {exportResult.dir}
                 {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
               </p>
+            {/if}
+            {#if openEventId === event.id && eventMembers[event.id]?.length}
+              <div class="members">
+                {#each eventMembers[event.id] as member (member.id)}
+                  <figure>
+                    <div class="thumb small">
+                      {#if thumbs[member.path]}
+                        <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                      {:else}
+                        <span class="placeholder">{member.kind === "video" ? "VID" : "IMG"}</span>
+                      {/if}
+                    </div>
+                    <figcaption>
+                      <span class="name" title={member.path}>{member.name}</span>
+                    </figcaption>
+                  </figure>
+                {/each}
+              </div>
+            {:else if openEventId === event.id}
+              <p class="hint">No readable photos in this event.</p>
             {/if}
           </article>
             {/each}
@@ -2131,6 +2186,23 @@
     width: min(52rem, 96vw);
     max-height: 82vh;
     overflow: auto;
+  }
+  .gap-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: #8a93a5;
+  }
+  .gap-input {
+    width: 3.2rem;
+    background: #0d0f14;
+    border: 1px solid #232733;
+    border-radius: 8px;
+    color: #e7eaf0;
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.4rem;
   }
   .timeline {
     border-left: 2px solid #232733;

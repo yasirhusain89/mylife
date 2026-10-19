@@ -643,6 +643,14 @@ pub fn cluster_events(
         )
         .map_err(|e| format!("update count: {e}"))?;
     }
+    // ended_at tracks the latest member: inserts only stamp the first asset.
+    tx.execute(
+        "UPDATE events SET ended_at =
+            (SELECT MAX(COALESCE(a.captured_at, a.modified)) FROM assets a
+             JOIN event_assets ea ON ea.asset_id = a.id WHERE ea.event_id = events.id)",
+        [],
+    )
+    .map_err(|e| format!("update event spans: {e}"))?;
     for (eid, _) in &rows {
         let fc: i64 = tx.query_row(
             "SELECT COUNT(*) FROM faces f
@@ -657,6 +665,36 @@ pub fn cluster_events(
     }
 
     tx.commit().map_err(|e| format!("events commit: {e}"))?;
+
+    // Default names are set after the spans are final: date or date range,
+    // plus a cached place suffix when one is already known. Cache-only —
+    // clustering never hits the network; `resolve_places` fills the gaps.
+    let spans: Vec<(i64, f64, f64, Option<f64>, Option<f64>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, started_at, ended_at, latitude, longitude FROM events")
+            .map_err(|e| format!("prepare event spans: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .map_err(|e| format!("query event spans: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("event span row: {e}"))?);
+        }
+        v
+    };
+    for (eid, start, end, lat, lon) in &spans {
+        let mut name = format_event_range(*start, *end);
+        if let (Some(la), Some(lo)) = (lat, lon) {
+            if let Ok(Some(place)) =
+                geocode_cache_lookup(conn, round_coord(*la), round_coord(*lo))
+            {
+                name = format!("{name} · {place}");
+            }
+        }
+        conn.execute("UPDATE events SET name = ?2 WHERE id = ?1", params![eid, name])
+            .map_err(|e| format!("name event: {e}"))?;
+    }
+
     Ok((event_count, candidates.len() as i64))
 }
 
@@ -678,6 +716,17 @@ fn format_event_time(secs: f64) -> String {
     let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m];
     format!("{} {}", mon, d + 1)
+}
+
+/// Default event name: single date ("Oct 9") or span ("Oct 9–11").
+/// Rename stays manual; this only sets the initial label.
+fn format_event_range(started_at: f64, ended_at: f64) -> String {
+    let same_day = (started_at / 86400.0).floor() == (ended_at / 86400.0).floor();
+    if same_day {
+        format_event_time(started_at)
+    } else {
+        format!("{}–{}", format_event_time(started_at), format_event_time(ended_at))
+    }
 }
 
 fn leap(y: i64) -> bool {
@@ -2037,6 +2086,44 @@ mod tests {
         conn.execute("UPDATE assets SET latitude=37.8249 WHERE path='/near2.jpg'", []).unwrap();
         let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
         assert_eq!(events, 2, "distant photos split events");
+    }
+
+    #[test]
+    fn cluster_events_name_spans_and_cached_places() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // Two-day trip: 30h apart needs a wide gap to stay one event.
+        upsert_asset(&conn, &asset("/d1.jpg", 1, 1_700_000_000.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/d2.jpg", 1, 1_700_000_000.0 + 108_000.0), scan).unwrap();
+        conn.execute(
+            "UPDATE assets SET latitude = 37.7749, longitude = -122.4194",
+            [],
+        )
+        .unwrap();
+        geocode_cache_store(&conn, round_coord(37.7749), round_coord(-122.4194), "San Francisco, California")
+            .unwrap();
+
+        let (events, _) = cluster_events(&conn, 48.0, 500.0).unwrap();
+        assert_eq!(events, 1, "continuous days group with a wide gap");
+        let rows = events_list(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].name.contains('–'),
+            "multi-day default name is a span, got: {}",
+            rows[0].name
+        );
+        assert!(
+            rows[0].name.contains("San Francisco"),
+            "cached place suffixes the name, got: {}",
+            rows[0].name
+        );
+
+        // Same-day events keep a bare date name.
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 2, "narrow gap splits the days again");
+        let rows = events_list(&conn).unwrap();
+        assert!(rows.iter().all(|r| !r.name.contains('–')), "single-day names have no span");
     }
 
     #[test]

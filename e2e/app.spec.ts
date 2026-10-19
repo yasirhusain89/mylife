@@ -114,6 +114,14 @@ test("events render as a month-grouped timeline", async ({ page }) => {
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
 });
 
+test("event cards expand to member photos", async ({ page }) => {
+  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Show photos" }).click();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+  await expect(page.getByLabel("Maximum hours between photos in one event")).toHaveValue("4");
+});
+
 test("scene tags filter the library", async ({ page }) => {
   await page.getByRole("button", { name: "Tag scenes" }).click();
   await page.getByLabel("Filter by scene").selectOption("mountain");
