@@ -960,10 +960,55 @@ async fn verify_library(app: tauri::AppHandle) -> Result<VerifyResult, String> {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
         let (missing, restored) = db::verify_missing(&conn)?;
-        Ok(VerifyResult { missing, restored })
+        let (unreadable, unreadable_paths) = probe_unreadable(&conn);
+        Ok(VerifyResult { missing, restored, unreadable, unreadable_paths })
     })
     .await
     .map_err(|e| format!("verify task join failed: {e}"))?
+}
+
+/// Capped sample of unreadable paths in the verify summary (keeps the IPC
+/// payload small on big libraries with a dead volume).
+const VERIFY_UNREADABLE_SAMPLE_CAP: usize = 20;
+
+/// True when a file that exists cannot be opened/read (permissions, dead
+/// volume mid-scan). A 1-byte read is enough: success means the path is
+/// at least openable, which is all `verifyLibrary` promises beyond existence.
+fn is_unreadable_1byte(path: &str) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return true,
+    };
+    let mut buf = [0u8; 1];
+    f.read(&mut buf).is_err()
+}
+
+/// 1-byte readability sweep over files that exist (missing rows excluded —
+/// the existence pass owns those). Never fails the verify: an unreadable
+/// row is counted, never flagged. Returns (count, capped sample).
+fn probe_unreadable(conn: &rusqlite::Connection) -> (i64, Vec<String>) {
+    let paths: Vec<String> = conn
+        .prepare("SELECT path FROM assets WHERE missing = 0")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let mut count = 0i64;
+    let mut sample = Vec::new();
+    for p in &paths {
+        if !std::path::Path::new(p).exists() {
+            continue; // vanished between passes; the missing count owns it
+        }
+        if is_unreadable_1byte(p) {
+            count += 1;
+            if sample.len() < VERIFY_UNREADABLE_SAMPLE_CAP {
+                sample.push(p.clone());
+            }
+        }
+    }
+    (count, sample)
 }
 
 #[derive(Serialize)]
@@ -971,6 +1016,8 @@ async fn verify_library(app: tauri::AppHandle) -> Result<VerifyResult, String> {
 struct VerifyResult {
     missing: i64,
     restored: i64,
+    unreadable: i64,
+    unreadable_paths: Vec<String>,
 }
 
 // MARK: - People clustering
@@ -2310,6 +2357,132 @@ async fn cached_thumb(app: tauri::AppHandle, path: String, max_px: u32) -> Resul
     .map_err(|e| format!("thumb task join failed: {e}"))?
 }
 
+// MARK: - Face-crop disk cache
+
+/// FNV-1a (64-bit) over the face-crop identity: canonical path + size +
+/// mtime + crop box + requested size. Same scheme as `thumb_cache_key` so a
+/// moved/edited file naturally misses.
+fn face_cache_key(
+    canonical: &str,
+    len: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    max_px: u32,
+) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in format!("{canonical}|{len}|{mtime_secs}.{mtime_nanos}|{x}|{y}|{w}|{h}|{max_px}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Cache file for a face crop: same `{app_data}/thumbs/` dir and shared
+/// size-cap eviction as grid thumbs; the key additionally folds in the
+/// normalized crop box so neighbouring faces never collide.
+fn face_cache_file(
+    cache_dir: &std::path::Path,
+    path: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    max_px: u32,
+) -> Result<std::path::PathBuf, String> {
+    let meta = std::fs::metadata(path).map_err(|_| format!("thumb: source file not found: {path}"))?;
+    let (secs, nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let canonical = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    Ok(cache_dir.join(format!(
+        "{}.jpg",
+        face_cache_key(&canonical, meta.len(), secs, nanos, x, y, w, h, max_px)
+    )))
+}
+
+/// Disk-backed face-crop fetch mirroring `cached_thumb_value`: hit → the
+/// cached JPEG re-encoded to the engine's `face_thumb` shape (`{image}`);
+/// miss → a single engine `face_thumb` call whose JPEG bytes populate the
+/// cache. Shares the thumbs dir + prune caps with grid thumbs.
+fn cached_face_thumb_value(
+    engine_state: &engine::EngineState,
+    cache_dir: &std::path::Path,
+    path: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    max_px: u32,
+) -> Result<Value, String> {
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("thumb: source file not found: {path}"));
+    }
+    let cache_file = face_cache_file(cache_dir, path, x, y, w, h, max_px)?;
+    if cache_file.exists() {
+        if let Ok(bytes) = std::fs::read(&cache_file) {
+            if !bytes.is_empty() {
+                return Ok(json!({ "image": b64_encode(&bytes) }));
+            }
+        }
+    }
+    let reply = engine::call_blocking(
+        engine_state,
+        "face_thumb",
+        Some(json!({ "path": path, "x": x, "y": y, "width": w, "height": h, "maxPx": max_px })),
+        Duration::from_secs(60),
+    )?;
+    let b64 = reply
+        .get("image")
+        .and_then(Value::as_str)
+        .ok_or("face_thumb engine returned no image")?;
+    let bytes = b64_decode(b64)?;
+    if bytes.is_empty() {
+        return Err("face_thumb engine returned an empty image".to_string());
+    }
+    if let Some(parent) = cache_file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create thumbs dir: {e}"))?;
+    }
+    std::fs::write(&cache_file, &bytes).map_err(|e| format!("write thumb cache: {e}"))?;
+    prune_thumb_cache(cache_dir, THUMB_CACHE_MAX_BYTES, THUMB_CACHE_PRUNE_TARGET_BYTES);
+    Ok(reply)
+}
+
+/// Face/pet crop with the same disk cache as grid thumbs: repeat expands of
+/// the same (file, box, size, mtime, max_px) skip the engine entirely.
+/// Missing files are a clean error; the cluster view keeps its placeholder.
+#[tauri::command]
+async fn cached_face_thumb(
+    app: tauri::AppHandle,
+    path: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    max_px: u32,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("thumbs");
+        std::fs::create_dir_all(&cache_dir).map_err(|e| format!("create thumbs dir: {e}"))?;
+        let engine_state = app.state::<engine::EngineState>();
+        cached_face_thumb_value(&engine_state, &cache_dir, &path, x, y, width, height, max_px)
+    })
+    .await
+    .map_err(|e| format!("face thumb task join failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2341,6 +2514,7 @@ pub fn run() {
             greet,
             engine_call,
             cached_thumb,
+            cached_face_thumb,
             import_folder,
             enrich_assets,
             hash_candidates_run,
@@ -2882,6 +3056,92 @@ mod tests {
     }
 
     #[test]
+    fn face_cache_key_covers_box_and_max_px() {
+        let dir = std::env::temp_dir().join("ff-face-key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("icon.png");
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        std::fs::copy(&favicon, &src).unwrap();
+        let s = src.to_str().unwrap();
+
+        let a = face_cache_file(&dir, s, 0.1, 0.2, 0.3, 0.4, 256).unwrap();
+        let b = face_cache_file(&dir, s, 0.5, 0.2, 0.3, 0.4, 256).unwrap();
+        assert_ne!(a, b, "x is part of the key");
+        let c = face_cache_file(&dir, s, 0.1, 0.2, 0.3, 0.4, 512).unwrap();
+        assert_ne!(a, c, "max_px is part of the key");
+        let d = face_cache_file(&dir, s, 0.1, 0.2, 0.35, 0.4, 256).unwrap();
+        assert_ne!(a, d, "width is part of the key");
+        assert_eq!(a.extension().and_then(|e| e.to_str()), Some("jpg"));
+
+        // Same path but different bytes → different key (size/mtime invalidation).
+        std::fs::write(&src, b"different-bytes").unwrap();
+        let rewritten = face_cache_file(&dir, s, 0.1, 0.2, 0.3, 0.4, 256).unwrap();
+        assert_ne!(a, rewritten, "edited files must miss the old entry");
+    }
+
+    #[test]
+    fn face_cache_missing_source_is_a_clean_error() {
+        let state = engine::new_state(); // never touched: the stat fails first
+        let dir = std::env::temp_dir().join("ff-face-missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let err = cached_face_thumb_value(&state, &dir, "/definitely/not/a/photo.jpg", 0.1, 0.2, 0.3, 0.4, 256)
+            .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn face_cache_serves_identical_bytes_from_disk() {
+        let state = engine_state();
+        let src_dir = std::env::temp_dir().join("ff-face-src");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let favicon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../static/favicon.png");
+        assert!(favicon.exists(), "static/favicon.png must exist for the face test");
+        let src = src_dir.join("icon.png");
+        std::fs::copy(&favicon, &src).unwrap();
+
+        let cache_dir = std::env::temp_dir().join("ff-face-cache");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Full-image crop: valid on any decodable image.
+        let first = cached_face_thumb_value(&state, &cache_dir, src.to_str().unwrap(), 0.0, 0.0, 1.0, 1.0, 256)
+            .expect("engine face_thumb on favicon.png");
+        let img1 = first.get("image").and_then(Value::as_str).expect("image field");
+        assert!(!img1.is_empty(), "engine must return face bytes");
+
+        let files: Vec<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "one cache file after the first call");
+        let mtime_before = files[0].metadata().unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let second =
+            cached_face_thumb_value(&state, &cache_dir, src.to_str().unwrap(), 0.0, 0.0, 1.0, 1.0, 256)
+                .expect("cached face thumb");
+        let img2 = second.get("image").and_then(Value::as_str).unwrap();
+        assert_eq!(img1, img2, "cache hit returns identical bytes");
+        let mtime_after = std::fs::metadata(&files[0].path()).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "a hit must not rewrite the cache file");
+
+        // A different box must miss and populate a second entry.
+        let third =
+            cached_face_thumb_value(&state, &cache_dir, src.to_str().unwrap(), 0.0, 0.0, 0.5, 0.5, 256)
+                .expect("second box renders");
+        assert!(!third.get("image").and_then(Value::as_str).unwrap().is_empty());
+        let files: Vec<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 2, "a new box is a new cache entry");
+    }
+
+    #[test]
     fn thumb_cache_prune_evicts_oldest_until_under_target() {
         let dir = std::env::temp_dir().join("ff-thumb-prune");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2905,6 +3165,49 @@ mod tests {
 
         // Under the cap: no-op.
         assert_eq!(prune_thumb_cache(&dir, 300, 150), 0);
+    }
+
+    #[test]
+    fn verify_probe_counts_unreadable_without_flagging() {
+        let dir = std::env::temp_dir().join("ff-verify-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.jpg");
+        std::fs::write(&good, b"bytes").unwrap();
+        assert!(!is_unreadable_1byte(good.to_str().unwrap()));
+        assert!(is_unreadable_1byte(dir.to_str().unwrap()), "a directory reads as unreadable");
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO assets (path, name, ext, kind, size_bytes, modified, missing, first_seen_at, last_seen_at) VALUES (?1, 'good.jpg', 'jpg', 'image', 5, 0, 0, 0, 0)",
+            rusqlite::params![good.to_str().unwrap()],
+        )
+        .unwrap();
+        // 25 unreadable rows (directories exist but never read as files).
+        for i in 0..25 {
+            let sub = dir.join(format!("sub{i}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            conn.execute(
+                "INSERT INTO assets (path, name, ext, kind, size_bytes, modified, missing, first_seen_at, last_seen_at) VALUES (?1, 'sub', '', 'image', 0, 0, 0, 0, 0)",
+                rusqlite::params![sub.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        // A vanished file stays the missing pass's business, never unreadable.
+        conn.execute(
+            "INSERT INTO assets (path, name, ext, kind, size_bytes, modified, missing, first_seen_at, last_seen_at) VALUES ('/definitely/not/here.jpg', 'here.jpg', 'jpg', 'image', 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let (count, sample) = probe_unreadable(&conn);
+        assert_eq!(count, 25, "only the unreadable dirs count");
+        assert_eq!(sample.len(), VERIFY_UNREADABLE_SAMPLE_CAP, "sample caps at 20");
+        let flagged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets WHERE missing = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(flagged, 0, "the probe never flags rows");
     }
 
     #[test]

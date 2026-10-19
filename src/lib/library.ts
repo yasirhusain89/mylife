@@ -410,10 +410,7 @@ export function faceThumb(
   height: number,
   maxPx = 256,
 ): Promise<{ image: string }> {
-  return invoke("engine_call", {
-    cmd: "face_thumb",
-    params: { path, x, y, width, height, maxPx },
-  });
+  return invoke("cached_face_thumb", { path, x, y, width, height, maxPx });
 }
 
 export type ClusterProgress = {
@@ -431,7 +428,14 @@ export function runFaceClustering(): Promise<{
   return invoke("cluster_faces", {});
 }
 
-export function verifyLibrary(): Promise<{ missing: number; restored: number }> {
+export type VerifySummary = {
+  missing: number;
+  restored: number;
+  unreadable: number;
+  unreadablePaths: string[];
+};
+
+export function verifyLibrary(): Promise<VerifySummary> {
   return invoke("verify_library");
 }
 

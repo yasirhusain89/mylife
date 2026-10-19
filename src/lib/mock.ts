@@ -476,9 +476,9 @@ export function onClusterProgress(_cb: (p: ClusterProgress) => void): Promise<()
   return Promise.resolve(() => {});
 }
 
-export async function verifyLibrary(): Promise<{ missing: number; restored: number }> {
+export async function verifyLibrary(): Promise<{ missing: number; restored: number; unreadable: number; unreadablePaths: string[] }> {
   const missing = assets.filter((a) => a.missing !== 0).length;
-  return { missing, restored: 0 };
+  return { missing, restored: 0, unreadable: 0, unreadablePaths: [] };
 }
 
 export async function clustersList(): Promise<FaceClusterRow[]> {

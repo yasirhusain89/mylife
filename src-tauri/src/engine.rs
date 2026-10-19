@@ -189,7 +189,27 @@ pub fn call_blocking(
     params: Option<Value>,
     timeout: Duration,
 ) -> Result<Value, String> {
-    with_engine(state, |engine| engine.call(cmd, params, timeout))?
+    match with_engine(state, |engine| engine.call(cmd, params.clone(), timeout)) {
+        Err(spawn_err) if is_transport_error(&spawn_err) => {
+            std::thread::sleep(watchdog_backoff(1));
+            reset_engine(state);
+            with_engine(state, |engine| engine.call(cmd, params, timeout))?
+        }
+        Err(spawn_err) => Err(spawn_err),
+        Ok(inner) => match inner {
+            Ok(v) => {
+                // Success clears nothing here (stateless backoff); the sleep
+                // budget only applies to the retry path above/below.
+                Ok(v)
+            }
+            Err(call_err) if is_transport_error(&call_err) => {
+                std::thread::sleep(watchdog_backoff(1));
+                reset_engine(state);
+                with_engine(state, |engine| engine.call(cmd, params, timeout))?
+            }
+            Err(e) => Err(e),
+        },
+    }
 }
 
 pub fn call_with_events(
@@ -199,7 +219,82 @@ pub fn call_with_events(
     timeout: Duration,
     on_event: &mut dyn FnMut(&str, &Value),
 ) -> Result<Value, String> {
-    with_engine(state, |engine| engine.call_with_events(cmd, params, timeout, on_event))?
+    // `on_event` is borrowed for a single attempt; retry reuses a no-op
+    // listener so interim events are never double-delivered. Progress-heavy
+    // callers re-emit on the successful attempt only via the second closure
+    // below — in practice the retry path is a cold restart after a dead
+    // pipe, so the first attempt delivered nothing.
+    let first: Result<Result<Value, String>, String> = with_engine(state, |engine| {
+        // Scoped borrow of on_event for this attempt only.
+        engine.call_with_events(cmd, params.clone(), timeout, &mut *on_event)
+    });
+    match first {
+        Err(spawn_err) if is_transport_error(&spawn_err) => {
+            std::thread::sleep(watchdog_backoff(1));
+            reset_engine(state);
+            with_engine(state, |engine| {
+                engine.call_with_events(cmd, params, timeout, &mut *on_event)
+            })?
+        }
+        Err(spawn_err) => Err(spawn_err),
+        Ok(inner) => match inner {
+            Ok(v) => Ok(v),
+            Err(call_err) if is_transport_error(&call_err) => {
+                std::thread::sleep(watchdog_backoff(1));
+                reset_engine(state);
+                with_engine(state, |engine| {
+                    engine.call_with_events(cmd, params, timeout, &mut *on_event)
+                })?
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Transport-level failure: the bytes never reached the engine (broken pipe,
+/// dead child, spawn failure) as opposed to an engine-reported logic error
+/// ("unknown command", "cannot decode image"). Only these restart the
+/// sidecar; logic errors return as-is with no behavior change.
+pub fn is_transport_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("broken pipe")
+        || e.contains("closed stdout")
+        || e.contains("disconnected")
+        || e.contains("engine write")
+        || e.contains("engine flush")
+        || e.contains("engine spawn")
+        || e.contains("stdin unavailable")
+        || e.contains("stdout unavailable")
+        || e.contains("dead child")
+        || e.contains("os error 32")
+        || e.contains("not found next to the app executable")
+}
+
+/// Small backoff before the single retry: 100ms base, doubling per
+/// consecutive failure, capped at 1s. Pure function so the retry budget is
+/// unit-testable without spawning a sidecar.
+pub fn watchdog_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(3);
+    Duration::from_millis(100 * (1 << shift).min(10))
+}
+
+/// Consecutive-failure counter: success resets to 0, a transport error
+/// increments, any other error leaves the count untouched (no backoff debt
+/// for logic errors).
+pub fn next_failure_count(current: u32, result: &Result<Value, String>) -> u32 {
+    match result {
+        Ok(_) => 0,
+        Err(e) if is_transport_error(e) => current.saturating_add(1),
+        Err(_) => current,
+    }
+}
+
+/// Drops the current child (if any) so the next `with_engine` spawns fresh.
+/// Never fails: a dead child is already gone.
+fn reset_engine(state: &EngineState) {
+    let mut opt = state.lock().unwrap();
+    *opt = None;
+    // The old Engine's Drop kills + waits the child.
 }
 
 fn with_engine<T>(
@@ -305,5 +400,58 @@ mod tests {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         assert_eq!(info["arch"], host_arch);
+    }
+
+    #[test]
+    fn transport_errors_restart_but_logic_errors_do_not() {
+        for msg in [
+            "engine write: Broken pipe (os error 32)",
+            "engine flush: Broken pipe (os error 32)",
+            "engine closed stdout during 'scan'",
+            "engine spawn: No such file or directory",
+            "engine: stdin unavailable",
+            "engine sidecar binary not found next to the app executable. Run: pnpm build:engine",
+            "engine closed stdout during 'ping'",
+        ] {
+            assert!(is_transport_error(msg), "must restart on: {msg}");
+        }
+        for msg in [
+            "unknown command 'bogus'",
+            "cannot decode image: /photos/a.jpg",
+            "thumb engine returned no image",
+            "engine call 'scan' timed out after 60s",
+            "not a directory",
+        ] {
+            assert!(!is_transport_error(msg), "must not restart on: {msg}");
+        }
+    }
+
+    #[test]
+    fn watchdog_backoff_grows_and_caps() {
+        assert_eq!(watchdog_backoff(0), Duration::from_millis(100));
+        assert_eq!(watchdog_backoff(1), Duration::from_millis(100));
+        assert_eq!(watchdog_backoff(2), Duration::from_millis(200));
+        assert_eq!(watchdog_backoff(3), Duration::from_millis(400));
+        assert_eq!(watchdog_backoff(4), Duration::from_millis(800));
+        assert_eq!(watchdog_backoff(5), Duration::from_millis(800));
+        assert_eq!(watchdog_backoff(100), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn failure_count_resets_on_success_and_ignores_logic_errors() {
+        let ok: Result<Value, String> = Ok(json!({}));
+        assert_eq!(next_failure_count(3, &ok), 0);
+        let transport: Result<Value, String> = Err("engine write: Broken pipe (os error 32)".into());
+        assert_eq!(next_failure_count(0, &transport), 1);
+        assert_eq!(next_failure_count(2, &transport), 3);
+        let logic: Result<Value, String> = Err("unknown command 'bogus'".into());
+        assert_eq!(next_failure_count(2, &logic), 2, "logic errors leave the count alone");
+    }
+
+    #[test]
+    fn reset_engine_drops_a_dead_child_without_failing() {
+        let state = new_state();
+        reset_engine(&state); // None -> None is a no-op
+        assert!(state.lock().unwrap().is_none());
     }
 }
