@@ -7,6 +7,8 @@ Current capabilities: folder import with metadata enrichment, cleanup (exact-dup
 ## Develop
 
 - `pnpm tauri dev` — run the app (dev window + engine sidecar)
+- `pnpm dev:web` — run the UI in a plain browser tab (in-memory mock bridge, no engine)
+- `pnpm test:e2e` — Playwright specs against `dev:web` on port 1422
 - `pnpm build:engine` — rebuild the Swift sidecar (`scripts/build-engine.sh`)
 - `cargo test` (in `src-tauri/`) — Rust suite; `pnpm check` — svelte-check
 

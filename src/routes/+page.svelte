@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { open, isWebMode } from "$lib/bridge";
   import {
     blurredAssets,
     cleanupStats,
@@ -55,8 +55,8 @@
     type EnrichProgress,
     type ImportProgress,
     type LibraryStats
-  } from "$lib/library";
-  import { engineCall, engineSysInfo, type SysInfo } from "$lib/engine";
+  } from "$lib/bridge";
+  import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
 
   type Row = { key: string; val: string };
   type EngineStatus =
@@ -677,9 +677,10 @@
   // The dev server is also reachable from a plain browser tab, where the Tauri
   // IPC bridge does not exist. Skip registration there instead of throwing.
   const inApp = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const web = isWebMode();
 
   onMount(() => {
-    if (!inApp) {
+    if (!inApp && !web) {
       error = "Open this inside the fotoflow app window — the dev-server tab has no engine bridge.";
       return;
     }

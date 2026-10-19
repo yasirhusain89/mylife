@@ -9,5 +9,9 @@ node_modules
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
+# Playwright
+/test-results
+/playwright-report
+
 # Swift sidecar
 sidecar/engine/.build/
