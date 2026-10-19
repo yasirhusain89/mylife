@@ -158,9 +158,22 @@ let albums: MockAlbum[] = [];
 let albumId = 1;
 
 export async function importFolder(root: string, _recursive = true): Promise<ImportSummary> {
+  // Deterministic web-mock batch: 4 images in a distinct month (Nov 2025) so
+  // the months dropdown gains an entry after import. Roots containing
+  // "missing" simulate an ejected volume: those assets are flagged missing so
+  // the Check-files / unreachable UI has something to report.
+  const NOV_BASE = Date.UTC(2025, 10, 15, 12, 0, 0) / 1000;
+  const missingRoot = root.toLowerCase().includes("missing");
   const added: AssetRow[] = [];
   for (let i = 0; i < 4; i++) {
-    added.push(asset(nextId, `IMPORTED_${nextId}.jpg`, "image", { path: `${root}/IMPORTED_${nextId}.jpg` }));
+    const id = nextId;
+    added.push(
+      asset(id, `IMPORTED_${id}.jpg`, "image", {
+        path: `${root}/IMPORTED_${id}.jpg`,
+        capturedAt: NOV_BASE + id * 60,
+        missing: missingRoot ? 1 : 0
+      })
+    );
     nextId++;
   }
   assets = [...assets, ...added];
@@ -253,7 +266,7 @@ export async function libraryStats(): Promise<LibraryStats> {  const photos = as
     photos,
     videos: assets.filter((a) => a.kind === "video").length,
     bytes: assets.reduce((s, a) => s + a.sizeBytes, 0),
-    missing: 0,
+    missing: assets.filter((a) => a.missing !== 0).length,
     hashed: assets.filter((a) => a.sha256 !== null).length
   };
 }
@@ -427,7 +440,8 @@ export function onClusterProgress(_cb: (p: ClusterProgress) => void): Promise<()
 }
 
 export async function verifyLibrary(): Promise<{ missing: number; restored: number }> {
-  return { missing: 0, restored: 0 };
+  const missing = assets.filter((a) => a.missing !== 0).length;
+  return { missing, restored: 0 };
 }
 
 export async function clustersList(): Promise<FaceClusterRow[]> {
