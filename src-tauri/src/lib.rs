@@ -690,6 +690,139 @@ fn rename_event(
     db::rename_event(&conn, event_id, &name)
 }
 
+// MARK: - Place names (reverse-geocode; the one allowed network call)
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GeocodeProgress {
+    pub processed: i64,
+    pub total: i64,
+    pub resolved: i64,
+    pub cached: i64,
+    pub failed: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvePlacesSummary {
+    pub total: i64,
+    pub resolved: i64,
+    pub cached: i64,
+    pub failed: i64,
+}
+
+/// Minimum gap between Nominatim requests (usage policy: max 1 req/s).
+const GEOCODE_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
+
+fn reverse_geocode_nominatim(lat: f64, lon: f64) -> Result<serde_json::Value, String> {
+    let url =
+        format!("https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}");
+    ureq::get(&url)
+        .header("User-Agent", "fotoflow/0.1.0 (local photo manager; place-name lookup only)")
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|e| format!("geocode request: {e}"))?
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .map_err(|e| format!("geocode body: {e}"))
+}
+
+/// Fills `events.place` for every event that has coordinates but no name yet.
+/// Cache-first per ~100m cell; network lookups are throttled to one per
+/// second. A single failed lookup never aborts the run — it is counted and
+/// the loop continues.
+#[tauri::command]
+async fn resolve_places(app: tauri::AppHandle) -> Result<ResolvePlacesSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let targets = db::events_missing_places(&conn)?;
+        let total = targets.len() as i64;
+        let mut resolved = 0i64;
+        let mut cached = 0i64;
+        let mut failed = 0i64;
+        // Cells already attempted this run (Some = place, None = failed):
+        // same-cell events share one network request.
+        let mut seen: std::collections::HashMap<(u64, u64), Option<String>> =
+            std::collections::HashMap::new();
+        let mut last_request: Option<std::time::Instant> = None;
+        for (i, t) in targets.iter().enumerate() {
+            let lat_key = db::round_coord(t.latitude);
+            let lon_key = db::round_coord(t.longitude);
+            let cell = (lat_key.to_bits(), lon_key.to_bits());
+            let place: Option<String> = match seen.get(&cell) {
+                Some(hit) => {
+                    if hit.is_some() {
+                        cached += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    hit.clone()
+                }
+                None => match db::geocode_cache_lookup(&conn, lat_key, lon_key)? {
+                    Some(p) => {
+                        cached += 1;
+                        seen.insert(cell, Some(p.clone()));
+                        Some(p)
+                    }
+                    None => {
+                        if let Some(prev) = last_request {
+                            let elapsed = prev.elapsed();
+                            if elapsed < GEOCODE_MIN_GAP {
+                                std::thread::sleep(GEOCODE_MIN_GAP - elapsed);
+                            }
+                        }
+                        last_request = Some(std::time::Instant::now());
+                        let fetched: Option<String> =
+                            match reverse_geocode_nominatim(t.latitude, t.longitude) {
+                                Ok(body) => body
+                                    .get("address")
+                                    .and_then(db::format_place_nominatim),
+                                Err(e) => {
+                                    let _ = app.emit(
+                                        "geocode-error",
+                                        format!("geocode {lat_key},{lon_key}: {e}"),
+                                    );
+                                    None
+                                }
+                            };
+                        match fetched {
+                            Some(p) => {
+                                resolved += 1;
+                                // A poisoned cache write must not fail the run.
+                                let _ = db::geocode_cache_store(&conn, lat_key, lon_key, &p);
+                                seen.insert(cell, Some(p.clone()));
+                                Some(p)
+                            }
+                            None => {
+                                failed += 1;
+                                seen.insert(cell, None);
+                                None
+                            }
+                        }
+                    }
+                },
+            };
+            if let Some(p) = place {
+                db::set_event_place(&conn, t.event_id, &p)?;
+            }
+            let _ = app.emit(
+                "geocode-progress",
+                GeocodeProgress {
+                    processed: (i + 1) as i64,
+                    total,
+                    resolved,
+                    cached,
+                    failed,
+                },
+            );
+        }
+        Ok(ResolvePlacesSummary { total, resolved, cached, failed })
+    })
+    .await
+    .map_err(|e| format!("geocode task join failed: {e}"))?
+}
+
 // MARK: - Albums
 
 #[tauri::command]
@@ -1180,6 +1313,7 @@ pub fn run() {
             events_list,
             event_assets,
             rename_event,
+            resolve_places,
             albums_list,
             album_create,
             album_rename,
@@ -1567,5 +1701,24 @@ mod export_tests {
         assert_eq!(slugify("Bday / Kids & parents!"), "bday-kids-parents");
         assert_eq!(slugify("///"), "event");
         assert_eq!(slugify("August 12 2026"), "august-12-2026");
+    }
+}
+
+#[cfg(test)]
+mod geocode_tests {
+    use super::reverse_geocode_nominatim;
+
+    /// Live check of the Nominatim request path (TLS, headers, JSON shape).
+    /// Ignored by default so the suite stays hermetic; run explicitly to
+    /// re-verify the one allowed network call.
+    #[test]
+    #[ignore]
+    fn live_reverse_geocode_returns_address() {
+        let body = reverse_geocode_nominatim(37.7749, -122.4194).expect("nominatim reachable");
+        let place = body
+            .get("address")
+            .and_then(crate::db::format_place_nominatim)
+            .expect("address formats to a label");
+        assert!(place.contains("San Francisco"), "unexpected label: {place}");
     }
 }

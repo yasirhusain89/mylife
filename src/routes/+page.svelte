@@ -9,6 +9,9 @@
     eventsList,
     eventAssets,
     renameEvent,
+    resolvePlaces,
+    onGeocodeProgress,
+    onGeocodeError,
     albumsList,
     albumCreate,
     albumRename,
@@ -50,6 +53,7 @@
     type FaceClusterRow,
     type EventRow,
     type EventAssetRow,
+    type GeocodeProgress,
     type FaceRow,
     type DuplicateGroup,
     type EnrichProgress,
@@ -116,6 +120,8 @@
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
   let eventsLoading = $state(false);
+  let resolvingPlaces = $state(false);
+  let geocodeState = $state<GeocodeProgress | null>(null);
   let toast = $state<string | null>(null);
 
   async function checkEngine() {
@@ -575,6 +581,24 @@
     }
   }
 
+  async function runResolvePlaces() {
+    resolvingPlaces = true;
+    geocodeState = null;
+    try {
+      const summary = await resolvePlaces();
+      events = await eventsList();
+      toast =
+        summary.total === 0
+          ? "Every located event already has a place name"
+          : `Resolved ${summary.resolved + summary.cached} of ${summary.total} place name${summary.total === 1 ? "" : "s"}` +
+            (summary.failed > 0 ? ` (${summary.failed} failed — retry later)` : "");
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      resolvingPlaces = false;
+    }
+  }
+
   async function doRename(event: EventRow) {
     const name = window.prompt("Event name", event.name);
     if (name === null || name.trim() === "" || name === event.name) return;
@@ -704,6 +728,12 @@
         if (peopleLoading && clusterState) {
           clusterState = { processed: p.processed, total: p.total };
         }
+      }),
+      onGeocodeProgress((p) => {
+        if (resolvingPlaces) geocodeState = p;
+      }),
+      onGeocodeError((m) => {
+        error = m;
       })
     ];
     void refresh();
@@ -1083,7 +1113,17 @@
         <button onclick={runClusterEvents} disabled={eventsLoading}>
           {eventsLoading ? "Clustering…" : "Cluster events by time & place"}
         </button>
+        <button onclick={runResolvePlaces} disabled={resolvingPlaces || eventsLoading}>
+          {resolvingPlaces ? "Resolving…" : "Resolve place names"}
+        </button>
       </div>
+      {#if geocodeState && resolvingPlaces}
+        <p class="hint">
+          {geocodeState.processed} of {geocodeState.total} places ·
+          {geocodeState.cached} cached{geocodeState.failed > 0 ? ` · ${geocodeState.failed} failed` : ""}
+        </p>
+      {/if}
+      <p class="hint">Place names come from OpenStreetMap and are cached on this device.</p>
       {#if events.length}
         {#each events as event (event.id)}
           <article class="group event-card">
@@ -1097,9 +1137,9 @@
             <p class="meta">
               {event.assetCount} asset{event.assetCount === 1 ? "" : "s"} ·
               {event.faceCount} face{event.faceCount === 1 ? "" : "s"} ·
-              {event.latitude !== null && event.longitude !== null
+              {event.place ?? (event.latitude !== null && event.longitude !== null
                 ? `${event.latitude.toFixed(4)}, ${event.longitude.toFixed(4)}`
-                : "no location"}
+                : "no location")}
             </p>
             <div class="row-actions">
               <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>

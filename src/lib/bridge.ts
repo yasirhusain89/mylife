@@ -61,6 +61,9 @@ export const clusterEvents = pick("clusterEvents");
 export const eventsList = pick("eventsList");
 export const eventAssets = pick("eventAssets");
 export const renameEvent = pick("renameEvent");
+export const resolvePlaces = pick("resolvePlaces");
+export const onGeocodeProgress = pick("onGeocodeProgress");
+export const onGeocodeError = pick("onGeocodeError");
 export const albumsList = pick("albumsList");
 export const albumCreate = pick("albumCreate");
 export const albumRename = pick("albumRename");
@@ -103,11 +106,13 @@ export type {
   ExportSummary,
   FaceClusterRow,
   FaceRow,
+  GeocodeProgress,
   HighlightResult,
   ImportProgress,
   ImportSummary,
   LibraryFilters,
   LibraryMonth,
-  LibraryStats
+  LibraryStats,
+  ResolvePlacesSummary
 } from "./library";
 export type { SysInfo } from "./engine";

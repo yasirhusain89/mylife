@@ -295,6 +295,33 @@ export function renameEvent(eventId: number, name: string): Promise<void> {
   return invoke("rename_event", { event_id: eventId, name });
 }
 
+export type GeocodeProgress = {
+  processed: number;
+  total: number;
+  resolved: number;
+  cached: number;
+  failed: number;
+};
+
+export type ResolvePlacesSummary = {
+  total: number;
+  resolved: number;
+  cached: number;
+  failed: number;
+};
+
+export function resolvePlaces(): Promise<ResolvePlacesSummary> {
+  return invoke("resolve_places");
+}
+
+export function onGeocodeProgress(cb: (p: GeocodeProgress) => void): Promise<() => void> {
+  return listen<GeocodeProgress>("geocode-progress", (e) => cb(e.payload));
+}
+
+export function onGeocodeError(cb: (message: string) => void): Promise<() => void> {
+  return listen<string>("geocode-error", (e) => cb(e.payload));
+}
+
 // MARK: - Albums (user-curated lists, usable as export sources)
 
 export type AlbumRow = {

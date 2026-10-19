@@ -52,3 +52,12 @@ test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
+
+test("event place names resolve from coordinates", async ({ page }) => {
+  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await expect(page.getByText("InlawsVisit2026")).toBeVisible();
+  await expect(page.getByText("37.7749, -122.4194")).toBeVisible();
+  await page.getByRole("button", { name: "Resolve place names" }).click();
+  await expect(page.getByText("San Francisco, California")).toBeVisible();
+});

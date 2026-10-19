@@ -13,12 +13,14 @@ import type {
   ExportSummary,
   FaceClusterRow,
   FaceRow,
+  GeocodeProgress,
   HighlightResult,
   ImportProgress,
   ImportSummary,
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  ResolvePlacesSummary,
   ClusterProgress
 } from "./library";
 
@@ -344,8 +346,8 @@ export async function clusterEvents(
         name: "InlawsVisit2026",
         startedAt: start,
         endedAt: start + 3600 * 3,
-        latitude: null,
-        longitude: null,
+        latitude: 37.7749,
+        longitude: -122.4194,
         place: null,
         assetCount: assets.length,
         faceCount: 0
@@ -367,6 +369,24 @@ export async function eventAssets(eventId: number): Promise<EventAssetRow[]> {
 
 export async function renameEvent(eventId: number, name: string): Promise<void> {
   events = events.map((e) => (e.id === eventId ? { ...e, name } : e));
+}
+
+export async function resolvePlaces(): Promise<ResolvePlacesSummary> {
+  const missing = events.filter((e) => e.place === null && e.latitude !== null && e.longitude !== null);
+  events = events.map((e) =>
+    e.place === null && e.latitude !== null && e.longitude !== null
+      ? { ...e, place: "San Francisco, California" }
+      : e,
+  );
+  return { total: missing.length, resolved: missing.length, cached: 0, failed: 0 };
+}
+
+export function onGeocodeProgress(_cb: (p: GeocodeProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
+export function onGeocodeError(_cb: (message: string) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
 }
 
 function albumRow(a: MockAlbum): AlbumRow {

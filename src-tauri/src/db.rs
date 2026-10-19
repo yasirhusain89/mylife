@@ -13,6 +13,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/004_faces.sql")),
     (5, include_str!("../migrations/005_events.sql")),
     (6, include_str!("../migrations/006_albums.sql")),
+    (7, include_str!("../migrations/007_geocode.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -639,6 +640,98 @@ pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), 
         return Err(format!("event {event_id} not found"));
     }
     Ok(())
+}
+
+// MARK: - Place names (reverse-geocode cache; the one network exception)
+
+/// Cache cell: 3-decimal rounding (~100m), so nearby centroids share a lookup.
+pub fn round_coord(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+pub struct PlaceTarget {
+    pub event_id: i64,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// Events that have coordinates but no resolved place name yet.
+pub fn events_missing_places(conn: &Connection) -> Result<Vec<PlaceTarget>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, latitude, longitude FROM events WHERE place IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id")
+        .map_err(|e| format!("prepare missing places: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(PlaceTarget {
+                event_id: r.get(0)?,
+                latitude: r.get(1)?,
+                longitude: r.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query missing places: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("missing place row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn geocode_cache_lookup(
+    conn: &Connection,
+    lat_key: f64,
+    lon_key: f64,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT place FROM geocode_cache WHERE lat_key = ?1 AND lon_key = ?2",
+        params![lat_key, lon_key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("geocode lookup: {e}"))
+}
+
+pub fn geocode_cache_store(
+    conn: &Connection,
+    lat_key: f64,
+    lon_key: f64,
+    place: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO geocode_cache (lat_key, lon_key, place, fetched_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (lat_key, lon_key) DO UPDATE SET place = excluded.place, fetched_at = excluded.fetched_at",
+        params![lat_key, lon_key, place, now()],
+    )
+    .map_err(|e| format!("geocode store: {e}"))?;
+    Ok(())
+}
+
+pub fn set_event_place(conn: &Connection, event_id: i64, place: &str) -> Result<(), String> {
+    conn.execute("UPDATE events SET place = ?2 WHERE id = ?1", params![event_id, place])
+        .map_err(|e| format!("set event place: {e}"))?;
+    Ok(())
+}
+
+/// Short "City, Region" label from a Nominatim `address` object. Pure and
+/// unit-tested; the network layer only feeds it JSON.
+pub fn format_place_nominatim(address: &serde_json::Value) -> Option<String> {
+    let str_field = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            address
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    };
+    let locality = str_field(&["city", "town", "village", "hamlet", "municipality", "county"]);
+    let region = str_field(&["state", "country"]);
+    match (locality, region) {
+        (Some(l), Some(r)) if l != r => Some(format!("{l}, {r}")),
+        (Some(l), _) => Some(l),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
 }
 
 // MARK: - Albums (user-curated lists, the "audience groups" for export)
@@ -1373,10 +1466,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 6, "user_version tracks the highest applied migration");
+        assert_eq!(v, 7, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -1652,6 +1745,59 @@ mod tests {
         let mut bad = asset("/x.jpg", 1, 1.0);
         bad.kind = "other".into();
         assert!(upsert_asset(&conn, &bad, scan).is_err(), "kind must be image or video");
+    }
+
+    #[test]
+    fn geocode_cache_feeds_missing_places_without_network() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO events (name, started_at, ended_at, latitude, longitude, asset_count, face_count, created_at)
+             VALUES ('Oct 9', 1.0, 2.0, 37.7749, -122.4194, 3, 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (name, started_at, ended_at, latitude, longitude, asset_count, face_count, created_at)
+             VALUES ('Oct 10', 3.0, 4.0, NULL, NULL, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let missing = events_missing_places(&conn).unwrap();
+        assert_eq!(missing.len(), 1, "only the geotagged event needs a place");
+        assert_eq!(missing[0].latitude, 37.7749);
+
+        // Rounding buckets nearby centroids into one cache cell.
+        assert_eq!(round_coord(37.77494), round_coord(37.7749));
+        assert!((round_coord(-122.41944) - -122.419).abs() < 1e-9);
+
+        assert!(geocode_cache_lookup(&conn, 37.775, -122.419).unwrap().is_none());
+        geocode_cache_store(&conn, 37.775, -122.419, "San Francisco, California").unwrap();
+        assert_eq!(
+            geocode_cache_lookup(&conn, 37.775, -122.419).unwrap().as_deref(),
+            Some("San Francisco, California")
+        );
+
+        set_event_place(&conn, missing[0].event_id, "San Francisco, California").unwrap();
+        assert!(events_missing_places(&conn).unwrap().is_empty());
+        let rows = events_list(&conn).unwrap();
+        let placed = rows.iter().find(|r| r.id == missing[0].event_id).unwrap();
+        assert_eq!(placed.place.as_deref(), Some("San Francisco, California"));
+    }
+
+    #[test]
+    fn format_place_prefers_city_region() {
+        let addr = serde_json::json!({"city": "San Francisco", "state": "California", "country": "United States"});
+        assert_eq!(format_place_nominatim(&addr).as_deref(), Some("San Francisco, California"));
+        let addr = serde_json::json!({"village": "Mawlynnong", "country": "India"});
+        assert_eq!(format_place_nominatim(&addr).as_deref(), Some("Mawlynnong, India"));
+        let addr = serde_json::json!({"country": "Iceland"});
+        assert_eq!(format_place_nominatim(&addr).as_deref(), Some("Iceland"));
+        let addr = serde_json::json!({"city": "Singapore", "country": "Singapore"});
+        assert_eq!(format_place_nominatim(&addr).as_deref(), Some("Singapore"), "no doubled locality");
+        let addr = serde_json::json!({"road": "Some Street"});
+        assert!(format_place_nominatim(&addr).is_none(), "street alone is not a place label");
     }
 }
 
