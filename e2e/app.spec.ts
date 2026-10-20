@@ -1899,3 +1899,18 @@ test("space saver compresses dup extras plus blurred", async ({ page }) => {
   await expect(page.locator(".toast")).toContainText("Compressed 2 photos");
   await expect(page.getByText("Compressed 2 to /mock/picked-folder/space-saver")).toBeVisible();
 });
+
+test("recently deleted lists trash and restores", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".batch-bar").getByRole("button", { name: "Trash", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.locator(".toast")).toContainText("moved to Trash");
+  await page.getByRole("button", { name: "Recently Deleted", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Recently Deleted" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("IMG_20261007_185817.jpg");
+  await dialog.getByRole("button", { name: "Restore", exact: true }).click();
+  await expect(page.locator(".toast")).toContainText("Restored IMG_20261007_185817.jpg");
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+});

@@ -128,6 +128,8 @@ export const exportHighlight = pick("exportHighlight");
 export const ingestCopy = pick("ingestCopy");
 export const onIngestProgress = pick("onIngestProgress");
 export const addEventPicksToAlbum = pick("addEventPicksToAlbum");
+export const trashList = pick("trashList");
+export const clearTrashLog = pick("clearTrashLog");
 export const onHashProgress = pick("onHashProgress");
 export const onQualityProgress = pick("onQualityProgress");
 export const engineThumb = pick("engineThumb");
@@ -190,6 +192,7 @@ export type {
   PipelineProgress,
   PipelineSummary,
   ResolvePlacesSummary,
+  TrashEntry,
   ScanRoot,
   SceneTag,
   SceneTagCount,

@@ -678,6 +678,22 @@ export function addEventPicksToAlbum(eventId: number, albumId: number, limit = 1
   return invoke("add_event_picks_to_album", { eventId, albumId, limit });
 }
 
+// Recently Deleted: trashed assets beyond the session-undo window.
+export type TrashEntry = {
+  assetId: number;
+  path: string;
+  name: string;
+  trashedAt: number;
+};
+
+export function trashList(): Promise<TrashEntry[]> {
+  return invoke("trash_list");
+}
+
+export function clearTrashLog(): Promise<number> {
+  return invoke("clear_trash_log");
+}
+
 export function albumRemove(albumId: number, assetId: number): Promise<void> {
   return invoke("album_remove", { albumId, assetId });
 }

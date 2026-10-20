@@ -40,7 +40,8 @@ import type {
   SimilarHit,
   TagProgress,
   TagScenesSummary,
-  ClusterProgress
+  ClusterProgress,
+  TrashEntry,
 } from "./library";
 
 /**
@@ -129,6 +130,7 @@ let nextId = 100;
 // Session-undo shelf: trashAssets moves rows here, restoreAssets moves them
 // back. Mirrors the backend keeping DB rows with missing=1.
 let trashedStore = new Map<number, AssetRow>();
+let trashedAt = new Map<number, number>();
 let scanHistory: string[] = ["/photos"];
 
 // AssetRow carries lat/lng for the rare fully-tagged fixture; the mock
@@ -508,7 +510,11 @@ export async function blurredAssets(limit = 60): Promise<AssetRow[]> {
 export async function trashAssets(ids: number[]): Promise<{ trashed: number; failed: string[] }> {
   const drop = new Set(ids);
   const found = assets.filter((a) => drop.has(a.id));
-  for (const a of found) trashedStore.set(a.id, a);
+  const now = Math.floor(Date.now() / 1000);
+  for (const a of found) {
+    trashedStore.set(a.id, a);
+    trashedAt.set(a.id, now);
+  }
   assets = assets.filter((a) => !drop.has(a.id));
   return { trashed: found.length, failed: [] };
 }
@@ -523,11 +529,31 @@ export async function restoreAssets(ids: number[]): Promise<{ restored: number; 
       continue;
     }
     trashedStore.delete(id);
+    trashedAt.delete(id);
     assets = [...assets, { ...row, missing: 0 }];
     restored++;
   }
   assets.sort((x, y) => x.id - y.id);
   return { restored, failed };
+}
+
+/** Recently Deleted stand-in over the trash shelf. */
+export async function trashList(): Promise<TrashEntry[]> {
+  return [...trashedStore.values()]
+    .map((a) => ({
+      assetId: a.id,
+      path: a.path,
+      name: a.name,
+      trashedAt: trashedAt.get(a.id) ?? 0
+    }))
+    .sort((x, y) => y.trashedAt - x.trashedAt || y.assetId - x.assetId);
+}
+
+export async function clearTrashLog(): Promise<number> {
+  const n = trashedStore.size;
+  trashedStore.clear();
+  trashedAt.clear();
+  return n;
 }
 
 export async function setFavorite(assetId: number, favorite: boolean): Promise<void> {

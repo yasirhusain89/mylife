@@ -55,6 +55,9 @@
     scoreQuality,
     trashAssets,
     restoreAssets,
+    trashList,
+    clearTrashLog,
+    type TrashEntry,
     importFolder,
     onEnrichProgress,
     libraryList,
@@ -1979,6 +1982,67 @@
     }
   }
 
+  // Recently Deleted: trashed assets beyond the session-undo window.
+  // Restoring reuses the same ~/.Trash lookup as session undo; entries whose
+  // files left the macOS Trash report the plain-language reason instead.
+  let trashOpen = $state(false);
+  let trashRows = $state<TrashEntry[]>([]);
+  let trashLoading = $state(false);
+
+  async function openTrash() {
+    trashOpen = true;
+    trashLoading = true;
+    try {
+      trashRows = await trashList();
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      trashLoading = false;
+    }
+  }
+
+  async function restoreTrashRow(entry: TrashEntry) {
+    try {
+      const r = await restoreAssets([entry.assetId]);
+      if (r.restored > 0) {
+        trashRows = trashRows.filter((t) => t.assetId !== entry.assetId);
+        await refresh();
+        toast = `Restored ${entry.name}`;
+      } else {
+        error = r.failed[0] ?? `Couldn't restore ${entry.name}`;
+      }
+    } catch (e) {
+      error = friendlyError(e);
+    }
+  }
+
+  async function restoreTrashAll() {
+    const ids = trashRows.map((t) => t.assetId);
+    if (ids.length === 0) return;
+    try {
+      const r = await restoreAssets(ids);
+      trashRows = await trashList();
+      await refresh();
+      toast =
+        r.failed.length === 0
+          ? `Restored ${r.restored} photo${r.restored === 1 ? "" : "s"}`
+          : `Restored ${r.restored}, ${r.failed.length} couldn't come back`;
+      if (r.failed.length > 0) error = r.failed.slice(0, 3).join("; ");
+    } catch (e) {
+      error = friendlyError(e);
+    }
+  }
+
+  async function clearTrash() {
+    try {
+      const n = await clearTrashLog();
+      trashRows = [];
+      toast = n > 0 ? `Cleared ${n} ${n === 1 ? "entry" : "entries"} from Recently Deleted` : "Recently Deleted is already empty";
+    } catch (e) {
+      error = friendlyError(e);
+    }
+  }
+
   async function runPipeline() {
     if (pipelining) return;
     pipelining = true;
@@ -3552,6 +3616,7 @@
         <button type="button" class="tab" onclick={() => void pinVideos()}>Videos</button>
         <button type="button" class="tab" onclick={() => void pinScreenshots()}>Screenshots</button>
         <button type="button" class="tab" onclick={pinPeople}>People</button>
+        <button type="button" class="tab" onclick={() => void openTrash()}>Recently Deleted</button>
       </div>
       <div class="sidebar-footer">
         <button
@@ -4817,6 +4882,39 @@
     </div><!-- /.content -->
   </div><!-- /.shell -->
 
+  {#if trashOpen}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget) trashOpen = false; }}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="trash-heading" tabindex={-1} use:dialogFocus={() => (trashOpen = false)}>
+        <h3 id="trash-heading">Recently Deleted</h3>
+        <p class="hint">Photos trashed from anywhere in the app. Restoring puts the file back where it was — unless the macOS Trash was emptied since.</p>
+        {#if trashLoading}
+          <p class="hint">Loading…</p>
+        {:else if trashRows.length === 0}
+          <p class="hint">Nothing here — trashed photos wait here until you clear the list.</p>
+        {:else}
+          <ul class="trash-list">
+            {#each trashRows as t (t.assetId)}
+              <li>
+                <span class="name" title={t.path}>{t.name}</span>
+                <span class="hint">{fmtDate(t.trashedAt)}</span>
+                <button type="button" class="tiny" onclick={() => void restoreTrashRow(t)}>Restore</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (trashOpen = false)}>Close</button>
+          {#if trashRows.length > 0}
+            <button class="ghost" onclick={() => void clearTrash()}>Clear list</button>
+            <button disabled={trashLoading} onclick={() => void restoreTrashAll()}>Restore all</button>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if ingest}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -5985,6 +6083,29 @@
   .theater-info {
     align-self: center;
     width: min(28rem, 92%);
+  }
+  /* Recently Deleted rows: name + date left, Restore right. */
+  .trash-list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-height: 16rem;
+    overflow: auto;
+  }
+  .trash-list li {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .trash-list .name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .grid > figure {
     position: relative;
