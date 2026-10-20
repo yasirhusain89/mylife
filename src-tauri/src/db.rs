@@ -135,6 +135,42 @@ pub struct ScanRoot {
     pub missing: i64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapPin {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// Map marker cap: thousands of circle markers stay interactive; beyond this
+/// the map needs clustering or filters (follow-up).
+pub const MAP_PINS_LIMIT: i64 = 5000;
+
+/// Every geotagged, present asset for the map view. No filters in v1: the map
+/// shows the whole library, ordered by id.
+pub fn map_pins(conn: &Connection) -> Result<Vec<MapPin>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path, name, latitude, longitude FROM assets
+             WHERE missing = 0 AND latitude IS NOT NULL AND longitude IS NOT NULL
+             ORDER BY id LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare map pins: {e}"))?;
+    let rows = stmt
+        .query_map(params![MAP_PINS_LIMIT], |r| {
+            Ok(MapPin { id: r.get(0)?, path: r.get(1)?, name: r.get(2)?, latitude: r.get(3)?, longitude: r.get(4)? })
+        })
+        .map_err(|e| format!("query map pins: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("map pin row: {e}"))?);
+    }
+    Ok(out)
+}
+
 /// Escape for LIKE patterns: roots containing `%`/`_` must match literally.
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
@@ -3880,6 +3916,26 @@ mod tests {
         assert_eq!(ids.len(), 1, "% in root matches literally");
         let ids = asset_ids_in_root(&conn, "/nowhere").unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn map_pins_returns_only_geotagged_present_assets() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/c.jpg", 1, 3.0), scan).unwrap();
+        conn.execute("UPDATE assets SET latitude = 37.7, longitude = -122.4 WHERE path = '/a.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET latitude = 38.0, longitude = -122.0 WHERE path IN ('/b.jpg', '/c.jpg')", [])
+            .unwrap();
+        conn.execute("UPDATE assets SET missing = 1 WHERE path = '/c.jpg'", []).unwrap();
+
+        let pins = map_pins(&conn).unwrap();
+        assert_eq!(pins.len(), 2, "unlocated and missing rows are skipped");
+        assert_eq!(pins[0].path, "/a.jpg");
+        assert!((pins[0].latitude - 37.7).abs() < 1e-9);
+        assert_eq!(pins[1].path, "/b.jpg");
     }
 
     #[test]

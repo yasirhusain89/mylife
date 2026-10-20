@@ -7,6 +7,7 @@ import type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  MapPin,
   ScanRoot,
   SceneTagCount,
   TagScenesSummary
@@ -114,6 +115,19 @@ export function scanRoots(): Promise<ScanRoot[]> {
 
 export function assetsInRoot(root: string): Promise<number[]> {
   return getJson<number[]>(`/api/root-assets?root=${encodeURIComponent(root)}`);
+}
+
+export function mapPins(): Promise<MapPin[]> {
+  return getJson<MapPin[]>("/api/map-pins");
+}
+
+/**
+ * HTTP-mode tiles skip the Rust disk cache (the server is a LAN service, not
+ * the desktop app): plain OSM URLs, browser-cached. Attribution is still
+ * rendered by the map UI.
+ */
+export async function mapTile(z: number, x: number, y: number): Promise<string> {
+  return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
 }
 
 export function clustersList(): Promise<FaceClusterRow[]> {

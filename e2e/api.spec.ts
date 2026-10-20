@@ -142,3 +142,11 @@ test("path import via Scan adds a second root and grows counts", async ({ page }
   }, API!);
   expect(roots.some((r) => r.root === tmpRoot)).toBe(true);
 });
+
+test("map pins endpoint serves an array", async ({ page }) => {
+  const pins = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/map-pins`);
+    return (await r.json()) as unknown;
+  }, API!);
+  expect(Array.isArray(pins)).toBe(true);
+});

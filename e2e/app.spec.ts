@@ -23,6 +23,9 @@ test("all tabs navigate and render", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "People" })).toBeVisible();
   await page.getByRole("button", { name: "Events", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Events" })).toBeVisible();
+  await page.getByRole("button", { name: "Map", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Map" })).toBeVisible();
+  await expect(page.locator(".leaflet-container")).toBeVisible();
   await page.getByRole("button", { name: "Albums", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Albums" })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
@@ -205,6 +208,17 @@ test("slideshow plays just the current selection", async ({ page }) => {
   await expect(show).toBeHidden();
   // Selection survives the show.
   await expect(page.getByText("6 selected")).toBeVisible();
+});
+
+test("map tab plots located photos and jumps to the library", async ({ page }) => {
+  await page.getByRole("button", { name: "Map", exact: true }).click();
+  const map = page.locator(".leaflet-container");
+  await expect(map).toBeVisible();
+  await expect(map.locator("path.leaflet-interactive")).toHaveCount(4);
+  await expect(map.locator(".leaflet-control-attribution")).toContainText("OpenStreetMap");
+  await map.locator("path.leaflet-interactive").first().click();
+  await page.getByRole("button", { name: "Show in Library" }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
 });
 
 test("month filter narrows the grid", async ({ page }) => {

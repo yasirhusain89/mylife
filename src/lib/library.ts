@@ -233,6 +233,23 @@ export function assetsInRoot(root: string): Promise<number[]> {
   return invoke("assets_in_root", { root });
 }
 
+export type MapPin = {
+  id: number;
+  path: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+};
+
+export function mapPins(): Promise<MapPin[]> {
+  return invoke("map_pins");
+}
+
+/** One cached OSM tile as a data URL (desktop only — see api.ts for the HTTP fallback). */
+export function mapTile(z: number, x: number, y: number): Promise<string> {
+  return invoke("map_tile", { z, x, y });
+}
+
 export function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {
   return listen<ImportProgress>("import-progress", (e) => cb(e.payload));
 }

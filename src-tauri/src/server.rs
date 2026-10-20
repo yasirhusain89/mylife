@@ -156,6 +156,17 @@ async fn root_assets(State(state): State<ApiState>, Query(p): Query<RootAssetsPa
     }
 }
 
+async fn map_pins(State(state): State<ApiState>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::map_pins(&conn) {
+        Ok(pins) => (cors(), Json(pins)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn clusters(State(state): State<ApiState>) -> Response {
     let conn = match lock(&state) {
         Ok(g) => g,
@@ -225,6 +236,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/tags/run", post(tags_run).options(preflight))
         .route("/api/favorites", post(favorite_set).options(preflight))
         .route("/api/imports", post(imports).options(preflight))
+        .route("/api/map-pins", get(map_pins))
         .with_state(state)
 }
 

@@ -24,6 +24,7 @@ import type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  MapPin,
   PetProgress,
   PetSighting,
   DetectPetsSummary,
@@ -305,6 +306,32 @@ export async function assetsInRoot(root: string): Promise<number[]> {
   return assets
     .filter((a) => a.path === root || a.path === base || a.path.startsWith(`${base}/`))
     .map((a) => a.id);
+}
+
+// Web-mock pins: the "located" assets get deterministic coords around San
+// Francisco so the map view has something to plot without a backend.
+export async function mapPins(): Promise<MapPin[]> {
+  return [...located]
+    .sort((a, b) => a - b)
+    .map((id, i) => {
+      const a = assets.find((x) => x.id === id)!;
+      return {
+        id: a.id,
+        path: a.path,
+        name: a.name,
+        latitude: 37.7749 + i * 0.002,
+        longitude: -122.4194 + i * 0.0015
+      };
+    });
+}
+
+// Web-mock tiles: a labeled grid data URL — no network in tests.
+export async function mapTile(z: number, x: number, y: number): Promise<string> {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256">` +
+    `<rect width="256" height="256" fill="#1a2030"/>` +
+    `<text x="128" y="128" fill="#5a6a8a" font-size="16" text-anchor="middle">${z}/${x}/${y}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
 export async function enrichAssets(_maxAttempts = 3): Promise<EnrichSummary> {

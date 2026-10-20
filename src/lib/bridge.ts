@@ -64,6 +64,8 @@ export const libraryMonths = pickRead("libraryMonths");
 export const libraryStats = pickRead("libraryStats");
 export const scanRoots = pickRead("scanRoots");
 export const assetsInRoot = pickRead("assetsInRoot");
+export const mapPins = pickRead("mapPins");
+export const mapTile = pickRead("mapTile");
 export const setFavorite = pickWrite("setFavorite");
 export const tagScenes = pickWrite("tagScenes");
 export const onTagProgress = pick("onTagProgress");
@@ -172,6 +174,7 @@ export type {
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
+  MapPin,
   PetProgress,
   PetSighting,
   DetectPetsSummary,

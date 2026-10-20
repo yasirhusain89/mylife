@@ -2165,6 +2165,113 @@ fn assets_in_root(conn: tauri::State<'_, DbState>, root: String) -> Result<Vec<i
     db::asset_ids_in_root(&conn, &root)
 }
 
+/// Geotagged pins for the map view (whole library, capped — see
+/// `db::MAP_PINS_LIMIT`).
+#[tauri::command]
+fn map_pins(conn: tauri::State<'_, DbState>) -> Result<Vec<db::MapPin>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::map_pins(&conn)
+}
+
+/// OSM raster tile cache caps: tiles are ~15KB, so this holds thousands of
+/// panned/zoomed views before the oldest go.
+const MAP_TILE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const MAP_TILE_CACHE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One OpenStreetMap raster tile as a data URL, cached under
+/// `app_data/maptiles/{z}/{x}/{y}.png`. Cache-first so repeat pans cost no
+/// network; upstream tile usage policy (valid User-Agent, ≤2 parallel) is
+/// honored by the app UA below and the command threadpool. Attribution
+/// "© OpenStreetMap contributors" is rendered by the map UI.
+#[tauri::command]
+async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if z > 19 {
+            return Err("tile zoom out of range (0-19)".to_string());
+        }
+        let n = 1u32 << z;
+        if x >= n || y >= n {
+            return Err("tile coordinates out of range".to_string());
+        }
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("maptiles")
+            .join(z.to_string())
+            .join(x.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create tile dir: {e}"))?;
+        let file = dir.join(format!("{y}.png"));
+        if !file.is_file() {
+            let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
+            let bytes = ureq::get(&url)
+                .header("User-Agent", "fotoflow/0.1.0 (local photo manager; map tile cache)")
+                .header("Accept", "image/png")
+                .call()
+                .map_err(|e| format!("tile download: {e}"))?
+                .body_mut()
+                .read_to_vec()
+                .map_err(|e| format!("tile body: {e}"))?;
+            if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 {
+                return Err("tile download: unexpected body".to_string());
+            }
+            std::fs::write(&file, &bytes).map_err(|e| format!("cache tile: {e}"))?;
+            prune_dir_recursive(
+                &app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?.join("maptiles"),
+                MAP_TILE_CACHE_MAX_BYTES,
+                MAP_TILE_CACHE_TARGET_BYTES,
+            );
+        }
+        let bytes = std::fs::read(&file).map_err(|e| format!("read tile: {e}"))?;
+        Ok(format!("data:image/png;base64,{}", b64_encode(&bytes)))
+    })
+    .await
+    .map_err(|e| format!("tile task join failed: {e}"))?
+}
+
+/// Recursive twin of `prune_thumb_cache` (tiles nest z/x/y; thumbs are flat).
+/// Oldest files first; individual stat/remove failures are skipped.
+fn prune_dir_recursive(dir: &std::path::Path, max_bytes: u64, target_bytes: u64) {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(u64, std::path::PathBuf, u64)>, total: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, out, total);
+                continue;
+            }
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() * 1_000_000_000 + d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            *total += size;
+            out.push((mtime, p, size));
+        }
+    }
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+    walk(dir, &mut entries, &mut total);
+    if total <= max_bytes {
+        return;
+    }
+    entries.sort_by_key(|(mtime, _, _)| *mtime); // oldest first
+    for (_, path, size) in entries {
+        if total <= target_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
 // MARK: - Thumbnail disk cache
 
 /// Cap for the on-disk thumbnail cache: past this size the oldest entries
@@ -2582,6 +2689,8 @@ pub fn run() {
             library_stats,
             scan_roots,
             assets_in_root,
+            map_pins,
+            map_tile,
             set_favorite
         ])
         .run(tauri::generate_context!())

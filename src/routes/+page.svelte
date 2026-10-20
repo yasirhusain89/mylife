@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { open, isWebMode, isApiMode, assetUrl } from "$lib/bridge";  import {
     blurredAssets,
     cleanupStats,
@@ -88,9 +88,15 @@
     type SceneTag,
     type SceneTagCount,
     type TagProgress,
-    type EmbedProgress
+    type EmbedProgress,
+    mapPins,
+    mapTile,
+    type MapPin,
   } from "$lib/bridge";
   import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
+  import "leaflet/dist/leaflet.css";
+  import * as L from "leaflet";
+  import type { Coords, DoneCallback, LayerGroup, Map as LeafletMap, MapOptions } from "leaflet";
 
   type Row = { key: string; val: string };
   type EngineStatus =
@@ -326,7 +332,7 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums" | "settings">("library");
+  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums" | "map" | "settings">("library");
   let flagged = $state<Set<number>>(new Set());
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
@@ -1165,6 +1171,114 @@
     }
   }
 
+  // Map tab: pins from the backend, tiles from the Rust disk cache
+  // (mock/API: inline grid data URLs / plain OSM URLs — see mapTile). The
+  // map object is rebuilt when its container remounts after a tab switch.
+  // Cache-first tiles: the Rust command serves disk-cached OSM PNGs as data
+  // URLs so repeat pans cost no network.
+  class CachedTiles extends L.GridLayer {
+    createTile(coords: Coords, done: DoneCallback): HTMLImageElement {
+      const img = document.createElement("img");
+      img.alt = "";
+      mapTile(coords.z, coords.x, coords.y).then(
+        (url) => {
+          img.src = url;
+          done(undefined, img);
+        },
+        (err) => done(err instanceof Error ? err : new Error(String(err)), img)
+      );
+      return img;
+    }
+  }
+
+  let mapEl = $state<HTMLDivElement | null>(null);
+  let mapObj: LeafletMap | null = null;
+  let pinLayer: LayerGroup | null = null;
+  let mapPinsRows = $state<MapPin[]>([]);
+  let mapLoading = $state(false);
+  let mapError = $state<string | null>(null);
+
+  async function loadMap() {
+    if (mapLoading) return;
+    mapLoading = true;
+    mapError = null;
+    try {
+      mapPinsRows = await mapPins();
+      loadThumbs(mapPinsRows.slice(0, 500));
+    } catch (e) {
+      mapError = String(e).replace(/^Error: /, "");
+      return;
+    } finally {
+      mapLoading = false;
+    }
+    // The tab section mounts on the same click that calls loadMap; wait a
+    // render pass so bind:this has run before touching the container.
+    await tick();
+    if (!mapEl) return;
+    if (mapObj && !mapObj.getContainer().isConnected) {
+      mapObj.remove();
+      mapObj = null;
+      pinLayer = null;
+    }
+    if (!mapObj) {
+      const opts: MapOptions = { attributionControl: true };
+      mapObj = L.map(mapEl, opts).setView([20, 0], 2);
+      new CachedTiles({ attribution: "© OpenStreetMap contributors", tileSize: 256 }).addTo(mapObj);
+    }
+    renderPins();
+    requestAnimationFrame(() => mapObj?.invalidateSize());
+  }
+
+  function renderPins() {
+    if (!mapObj) return;
+    pinLayer?.remove();
+    pinLayer = L.layerGroup().addTo(mapObj);
+    for (const p of mapPinsRows) {
+      const m = L.circleMarker([p.latitude, p.longitude], {
+        radius: 7,
+        color: "#2f6bff",
+        weight: 2,
+        fillColor: "#2f6bff",
+        fillOpacity: 0.65
+      });
+      m.bindPopup(() => pinPopupEl(p));
+      pinLayer.addLayer(m);
+    }
+    if (mapPinsRows.length > 0) {
+      mapObj.fitBounds(
+        L.latLngBounds(mapPinsRows.map((p) => [p.latitude, p.longitude] as [number, number])),
+        { padding: [30, 30] }
+      );
+    }
+  }
+
+  function pinPopupEl(pin: MapPin): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "map-popup";
+    const thumb = thumbs[pin.path];
+    if (thumb) {
+      const img = document.createElement("img");
+      img.src = thumb;
+      img.alt = pin.name;
+      el.appendChild(img);
+    }
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = pin.name;
+    el.appendChild(name);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tiny";
+    btn.textContent = "Show in Library";
+    btn.onclick = () => {
+      mapObj?.closePopup();
+      tab = "library";
+      void applySearch(pin.name);
+    };
+    el.appendChild(btn);
+    return el;
+  }
+
   function toggleAlbum(album: AlbumRow) {
     openAlbumId = openAlbumId === album.id ? null : album.id;
     if (openAlbumId !== null) void loadAlbumMembers(album.id);
@@ -1777,6 +1891,9 @@
     </button>
     <button class="tab" class:on={tab === "albums"} onclick={() => { tab = "albums"; void loadAlbums(); }}>
       Albums{#if albums.length > 0}&nbsp;{albums.length}{/if}
+    </button>
+    <button class="tab" class:on={tab === "map"} onclick={() => { tab = "map"; void loadMap(); }}>
+      Map
     </button>
     <button class="tab" class:on={tab === "settings"} onclick={() => { tab = "settings"; }}>
       Settings
@@ -2723,6 +2840,24 @@
     </section>
   {/if}
 
+  {#if tab === "map"}
+  <section class="card" aria-labelledby="map-heading">
+    <div class="card-head">
+      <h2 id="map-heading">Map</h2>
+      <span class="hint">{mapPinsRows.length} geotagged photo{mapPinsRows.length === 1 ? "" : "s"}</span>
+    </div>
+    {#if mapLoading}
+      <p class="hint">Loading pins…</p>
+    {:else if mapError}
+      <p class="error">{mapError}</p>
+    {:else if mapPinsRows.length === 0}
+      <p class="hint">No geotagged photos yet — photos with GPS land here after Refresh metadata.</p>
+    {/if}
+    <div class="map-wrap" bind:this={mapEl} role="application" aria-label="Photo map"></div>
+    <p class="hint">Tiles © OpenStreetMap contributors · cached on this device · select a pin, then “Show in Library”.</p>
+  </section>
+  {/if}
+
   {#if tab === "settings"}
   <section class="card" aria-labelledby="engine-heading">
     <div class="card-head">
@@ -3438,6 +3573,36 @@
   .dialog h3 {
     margin: 0 0 0.5rem;
     font-size: 0.95rem;
+  }
+  .map-wrap {
+    height: 60vh;
+    min-height: 24rem;
+    border: 1px solid #232733;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #0b0e14;
+  }
+  .map-wrap :global(.leaflet-container) {
+    height: 100%;
+    background: #0b0e14;
+    font: inherit;
+  }
+  :global(.map-popup) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    align-items: flex-start;
+  }
+  :global(.map-popup img) {
+    width: 160px;
+    border-radius: 6px;
+  }
+  :global(.map-popup .name) {
+    font-size: 0.75rem;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .theater {
     position: fixed;
