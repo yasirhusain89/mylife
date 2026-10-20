@@ -17,35 +17,128 @@ test("library shows seeded assets with counts", async ({ page }) => {
 });
 
 test("all tabs navigate and render", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await expect(page.getByRole("heading", { name: "Cleanup" })).toBeVisible();
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await expect(page.getByRole("heading", { name: "People" })).toBeVisible();
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Events" })).toBeVisible();
-  await page.getByRole("button", { name: "Map", exact: true }).click();
+  await page.getByRole("tab", { name: "Map", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Map" })).toBeVisible();
   await expect(page.locator(".leaflet-container")).toBeVisible();
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Albums" })).toBeVisible();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("tab", { name: "Settings", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Engine" })).toBeVisible();
 });
 
+test("tabs expose tablist semantics with arrow-key navigation", async ({ page }) => {
+  const tablist = page.getByRole("tablist", { name: "Library sections" });
+  await expect(tablist).toBeVisible();
+  const libraryTab = page.getByRole("tab", { name: "Library", exact: true });
+  await expect(libraryTab).toHaveAttribute("aria-selected", "true");
+  await libraryTab.focus();
+  await page.keyboard.press("ArrowRight");
+  const cleanupTab = page.getByRole("tab", { name: /^Cleanup/ });
+  await expect(cleanupTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("heading", { name: "Cleanup" })).toBeVisible();
+  await page.keyboard.press("ArrowLeft");
+  await expect(libraryTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("heading", { name: "Library" })).toBeVisible();
+});
+
+test("confirm dialog traps focus and cancels with Esc and scrim click", async ({ page }) => {
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  const batchBar = page.locator(".batch-bar");
+  await batchBar.getByRole("button", { name: "Trash", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toBeVisible();
+  // Initial focus lands on Cancel; Shift+Tab wraps to the last action.
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.getByRole("button", { name: "Move to Trash" })).toBeFocused();
+  // Esc cancels and keeps the selection.
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(batchBar.getByText("1 selected")).toBeVisible();
+  // Scrim click cancels too.
+  await batchBar.getByRole("button", { name: "Trash", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await page.locator(".scrim").click({ position: { x: 5, y: 5 } });
+  await expect(dialog).toBeHidden();
+  await expect(batchBar.getByText("1 selected")).toBeVisible();
+});
+
+test("focus lands inside each dialog", async ({ page }) => {
+  // Confirm (destructive).
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".batch-bar").getByRole("button", { name: "Trash", exact: true }).click();
+  const confirm = page.getByRole("alertdialog");
+  await expect(confirm).toBeVisible();
+  await expect(confirm.locator(":focus")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(confirm).toBeHidden();
+  // Person name dialog.
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
+  const nameDialog = page.getByRole("dialog", { name: "Person name" });
+  await expect(nameDialog).toBeVisible();
+  await expect(nameDialog.getByLabel("Person name")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(nameDialog).toBeHidden();
+  // New-album dialog then the photo picker.
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const albumDialog = page.getByRole("dialog", { name: "New album" });
+  await expect(albumDialog).toBeVisible();
+  await expect(albumDialog.locator(":focus")).toHaveCount(1);
+  await albumDialog.getByLabel("New album").fill("FocusAlbum");
+  await albumDialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("FocusAlbum").first()).toBeVisible();
+  await page.getByRole("button", { name: "Add photos" }).click();
+  const picker = page.getByRole("dialog", { name: /Add photos to/ });
+  await expect(picker).toBeVisible();
+  await expect(picker.getByLabel("Search photos by filename")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(picker).toBeHidden();
+  // Delete-album confirm.
+  await page.getByRole("button", { name: "Delete album" }).click();
+  const deleteDialog = page.getByRole("dialog", { name: "Delete album" });
+  await expect(deleteDialog).toBeVisible();
+  await expect(deleteDialog.locator(":focus")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(deleteDialog).toBeHidden();
+  // Indexed-folder removal confirm.
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await page.getByRole("button", { name: "Remove /mock/vacation from the index" }).click();
+  const rootDialog = page.getByRole("dialog", { name: "Remove indexed folder" });
+  await expect(rootDialog).toBeVisible();
+  await expect(rootDialog.locator(":focus")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(rootDialog).toBeHidden();
+});
+
 test("engine check passes against the mock sidecar", async ({ page }) => {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("tab", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Check engine" }).click();
   await expect(page.getByText("mock 0.0")).toBeVisible();
 });
 
 test("cleanup surfaces the seeded duplicate group", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByRole("button", { name: "Find exact duplicates" }).click();
   await expect(page.getByText("IMG_20261007_191434.jpg")).toBeVisible();
 });
 
 test("similar photos surface the seeded near-duplicate group", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByRole("button", { name: "Find similar photos" }).click();
   await expect(page.getByRole("heading", { name: "Similar photos" })).toBeVisible();
   await expect(page.getByText("IMG_20261007_185824.jpg").first()).toBeVisible();
@@ -83,10 +176,10 @@ test("multi-select stars a batch", async ({ page }) => {
 
 test("batch delete honors Flag-only mode and Cancel keeps selection", async ({ page }) => {
   // Flag-only mode is set in Cleanup but must hold in the Library batch bar.
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByLabel(/Deleting moves files/).selectOption("flag");
 
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("button", { name: "Select", exact: true }).click();
   await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
   const batchBar = page.locator(".batch-bar");
@@ -126,7 +219,7 @@ test("batch delete in trash mode moves to Trash and clears selection", async ({ 
 });
 
 test("cleanup duplicate single delete honors trash mode", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByRole("button", { name: "Find exact duplicates" }).click();
   const group = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
   await group.getByRole("button", { name: "Remove" }).click();
@@ -137,7 +230,7 @@ test("cleanup duplicate single delete honors trash mode", async ({ page }) => {
 });
 
 test("cleanup blurred remove in flag mode shows the flagged badge", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByLabel(/Deleting moves files/).selectOption("flag");
   const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
   await card.getByRole("button", { name: "remove" }).click();
@@ -149,7 +242,7 @@ test("cleanup blurred remove in flag mode shows the flagged badge", async ({ pag
 });
 
 test("flags survive a reload", async ({ page }) => {
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByLabel(/Deleting moves files/).selectOption("flag");
   const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
   await card.getByRole("button", { name: "remove" }).click();
@@ -157,7 +250,7 @@ test("flags survive a reload", async ({ page }) => {
   await expect(card.getByRole("button", { name: "flagged" })).toBeVisible();
 
   await page.reload();
-  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
   const reloaded = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
   await expect(reloaded.getByRole("button", { name: "flagged" })).toBeVisible();
 });
@@ -185,7 +278,7 @@ test("Done exits select mode and drops the selection", async ({ page }) => {
 });
 
 test("people can be named and merged", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await page.getByRole("checkbox", { name: "Select cluster 1 for merge" }).check();
@@ -195,7 +288,7 @@ test("people can be named and merged", async ({ page }) => {
 });
 
 test("cluster cards expand and jump to the library", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Show photos" }).first().click();
   await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
@@ -204,11 +297,11 @@ test("cluster cards expand and jump to the library", async ({ page }) => {
 });
 
 test("pet detection surfaces sightings and filters", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find pets" }).click();
   await expect(page.getByRole("heading", { name: "Pets" })).toBeVisible();
   await expect(page.getByText("Dog · 93%")).toBeVisible();
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("button", { name: "Pets", exact: true }).click();
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
   await page.getByRole("searchbox", { name: "Search library" }).fill("dog");
@@ -255,14 +348,14 @@ test("group by sections the grid and clears back to flat", async ({ page }) => {
 });
 
 test("group by person sections named clusters from untagged", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Person name" });
   await dialog.getByLabel("Person name").fill("Ada");
   await dialog.getByRole("button", { name: "Rename" }).click();
   await expect(page.getByText("Ada").first()).toBeVisible();
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByLabel("Group by").selectOption("person");
   await expect(page.getByRole("heading", { name: "Ada (4)" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "No one tagged (4)" })).toBeVisible();
@@ -314,7 +407,7 @@ test("slideshow plays just the current selection", async ({ page }) => {
 });
 
 test("map tab plots located photos and jumps to the library", async ({ page }) => {
-  await page.getByRole("button", { name: "Map", exact: true }).click();
+  await page.getByRole("tab", { name: "Map", exact: true }).click();
   const map = page.locator(".leaflet-container");
   await expect(map).toBeVisible();
   await expect(map.locator("path.leaflet-interactive")).toHaveCount(4);
@@ -363,16 +456,16 @@ test("concept search finds tags and places", async ({ page }) => {
   await page.getByRole("searchbox", { name: "Search library" }).fill("mountain");
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
   await page.getByRole("button", { name: "Clear" }).click();
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Resolve place names" }).click();
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("searchbox", { name: "Search library" }).fill("san francisco");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
 
 test("event place names resolve from coordinates", async ({ page }) => {
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
   await expect(page.getByText("37.7749, -122.4194")).toBeVisible();
@@ -381,7 +474,7 @@ test("event place names resolve from coordinates", async ({ page }) => {
 });
 
 test("highlight video reports photos and clips", async ({ page }) => {
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Highlight video" }).click();
   await expect(page.getByText("3 photos")).toBeVisible();
@@ -389,14 +482,14 @@ test("highlight video reports photos and clips", async ({ page }) => {
 });
 
 test("events render as a month-grouped timeline", async ({ page }) => {
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await expect(page.getByRole("heading", { name: "October 2025" })).toBeVisible();
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
 });
 
 test("album workflow: create, add photos, show, rename, delete", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await expect(dialog).toBeVisible();
@@ -430,7 +523,7 @@ test("album workflow: create, add photos, show, rename, delete", async ({ page }
 });
 
 test("event cards expand to member photos", async ({ page }) => {
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Show photos" }).click();
   await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
@@ -465,7 +558,7 @@ test("video shows a poster with a web-mode note", async ({ page }) => {
 });
 
 test("picker search narrows candidates", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("Searchable");
@@ -483,7 +576,7 @@ test("picker search narrows candidates", async ({ page }) => {
 });
 
 test("picker inline new-album creates and selects", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("First");
@@ -512,7 +605,7 @@ test("batch-bar inline new-album creates and adds", async ({ page }) => {
   await expect(batchBar.getByLabel("Add selected to album")).toBeVisible();
   await batchBar.getByRole("button", { name: "Add to album" }).click();
   await expect(page.getByText("Added 1 photo to the album")).toBeVisible();
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   await expect(page.getByText("BatchAlbum").first()).toBeVisible();
 });
 
@@ -590,14 +683,14 @@ test("check-files reports a healthy library when nothing is missing", async ({ p
 // ---------------------------------------------------------------------------
 
 test("people empty state before clustering", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await expect(page.getByRole("heading", { name: "People" })).toBeVisible();
   await expect(page.getByText("No people clusters yet — scan the library to detect faces.")).toBeVisible();
   await expect(page.getByText("Cluster 1")).toBeHidden();
 });
 
 test("face clustering renders two clusters with face counts", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await expect(page.getByText("Cluster 2")).toBeVisible();
@@ -607,7 +700,7 @@ test("face clustering renders two clusters with face counts", async ({ page }) =
 });
 
 test("renaming a cluster persists in the UI", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
@@ -618,13 +711,13 @@ test("renaming a cluster persists in the UI", async ({ page }) => {
   await expect(page.getByText("Ada").first()).toBeVisible();
   await expect(page.getByText("Cluster 1")).toBeHidden();
   // Rename survives leaving and returning to the tab.
-  await page.getByRole("button", { name: "Library", exact: true }).click();
-  await page.getByRole("button", { name: /^People/ }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: /^People/ }).click();
   await expect(page.getByText("Ada").first()).toBeVisible();
 });
 
 test("rename offers known people to select instead of retyping", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   // Name cluster 1 first so cluster 2's dialog has a suggestion.
   await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
@@ -643,7 +736,7 @@ test("rename offers known people to select instead of retyping", async ({ page }
 });
 
 test("cluster source photos expand", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Show photos" }).first().click();
   // Cluster 1 holds the first four seed photos; paths dedupe to filenames.
@@ -655,7 +748,7 @@ test("cluster source photos expand", async ({ page }) => {
 });
 
 test("merging clusters adds counts and drops the loser", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await expect(page.getByText("Cluster 2")).toBeVisible();
@@ -669,7 +762,7 @@ test("merging clusters adds counts and drops the loser", async ({ page }) => {
 });
 
 test("removing a face that doesn't belong shrinks the cluster", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Show photos" }).first().click();
   await expect(page.getByText("4 faces")).toBeVisible();
@@ -685,7 +778,7 @@ test("removing a face keeps the collapsed preview compact", async ({ page }) => 
   await page.getByRole("button", { name: "Scan" }).click();
   await page.getByPlaceholder("…or paste a folder path").fill("/mock/trip");
   await page.getByRole("button", { name: "Scan" }).click();
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("12 faces")).toBeVisible();
   const card = page.locator("article", { hasText: "Cluster 1" });
@@ -698,7 +791,7 @@ test("removing a face keeps the collapsed preview compact", async ({ page }) => 
 });
 
 test("cluster review steps through every photo with per-photo reject", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Review all" }).first().click();
   await expect(page.getByText("1 of 4 · reviewing Cluster 1")).toBeVisible();
@@ -718,7 +811,7 @@ test("faces on unreadable files say so instead of loading forever", async ({ pag
   await page.getByRole("button", { name: "Scan" }).click();
   await expect(page.getByText("Showing 12 of 12")).toBeVisible();
 
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "Show photos" }).first().click();
   // Face grids render for every loaded cluster; all 4 UNREADABLE faces (2 in
@@ -728,7 +821,7 @@ test("faces on unreadable files say so instead of loading forever", async ({ pag
 });
 
 test("view-in-library filters to the selected person", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await page.getByRole("button", { name: "View in Library" }).first().click();
   // Cluster 1 = first four seed photos.
@@ -743,14 +836,14 @@ test("view-in-library filters to the selected person", async ({ page }) => {
 
 test("library multi-select adds a batch to an existing album", async ({ page }) => {
   // Arrange: an album to target.
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("BatchTarget");
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByText("BatchTarget").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("button", { name: "Select", exact: true }).click();
   await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
   await page.getByRole("checkbox", { name: "Select IMG_20261007_185822.jpg" }).check();
@@ -760,7 +853,7 @@ test("library multi-select adds a batch to an existing album", async ({ page }) 
   await batchBar.getByRole("button", { name: "Add to album" }).click();
   await expect(page.getByText("Added 2 photos to the album")).toBeVisible();
 
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   const card = page.locator(".album-card", { hasText: "BatchTarget" });
   await expect(card.getByText("2 photos")).toBeVisible();
   await card.getByRole("button", { name: "Show photos" }).click();
@@ -769,7 +862,7 @@ test("library multi-select adds a batch to an existing album", async ({ page }) 
 });
 
 test("picker search-toggle-confirm adds to an album", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("PickerTarget");
@@ -797,14 +890,14 @@ test("picker search-toggle-confirm adds to an album", async ({ page }) => {
 });
 
 test("event member grid adds to an album via ＋Album", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("EventTarget");
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByText("EventTarget").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Events", exact: true }).click();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
   await page.getByRole("button", { name: "Show photos" }).click();
@@ -813,7 +906,7 @@ test("event member grid adds to an album via ＋Album", async ({ page }) => {
   await page.getByRole("button", { name: "＋ Album" }).click();
   await expect(page.getByText('Added 8 photos to “EventTarget”')).toBeVisible();
 
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   const card = page.locator(".album-card", { hasText: "EventTarget" });
   await expect(card.getByText("8 photos")).toBeVisible();
   await card.getByRole("button", { name: "Show photos" }).click();
@@ -822,20 +915,20 @@ test("event member grid adds to an album via ＋Album", async ({ page }) => {
 });
 
 test("indexed folder adds everything to an album via ＋ All to album", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("FolderTarget");
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByText("FolderTarget").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   const row = page.locator(".roots li", { hasText: "/photos" });
   await row.getByLabel("Add everything under /photos to album").selectOption({ label: "FolderTarget" });
   await row.getByRole("button", { name: "＋ All to album" }).click();
   await expect(page.getByText("Added 8 photos from /photos to “FolderTarget”")).toBeVisible();
 
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   const card = page.locator(".album-card", { hasText: "FolderTarget" });
   await expect(card.getByText("8 photos")).toBeVisible();
   await card.getByRole("button", { name: "Show photos" }).click();
@@ -844,14 +937,14 @@ test("indexed folder adds everything to an album via ＋ All to album", async ({
 });
 
 test("filtered library selection adds only the visible set", async ({ page }) => {
-  await page.getByRole("button", { name: "Albums", exact: true }).click();
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
   await page.getByRole("button", { name: "New album" }).click();
   const dialog = page.getByRole("dialog", { name: "New album" });
   await dialog.getByLabel("New album").fill("FilteredTarget");
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByText("FilteredTarget").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("searchbox", { name: "Search library" }).fill("185817");
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
   await page.getByRole("button", { name: "Select", exact: true }).click();
@@ -861,7 +954,7 @@ test("filtered library selection adds only the visible set", async ({ page }) =>
   await batchBar.getByRole("button", { name: "Add to album" }).click();
   await expect(page.getByText("Added 1 photo to the album")).toBeVisible();
 
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   const card = page.locator(".album-card", { hasText: "FilteredTarget" });
   await expect(card.getByText("1 photo")).toBeVisible();
   await card.getByRole("button", { name: "Show photos" }).click();
@@ -908,7 +1001,7 @@ test("month filter isolates the seeded month", async ({ page }) => {
 test("person filter narrows to one cluster", async ({ page }) => {
   // The Library person dropdown only appears once personOptions load; a
   // rename triggers that reload (Find alone does not refresh the options).
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
   await expect(page.getByText("Cluster 1")).toBeVisible();
   await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
@@ -917,7 +1010,7 @@ test("person filter narrows to one cluster", async ({ page }) => {
   await rename.getByRole("button", { name: "Rename" }).click();
   await expect(page.getByText("FilterMe").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   const person = page.getByLabel("Filter by person");
   await expect(person).toBeVisible();
   await person.selectOption("1");
@@ -943,10 +1036,10 @@ test("scene tag filter narrows to tagged assets", async ({ page }) => {
 });
 
 test("pet filter needs detection then narrows", async ({ page }) => {
-  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find pets" }).click();
   await expect(page.getByText("Dog · 93%")).toBeVisible();
-  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
   await page.getByRole("button", { name: "Pets", exact: true }).click();
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
   await expect(page.getByText("IMG_20261007_191433.jpg").first()).toBeVisible();

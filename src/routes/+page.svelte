@@ -892,6 +892,67 @@
     else if (e.key === "ArrowLeft") { e.preventDefault(); stepViewer(-1); }
   }
 
+  // A11y (issue #4): roving-tabindex tablist with automatic activation.
+  const TAB_ORDER = ["library", "cleanup", "people", "events", "albums", "map", "settings"] as const;
+  type TabId = (typeof TAB_ORDER)[number];
+
+  function activateTab(next: TabId) {
+    if (tab === next) return;
+    tab = next;
+    if (next === "library") void refresh();
+    else if (next === "cleanup") void refreshCleanup();
+    else if (next === "people") { void loadPeople(); void loadPets(); }
+    else if (next === "events") void loadEvents();
+    else if (next === "albums") void loadAlbums();
+    else if (next === "map") void loadMap();
+  }
+
+  function tabKey(e: KeyboardEvent) {
+    const el = e.target as HTMLElement | null;
+    if (!el || el.getAttribute("role") !== "tab") return;
+    const i = TAB_ORDER.indexOf(tab);
+    let next: TabId | null = null;
+    if (e.key === "ArrowRight") next = TAB_ORDER[(i + 1) % TAB_ORDER.length];
+    else if (e.key === "ArrowLeft") next = TAB_ORDER[(i - 1 + TAB_ORDER.length) % TAB_ORDER.length];
+    else if (e.key === "Home") next = TAB_ORDER[0];
+    else if (e.key === "End") next = TAB_ORDER[TAB_ORDER.length - 1];
+    else return;
+    e.preventDefault();
+    const target = next;
+    activateTab(target);
+    void tick().then(() => document.getElementById(`tab-${target}`)?.focus());
+  }
+
+  // A11y (issue #4): modal dialogs — initial focus, focus trap, Esc cancels.
+  function trapTabKey(e: KeyboardEvent, root: HTMLElement) {
+    if (e.key !== "Tab") return;
+    const items = [...root.querySelectorAll<HTMLElement>(
+      "button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex='-1'])"
+    )].filter((n) => n.offsetParent !== null);
+    if (items.length === 0) { e.preventDefault(); return; }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+
+  function dialogFocus(node: HTMLElement, onClose: () => void) {
+    const prev = document.activeElement as HTMLElement | null;
+    const first = node.querySelector<HTMLElement>("input:not(:disabled), button:not(:disabled)");
+    (first ?? node).focus();
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); return; }
+      trapTabKey(e, node);
+    }
+    node.addEventListener("keydown", onKey);
+    return {
+      destroy() {
+        node.removeEventListener("keydown", onKey);
+        if (prev && document.contains(prev)) prev.focus();
+      }
+    };
+  }
+
   async function runImport(target: string) {
     error = null;
     root = target;
@@ -1484,7 +1545,7 @@
     try {
       const s = await removeRoot(target.root);
       await refresh();
-      toast = `Removed ${target.root} — ${s.removedAssets} asset${s.removedAssets === 1 ? "" : "s"} forgotten`;
+      toast = `Removed ${target.root} — ${s.removedAssets} asset${s.removedAssets === 1 ? "" : "s"} removed from the index`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -1930,27 +1991,28 @@
     <p class="tagline">on-device library management for photo and video</p>
   </header>
 
-  <nav class="tabs">
-    <button class="tab" class:on={tab === "library"} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
-    <button class="tab" class:on={tab === "cleanup"} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
+  <!-- svelte-ignore a11y_interactive_supports_focus: roving-tabindex tablist, only the active tab is a tab stop -->
+  <div class="tabs" role="tablist" aria-label="Library sections" onkeydown={tabKey}>
+    <button id="tab-library" class="tab" class:on={tab === "library"} role="tab" aria-selected={tab === "library"} tabindex={tab === "library" ? 0 : -1} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
+    <button id="tab-cleanup" class="tab" class:on={tab === "cleanup"} role="tab" aria-selected={tab === "cleanup"} tabindex={tab === "cleanup" ? 0 : -1} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
     </button>
-    <button class="tab" class:on={tab === "people"} onclick={() => { tab = "people"; void loadPeople(); void loadPets(); }}>
+    <button id="tab-people" class="tab" class:on={tab === "people"} role="tab" aria-selected={tab === "people"} tabindex={tab === "people" ? 0 : -1} onclick={() => { tab = "people"; void loadPeople(); void loadPets(); }}>
       People{#if people.length > 0}&nbsp;{people.length}{/if}
     </button>
-    <button class="tab" class:on={tab === "events"} onclick={() => { tab = "events"; void loadEvents(); }}>
+    <button id="tab-events" class="tab" class:on={tab === "events"} role="tab" aria-selected={tab === "events"} tabindex={tab === "events" ? 0 : -1} onclick={() => { tab = "events"; void loadEvents(); }}>
       Events{#if events.length > 0}&nbsp;{events.length}{/if}
     </button>
-    <button class="tab" class:on={tab === "albums"} onclick={() => { tab = "albums"; void loadAlbums(); }}>
+    <button id="tab-albums" class="tab" class:on={tab === "albums"} role="tab" aria-selected={tab === "albums"} tabindex={tab === "albums" ? 0 : -1} onclick={() => { tab = "albums"; void loadAlbums(); }}>
       Albums{#if albums.length > 0}&nbsp;{albums.length}{/if}
     </button>
-    <button class="tab" class:on={tab === "map"} onclick={() => { tab = "map"; void loadMap(); }}>
+    <button id="tab-map" class="tab" class:on={tab === "map"} role="tab" aria-selected={tab === "map"} tabindex={tab === "map" ? 0 : -1} onclick={() => { tab = "map"; void loadMap(); }}>
       Map
     </button>
-    <button class="tab" class:on={tab === "settings"} onclick={() => { tab = "settings"; }}>
+    <button id="tab-settings" class="tab" class:on={tab === "settings"} role="tab" aria-selected={tab === "settings"} tabindex={tab === "settings" ? 0 : -1} onclick={() => { tab = "settings"; }}>
       Settings
     </button>
-  </nav>
+  </div>
 
   {#if error}
     <div class="error global-error" role="alert">
@@ -2959,9 +3021,11 @@
   {/if}
 
   {#if confirm}
-    <div class="scrim">
-      <div class="dialog" role="alertdialog" aria-labelledby="confirm-heading">
-        <h3 id="confirm-heading">Remove {confirm.label}?</h3>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget) confirm = null; }}>
+      <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-heading" tabindex={-1} use:dialogFocus={() => (confirm = null)}>
+        <h3 id="confirm-heading">{deleteMode === "trash" ? `Move ${confirm.label} to Trash?` : `Flag ${confirm.label}?`}</h3>
         <p class="hint">
           {#if deleteMode === "trash"}
             This moves the file to the macOS Trash. You can put it back from Finder until the
@@ -2981,8 +3045,9 @@
   {/if}
 
   {#if picker}
-    <div class="scrim" role="dialog" aria-labelledby="picker-heading">
-      <div class="dialog wide">
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
+    <div class="scrim" role="dialog" aria-modal="true" aria-labelledby="picker-heading" tabindex={-1} onclick={(e) => { if (e.target === e.currentTarget) { picker = null; resetThumbs(); } }}>
+      <div class="dialog wide" use:dialogFocus={() => { picker = null; resetThumbs(); }}>
         <h3 id="picker-heading">Add photos to “{picker.name}”</h3>
         <div class="path-entry">
           <input
@@ -3174,14 +3239,16 @@
   {/if}
 
   {#if similar}
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
     <div
       class="scrim"
       role="dialog"
       aria-modal="true"
       aria-label={`Similar to ${similar.name}`}
       tabindex={-1}
+      onclick={(e) => { if (e.target === e.currentTarget) similar = null; }}
     >
-      <div class="dialog wide">
+      <div class="dialog wide" use:dialogFocus={() => (similar = null)}>
         <h3>Similar to {similar.name}</h3>
         {#if similarLoading}
           <p class="hint">
@@ -3220,9 +3287,11 @@
   {/if}
 
   {#if nameDialog}
-    <div class="scrim" role="dialog" aria-modal="true" aria-label={nameDialog.title} tabindex={-1}>
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
+    <div class="scrim" role="dialog" aria-modal="true" aria-label={nameDialog.title} tabindex={-1} onclick={(e) => { if (e.target === e.currentTarget) nameDialog = null; }}>
       <form
         class="dialog"
+        use:dialogFocus={() => (nameDialog = null)}
         onsubmit={(e) => {
           e.preventDefault();
           const v = nameValue.trim();
@@ -3259,8 +3328,9 @@
   {/if}
 
   {#if deleteAlbumTarget}
-    <div class="scrim" role="dialog" aria-modal="true" aria-label="Delete album" tabindex={-1}>
-      <div class="dialog">
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
+    <div class="scrim" role="dialog" aria-modal="true" aria-label="Delete album" tabindex={-1} onclick={(e) => { if (e.target === e.currentTarget) deleteAlbumTarget = null; }}>
+      <div class="dialog" use:dialogFocus={() => (deleteAlbumTarget = null)}>
         <h3 id="delete-album-heading">Delete “{deleteAlbumTarget.name}”?</h3>
         <p class="hint">Photos stay in the library.</p>
         <div class="dialog-actions">
@@ -3272,9 +3342,10 @@
   {/if}
 
   {#if removeRootTarget}
-    <div class="scrim" role="dialog" aria-modal="true" aria-label="Remove indexed folder" tabindex={-1}>
-      <div class="dialog">
-        <h3>Forget “{removeRootTarget.root}”?</h3>
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
+    <div class="scrim" role="dialog" aria-modal="true" aria-label="Remove indexed folder" tabindex={-1} onclick={(e) => { if (e.target === e.currentTarget) removeRootTarget = null; }}>
+      <div class="dialog" use:dialogFocus={() => (removeRootTarget = null)}>
+        <h3>Remove “{removeRootTarget.root}”?</h3>
         <p class="hint">
           {removeRootTarget.assets} asset{removeRootTarget.assets === 1 ? "" : "s"} leave the index.
           Files on disk are untouched — rescan to bring them back.
