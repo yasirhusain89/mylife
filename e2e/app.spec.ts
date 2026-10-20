@@ -1565,6 +1565,21 @@ test("library zoom granularity persists across reload", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Zoom out timeline" })).toBeEnabled();
 });
 
+test("ctrl+wheel over the grid zooms the timeline, plain wheel only scrolls", async ({ page }) => {
+  const grid = page.locator(".grid");
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  // Ctrl+wheel up = zoom in (all → day), matching the + button.
+  await grid.dispatchEvent("wheel", { deltaY: -80, ctrlKey: true, bubbles: true, cancelable: true });
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await page.waitForTimeout(350);
+  // Ctrl+wheel down = zoom out (day → all).
+  await grid.dispatchEvent("wheel", { deltaY: 80, ctrlKey: true, bubbles: true, cancelable: true });
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  // Plain wheel never changes zoom.
+  await grid.dispatchEvent("wheel", { deltaY: 400, bubbles: true, cancelable: true });
+  await expect(page.locator(".group-head")).toHaveCount(0);
+});
+
 test("library zoom keyboard shortcuts move levels and respect viewer and dialogs", async ({ page }) => {
   // Wait for the app to be interactive so the first keypress isn't lost.
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();

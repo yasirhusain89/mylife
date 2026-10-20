@@ -331,6 +331,31 @@
     saveLibZoom(libZoom);
   }
 
+  // Ctrl/Cmd+wheel (trackpad pinch) over the grid steps the timeline zoom;
+  // plain wheel keeps scrolling. Accumulated with a cooldown so one gesture
+  // moves exactly one level. Non-passive: must suppress the browser zoom.
+  let gridWheelAcc = 0;
+  let gridWheelCool = 0;
+
+  function gridZoomWheel(node: HTMLElement) {
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      if (tab !== "library" || viewer || show) return;
+      const now = performance.now();
+      if (now < gridWheelCool) return;
+      const delta = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
+      gridWheelAcc += delta;
+      if (Math.abs(gridWheelAcc) < 50) return;
+      // Wheel up (deltaY −) = zoom in, matching the + button (all → year).
+      zoomLib(gridWheelAcc > 0 ? -1 : 1);
+      gridWheelAcc = 0;
+      gridWheelCool = now + 250;
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return { destroy() { node.removeEventListener("wheel", onWheel); } };
+  }
+
   // Effective grouping: a zoomed timeline always sections by date at the
   // zoom granularity; at "all" the Group-by select owns the grid (its date
   // branch keeps the historical month granularity).
@@ -3520,7 +3545,7 @@
     {/if}
 
     {#if assets.length}
-      <div class="grid" data-density={density}>
+      <div class="grid" data-density={density} use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if effGroup !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
             {@const gkey = groupKeyOf(asset)}
