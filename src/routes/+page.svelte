@@ -115,6 +115,27 @@
   let roots = $state<ScanRoot[]>([]);
   const RECENT_SEARCH_KEY = "fotoflow-recent-searches";
   const FOLDERS_OPEN_KEY = "fotoflow-folders-open";
+  const FLAGGED_KEY = "fotoflow-flagged";
+
+  function loadFlagged(): Set<number> {
+    try {
+      if (typeof localStorage === "undefined") return new Set();
+      const raw = localStorage.getItem(FLAGGED_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(arr)) return new Set();
+      return new Set(arr.filter((id) => typeof id === "number"));
+    } catch {
+      return new Set();
+    }
+  }
+
+  function saveFlagged(ids: Set<number>) {
+    try {
+      localStorage.setItem(FLAGGED_KEY, JSON.stringify([...ids]));
+    } catch {
+      /* storage unavailable: flags just don't persist */
+    }
+  }
 
   function loadFoldersOpen(): boolean {
     try {
@@ -335,7 +356,7 @@
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
   let tab = $state<"library" | "cleanup" | "people" | "events" | "albums" | "map" | "settings">("library");
-  let flagged = $state<Set<number>>(new Set());
+  let flagged = $state<Set<number>>(loadFlagged());
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
   let eventsLoading = $state(false);
@@ -623,9 +644,9 @@
 
   function batchTrash() {
     if (selected.size === 0) return;
-    deleteMode = "trash";
+    // Honor the user's Trash-vs-Flag mode; selection clears only after the
+    // action is confirmed (Cancel in the dialog keeps the selection).
     confirm = { ids: [...selected], label: `${selected.size} selected assets` };
-    selected = new Set();
   }
 
   // Lightbox viewer: full-size image via the engine, video via asset URL.
@@ -1763,8 +1784,12 @@
         // Flag only: nothing on disk changes, the choice stays reversible.
         for (const id of ids) flagged.add(id);
         flagged = flagged;
+        saveFlagged(flagged);
       }
       await refreshCleanup();
+      // Drop only the acted-on ids so unrelated Library selection survives
+      // Cleanup-initiated deletes (which never touch `selected`).
+      selected = new Set([...selected].filter((id) => !ids.includes(id)));
       toast = `${label} · ${deleteMode === "trash" ? "moved to Trash" : "flagged only"}`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -2423,7 +2448,7 @@
             </button>
           </form>
         {/if}
-        <button class="tiny danger" disabled={selected.size === 0} onclick={batchTrash}>Trash</button>
+        <button class="tiny danger" disabled={selected.size === 0} onclick={batchTrash}>{deleteMode === "trash" ? "Trash" : "Flag"}</button>
         <button class="ghost" disabled={selected.size === 0} onclick={() => (selected = new Set())}>Clear</button>
       </div>
     {/if}

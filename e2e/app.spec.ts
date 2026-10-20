@@ -81,6 +81,109 @@ test("multi-select stars a batch", async ({ page }) => {
   await expect(page.getByText("Showing 2 of 2")).toBeVisible();
 });
 
+test("batch delete honors Flag-only mode and Cancel keeps selection", async ({ page }) => {
+  // Flag-only mode is set in Cleanup but must hold in the Library batch bar.
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  const batchBar = page.locator(".batch-bar");
+  // The button reflects flag mode instead of silently flipping to trash.
+  await batchBar.getByRole("button", { name: "Flag", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByText("Flag only — nothing on disk changes.")).toBeVisible();
+  // Cancel preserves the selection.
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(batchBar.getByText("1 selected")).toBeVisible();
+  // Confirm flags without touching disk.
+  await batchBar.getByRole("button", { name: "Flag", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Flag", exact: true }).click();
+  await expect(page.getByText("flagged only")).toBeVisible();
+  // Confirm drops only the acted-on id from the selection.
+  await expect(batchBar.getByText("1 selected")).toBeHidden();
+});
+
+test("batch delete in trash mode moves to Trash and clears selection", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  const batchBar = page.locator(".batch-bar");
+  await expect(batchBar.getByText("1 selected")).toBeVisible();
+  // The batch button reflects the default trash mode.
+  await batchBar.getByRole("button", { name: "Trash", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByText("moves the file to the macOS Trash")).toBeVisible();
+  // Cancel keeps the selection.
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(batchBar.getByText("1 selected")).toBeVisible();
+  // Confirm trashes and clears the selection.
+  await batchBar.getByRole("button", { name: "Trash", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.getByRole("status")).toContainText("moved to Trash");
+  await expect(batchBar.getByText("1 selected")).toBeHidden();
+  await expect(batchBar.getByText("0 selected")).toBeVisible();
+});
+
+test("cleanup duplicate single delete honors trash mode", async ({ page }) => {
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find exact duplicates" }).click();
+  const group = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
+  await group.getByRole("button", { name: "Remove" }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByText("moves the file to the macOS Trash")).toBeVisible();
+  await dialog.getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.getByRole("status")).toContainText("moved to Trash");
+});
+
+test("cleanup blurred remove in flag mode shows the flagged badge", async ({ page }) => {
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+  const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await card.getByRole("button", { name: "remove" }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByText("Flag only — nothing on disk changes.")).toBeVisible();
+  await dialog.getByRole("button", { name: "Flag", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("flagged only");
+  await expect(card.getByRole("button", { name: "flagged" })).toBeVisible();
+});
+
+test("flags survive a reload", async ({ page }) => {
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+  const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await card.getByRole("button", { name: "remove" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Flag", exact: true }).click();
+  await expect(card.getByRole("button", { name: "flagged" })).toBeVisible();
+
+  await page.reload();
+  await page.getByRole("button", { name: /^Cleanup/ }).click();
+  const reloaded = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await expect(reloaded.getByRole("button", { name: "flagged" })).toBeVisible();
+});
+
+test("Clear empties the batch selection", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185822.jpg" }).check();
+  const batchBar = page.locator(".batch-bar");
+  await expect(batchBar.getByText("2 selected")).toBeVisible();
+  await batchBar.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(batchBar.getByText("0 selected")).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" })).not.toBeChecked();
+  await expect(page.getByRole("checkbox", { name: "Select IMG_20261007_185822.jpg" })).not.toBeChecked();
+});
+
+test("Done exits select mode and drops the selection", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await expect(page.locator(".batch-bar").getByText("1 selected")).toBeVisible();
+  await page.getByRole("button", { name: "Done" }).click();
+  await expect(page.locator(".batch-bar")).toBeHidden();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await expect(page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" })).not.toBeChecked();
+});
+
 test("people can be named and merged", async ({ page }) => {
   await page.getByRole("button", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
