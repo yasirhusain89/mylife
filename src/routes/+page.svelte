@@ -631,6 +631,7 @@
     locFilter?: "all" | "with" | "without";
     personFilter?: number | null;
     sceneFilter?: string | null;
+    sortAdded?: boolean;
   } {
     try {
       if (typeof localStorage === "undefined") return {};
@@ -646,7 +647,8 @@
         ...(typeof q.monthFilter === "string" ? { monthFilter: q.monthFilter } : {}),
         ...(q.locFilter === "all" || q.locFilter === "with" || q.locFilter === "without" ? { locFilter: q.locFilter } : {}),
         ...(typeof q.personFilter === "number" ? { personFilter: q.personFilter } : {}),
-        ...(typeof q.sceneFilter === "string" ? { sceneFilter: q.sceneFilter } : {})
+        ...(typeof q.sceneFilter === "string" ? { sceneFilter: q.sceneFilter } : {}),
+        ...(typeof q.sortAdded === "boolean" ? { sortAdded: q.sortAdded } : {})
       };
     } catch {
       return {};
@@ -658,6 +660,8 @@
   let filter = $state<"all" | "image" | "video">(savedFilters.filter ?? "all");
   let favFilter = $state(savedFilters.favFilter ?? false);
   let petFilter = $state(savedFilters.petFilter ?? false);
+  // Recently Saved ordering (Pinned shortcut): newest first_seen_at first.
+  let sortAdded = $state(savedFilters.sortAdded ?? false);
   let searchText = $state("");
   let searchQuery = $state<string | null>(null);
   let recentSearches = $state<string[]>(loadRecentSearches());
@@ -707,7 +711,7 @@
     try {
       localStorage.setItem(
         FILTERS_KEY,
-        JSON.stringify({ filter, favFilter, petFilter, monthFilter, locFilter, personFilter, sceneFilter })
+        JSON.stringify({ filter, favFilter, petFilter, monthFilter, locFilter, personFilter, sceneFilter, sortAdded })
       );
     } catch {
       /* storage unavailable: filters just don't persist */
@@ -729,7 +733,7 @@
 
   // Active-filter summary (issue #6): one line like
   // "Filters: photos · October 2025 · Lake". Rendered whenever any of the
-  // seven persisted filters is active, so a People→Library jump (which sets
+  // persisted filters is active, so a People→Library jump (which sets
   // personFilter while the person dropdown may have no options yet) stays
   // visible with a way back.
   let activeFilterParts = $derived.by(() => {
@@ -744,6 +748,7 @@
     if (sceneFilter) parts.push(sceneFilter);
     if (locFilter === "with") parts.push("with location");
     else if (locFilter === "without") parts.push("no location");
+    if (sortAdded) parts.push("recently added");
     return parts;
   });
 
@@ -755,6 +760,7 @@
     locFilter = "all";
     personFilter = null;
     sceneFilter = null;
+    sortAdded = false;
     void refresh();
   }
 
@@ -774,7 +780,8 @@
       personCluster: personFilter ?? undefined,
       hasLocation: locFilter === "all" ? undefined : locFilter === "with",
       capturedMin,
-      capturedMax
+      capturedMax,
+      sortAdded: sortAdded || undefined
     };
   }
   let root = $state<string | null>(null);
@@ -822,6 +829,9 @@
   let reviewCluster = $state<{ id: number; name: string } | null>(null);
   let viewerSrc = $state<string | null>(null);
   let viewerError = $state<string | null>(null);
+  // Photo info panel (ⓘ): camera settings + GPS + file facts. Stays open
+  // across steps like Apple's inspector; closed with the viewer/theater.
+  let infoOpen = $state(false);
   let viewerTags = $state<SceneTag[]>([]);
   // Image-query visual neighbours ("more like this photo").
   let similar = $state<{ assetId: number; name: string; rows: SimilarHit[] } | null>(null);
@@ -896,6 +906,54 @@
       month: "short",
       day: "numeric"
     });
+  }
+
+  // Photo info panel: camera settings + GPS + file facts, Apple-style.
+  // Every helper returns null when the file carries no such EXIF so the
+  // panel simply omits that row instead of showing dashes.
+  function trimNum(v: number): string {
+    return String(Math.round(v * 100) / 100);
+  }
+
+  function fmtFNumber(v: number | null): string | null {
+    if (v === null || !(v > 0)) return null;
+    return `ƒ/${trimNum(v)}`;
+  }
+
+  function fmtExposure(v: number | null): string | null {
+    if (v === null || !(v > 0)) return null;
+    if (v >= 1) return `${trimNum(v)} s`;
+    return `1/${Math.round(1 / v)}`;
+  }
+
+  function fmtFocal(a: AssetRow): string | null {
+    const mm = a.focalLength35 ?? a.focalLength;
+    if (mm === null || !(mm > 0)) return null;
+    return `${trimNum(mm)} mm`;
+  }
+
+  function exposureParts(a: AssetRow): string[] {
+    const parts: string[] = [];
+    const f = fmtFNumber(a.fNumber);
+    if (f) parts.push(f);
+    const s = fmtExposure(a.exposureTime);
+    if (s) parts.push(s);
+    if (a.iso !== null && a.iso > 0) parts.push(`ISO ${a.iso}`);
+    const fl = fmtFocal(a);
+    if (fl) parts.push(fl);
+    return parts;
+  }
+
+  function cameraLabel(a: AssetRow): string | null {
+    const { cameraMake: make, cameraModel: model } = a;
+    if (model && make && model.toLowerCase().startsWith(make.toLowerCase())) return model;
+    const bits = [make, model].filter((x): x is string => !!x);
+    return bits.length > 0 ? bits.join(" ") : null;
+  }
+
+  function gpsLabel(a: AssetRow): string | null {
+    if (a.latitude === null || a.longitude === null) return null;
+    return `${a.latitude.toFixed(4)}, ${a.longitude.toFixed(4)}`;
   }
 
   // Plain-language errors (issue #6): known engine/sidecar jargon maps to a
@@ -1287,7 +1345,9 @@
         id: -1, path, name, ext: name.split(".").pop() ?? "", kind: "image" as const,
         mime: null, sizeBytes: 0, modified: 0, capturedAt: null, width: null,
         height: null, duration: null, favorite: 0, missing: 0, sha256: null,
-        place: null, people: []
+        place: null, people: [], cameraMake: null, cameraModel: null, lens: null,
+        latitude: null, longitude: null, iso: null, fNumber: null,
+        exposureTime: null, focalLength: null, focalLength35: null
       };
     });
     reviewCluster = { id: cluster.id, name: cluster.name ?? `Cluster ${cluster.id}` };
@@ -1568,7 +1628,21 @@
     }
   }
 
+  // Blurred review items need viewer-quality sources like compare panes.
+  $effect(() => {
+    if (!review || reviewItems.length === 0) return;
+    const item = reviewItems[Math.min(review.pos, reviewItems.length - 1)];
+    if (item?.kind !== "blur") return;
+    const a = blurred.find((x) => x.id === item.assetId);
+    if (a) void ensureCompareSrc(blurAsMember(a));
+  });
+
   function viewerKey(e: KeyboardEvent) {
+    // Cleanup review mode owns keys on its tab (no dialogs, not typing).
+    if (tab === "cleanup" && review && !confirm && !similar && !picker && !isTypingTarget(e.target)) {
+      reviewKey(e);
+      return;
+    }
     if (show) {
       if (e.key === "Escape") closeShow();
       else if (e.key === "ArrowRight") { e.preventDefault(); stepShow(1); }
@@ -1577,6 +1651,10 @@
       else if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomShow(1); }
       else if (e.key === "-" || e.key === "_") { e.preventDefault(); zoomShow(-1); }
       else if (e.key === "0") { e.preventDefault(); resetShowZoom(); }
+      else if ((e.key === "i" || e.key === "I") && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        infoOpen = !infoOpen;
+      }
       return;
     }
     if (!viewer) {
@@ -1647,6 +1725,9 @@
       const rows = viewerRows();
       const cur = rows[viewer.index];
       if (cur && cur.id >= 0) { e.preventDefault(); void toggleFavorite(cur); }
+    } else if ((e.key === "i" || e.key === "I") && !isTypingTarget(e.target)) {
+      e.preventDefault();
+      infoOpen = !infoOpen;
     }
   }
 
@@ -1663,6 +1744,68 @@
     else if (next === "events") void loadEvents();
     else if (next === "albums") void loadAlbums();
     else if (next === "map") void loadMap();
+  }
+
+  // Pinned shortcuts (Apple Photos-style): one click jumps to a tab with a
+  // clean filter preset. Only existing capabilities — no new queries beyond
+  // the sortAdded ordering. Recently Deleted is deliberately absent: there
+  // is no trash history to show yet.
+  function resetLibraryFilters() {
+    filter = "all";
+    favFilter = false;
+    petFilter = false;
+    monthFilter = null;
+    locFilter = "all";
+    personFilter = null;
+    sceneFilter = null;
+    sortAdded = false;
+    if (searchTimer) clearTimeout(searchTimer);
+    searchText = "";
+    searchQuery = null;
+  }
+
+  async function pinLibrary(preset: () => void) {
+    tab = "library";
+    resetLibraryFilters();
+    preset();
+    await refresh();
+  }
+
+  function pinFavorites() {
+    return pinLibrary(() => {
+      favFilter = true;
+    });
+  }
+
+  function pinRecent() {
+    return pinLibrary(() => {
+      sortAdded = true;
+    });
+  }
+
+  function pinVideos() {
+    return pinLibrary(() => {
+      filter = "video";
+    });
+  }
+
+  function pinScreenshots() {
+    tab = "library";
+    resetLibraryFilters();
+    return applySearch("screenshot");
+  }
+
+  function pinMap() {
+    if (tab === "map") return;
+    tab = "map";
+    void loadMap();
+  }
+
+  function pinPeople() {
+    if (tab === "people") return;
+    tab = "people";
+    void loadPeople();
+    void loadPets();
   }
 
   function tabKey(e: KeyboardEvent) {
@@ -1779,6 +1922,7 @@
     }
     for (const g of groups) primeCompare(g, `dup${g.id}`);
     for (const g of nearGroups) primeCompare(g, `near${g.id}`);
+    pruneVerdicts();
   }
 
   let highlightBusy = $state<string | null>(null);
@@ -2689,7 +2833,7 @@
     compareSel = { ...compareSel, [key]: id };
   }
 
-  function memberKind(m: DuplicateMember): "image" | "video" {
+  function memberKind(m: Pick<DuplicateMember, "id">): "image" | "video" {
     return assets.find((a) => a.id === m.id)?.kind ?? "image";
   }
 
@@ -2703,8 +2847,9 @@
 
   // Viewer-quality source for a compare pane: same pipeline as loadViewer
   // (engineThumb at 1600px for photos, assetUrl for video incl. its
-  // loading/error states) — no new engine commands.
-  async function ensureCompareSrc(m: DuplicateMember) {
+  // loading/error states) — no new engine commands. Narrow param so
+  // blurred-asset review items (which are AssetRows, not members) reuse it.
+  async function ensureCompareSrc(m: Pick<DuplicateMember, "id" | "path">) {
     if (compareBig[m.path] || compareErr[m.path] || compareBusy[m.path]) return;
     compareBusy[m.path] = true;
     try {
@@ -2749,6 +2894,17 @@
   // Candidate strip keyboard: ←/→ cycles the candidate, guarded to the
   // compare panel that owns the focused strip button so the global
   // viewerKey handler on <svelte:window> keeps every other context.
+  function cycleCandidate(g: CompareGroup, key: string, dir: 1 | -1) {
+    const ids = g.members.filter((m) => m.id !== g.keptId).map((m) => m.id);
+    if (ids.length === 0) return;
+    const cur = pickCandidate(g, key)?.id ?? ids[0];
+    const at = ids.indexOf(cur);
+    const next = ids[(((at < 0 ? 0 : at) + dir) % ids.length + ids.length) % ids.length];
+    selectCandidate(key, next);
+    const m = g.members.find((x) => x.id === next);
+    if (m) void ensureCompareSrc(m);
+  }
+
   function compareStripKey(e: KeyboardEvent, g: CompareGroup, key: string) {
     const panel = (e.currentTarget as HTMLElement | null)?.closest?.("[data-compare]");
     const t = e.target as HTMLElement | null;
@@ -2757,14 +2913,10 @@
     if (t.dataset.stripId === undefined) return;
     e.preventDefault();
     e.stopPropagation();
-    const ids = g.members.filter((m) => m.id !== g.keptId).map((m) => m.id);
-    if (ids.length === 0) return;
-    const cur = pickCandidate(g, key)?.id ?? ids[0];
-    const at = ids.indexOf(cur);
-    const next = ids[(((at < 0 ? 0 : at) + (e.key === "ArrowRight" ? 1 : -1)) % ids.length + ids.length) % ids.length];
-    selectCandidate(key, next);
-    const m = g.members.find((x) => x.id === next);
-    if (m) void ensureCompareSrc(m);
+    const before = pickCandidate(g, key)?.id;
+    cycleCandidate(g, key, e.key === "ArrowRight" ? 1 : -1);
+    const next = pickCandidate(g, key)?.id;
+    if (next === undefined || next === before) return;
     requestAnimationFrame(() => {
       panel.querySelector<HTMLElement>(`[data-strip-id="${next}"]`)?.focus();
     });
@@ -2793,9 +2945,235 @@
       // Cleanup-initiated deletes (which never touch `selected`).
       selected = new Set([...selected].filter((id) => !ids.includes(id)));
       toast = `${label} · ${deleteMode === "trash" ? "moved to Trash" : "flagged only"}`;
+      // A bulk review apply shrinks the queue behind it.
+      pruneVerdicts();
+      if (review && buildReviewItems().length === 0) {
+        review = null;
+        toast = "Review complete — every decision applied";
+      }
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
+  }
+
+  // Review mode (triage queue): one cleanup item on screen — duplicates,
+  // then similar, then blurred — with staged (not applied) verdicts and a
+  // single bulk apply. Keyboard-first so there's no scrolling between
+  // decisions; every key has a matching button for mouse users.
+  type ReviewItem = { kind: "dup" | "near"; groupId: number } | { kind: "blur"; assetId: number };
+
+  let review = $state<{ pos: number } | null>(null);
+  let verdicts = $state<Record<string, { remove: number[] }>>({});
+
+  function buildReviewItems(): ReviewItem[] {
+    const items: ReviewItem[] = [];
+    for (const g of groups) items.push({ kind: "dup", groupId: g.id });
+    for (const g of nearGroups) items.push({ kind: "near", groupId: g.id });
+    for (const a of blurred) items.push({ kind: "blur", assetId: a.id });
+    return items;
+  }
+
+  let reviewItems = $derived(review ? buildReviewItems() : []);
+
+  function reviewKeyOf(item: ReviewItem): string {
+    return item.kind === "blur" ? `blur${item.assetId}` : `${item.kind}${item.groupId}`;
+  }
+
+  function reviewGroupOf(item: ReviewItem): { g: DuplicateGroup | NearGroup; key: string; kind: "dup" | "near" } | null {
+    if (item.kind === "blur") return null;
+    const list = item.kind === "dup" ? groups : nearGroups;
+    const g = list.find((x) => x.id === item.groupId);
+    return g ? { g, key: reviewKeyOf(item), kind: item.kind } : null;
+  }
+
+  function currentReviewItem(): ReviewItem | undefined {
+    if (!review || reviewItems.length === 0) return undefined;
+    return reviewItems[Math.min(review.pos, reviewItems.length - 1)];
+  }
+
+  // Non-keeper member ids for a group item, from live data.
+  function reviewExtras(item: ReviewItem): number[] {
+    const found = reviewGroupOf(item);
+    if (!found) return [];
+    return found.g.members.filter((m) => m.id !== found.g.keptId).map((m) => m.id);
+  }
+
+  function startReview() {
+    pruneVerdicts();
+    if (buildReviewItems().length === 0) {
+      toast = "Nothing to review — run the finders above first";
+      return;
+    }
+    review = { pos: 0 };
+  }
+
+  function exitReview() {
+    review = null;
+  }
+
+  function advanceReview() {
+    if (!review) return;
+    review.pos = Math.min(review.pos + 1, Math.max(0, reviewItems.length - 1));
+  }
+
+  function stageCurrent() {
+    const item = currentReviewItem();
+    if (!item) return;
+    const key = reviewKeyOf(item);
+    const remove = item.kind === "blur" ? [item.assetId] : reviewExtras(item);
+    if (remove.length === 0) {
+      toast = "Nothing to stage here — every copy is the keeper";
+      return;
+    }
+    verdicts = { ...verdicts, [key]: { remove } };
+    advanceReview();
+  }
+
+  function skipCurrent() {
+    const item = currentReviewItem();
+    if (!item) return;
+    const key = reviewKeyOf(item);
+    if (verdicts[key] !== undefined) {
+      const next = { ...verdicts };
+      delete next[key];
+      verdicts = next;
+    }
+    advanceReview();
+  }
+
+  function backReview() {
+    if (!review) return;
+    review.pos = Math.max(0, review.pos - 1);
+  }
+
+  function reviewKeepCandidate() {
+    const item = currentReviewItem();
+    const found = item ? reviewGroupOf(item) : null;
+    if (!found) return;
+    const cand = pickCandidate(found.g, found.key);
+    if (!cand || cand.id === found.g.keptId) return;
+    void (found.kind === "dup"
+      ? swapDuplicateKeeper(found.g.id, cand.id)
+      : swapNearKeeper(found.g.id, cand.id));
+    // Keeper changed: the old staged set is stale, re-decide.
+    const key = found.key;
+    if (verdicts[key] !== undefined) {
+      const next = { ...verdicts };
+      delete next[key];
+      verdicts = next;
+    }
+  }
+
+  function cycleInCurrent(dir: 1 | -1) {
+    const item = currentReviewItem();
+    const found = item ? reviewGroupOf(item) : null;
+    if (found) cycleCandidate(found.g, found.key, dir);
+  }
+
+  // Drop verdicts whose items vanished; intersect group verdicts with live
+  // non-keeper members. Assigns only on change so callers can run it freely.
+  function pruneVerdicts() {
+    const keep: Record<string, { remove: number[] }> = {};
+    for (const [key, v] of Object.entries(verdicts)) {
+      if (key.startsWith("blur")) {
+        const id = Number(key.slice(4));
+        if (blurred.some((a) => a.id === id) && v.remove.includes(id)) keep[key] = { remove: [id] };
+        continue;
+      }
+      const m = key.match(/^(dup|near)(\d+)$/);
+      if (!m) continue;
+      const list = m[1] === "dup" ? groups : nearGroups;
+      const g = list.find((x) => x.id === Number(m[2]));
+      if (!g) continue;
+      const live = g.members.filter((x) => x.id !== g.keptId).map((x) => x.id);
+      const inter = v.remove.filter((id) => live.includes(id));
+      if (inter.length > 0) keep[key] = { remove: inter };
+    }
+    if (JSON.stringify(keep) !== JSON.stringify(verdicts)) verdicts = keep;
+    if (review) {
+      const len = buildReviewItems().length;
+      if (len > 0 && review.pos >= len) review.pos = len - 1;
+    }
+  }
+
+  function stagedStats(): { decisions: number; photos: number } {
+    const vals = Object.values(verdicts);
+    return {
+      decisions: vals.length,
+      photos: vals.reduce((s, v) => s + v.remove.length, 0)
+    };
+  }
+
+  function clearVerdicts() {
+    verdicts = {};
+  }
+
+  async function applyStaged() {
+    pruneVerdicts();
+    const entries = Object.entries(verdicts);
+    const ids = [...new Set(entries.flatMap(([, v]) => v.remove))];
+    if (ids.length === 0) {
+      toast = "Nothing staged — press D on items to stage them for removal";
+      return;
+    }
+    const n = entries.length;
+    confirm = {
+      ids,
+      label: `${ids.length} photo${ids.length === 1 ? "" : "s"} in ${n} decision${n === 1 ? "" : "s"}`
+    };
+  }
+
+  function reviewKey(e: KeyboardEvent) {
+    const item = currentReviewItem();
+    if (!item) return;
+    // Enter/Space on a focused button keeps its native behavior.
+    if ((e.key === "Enter" || e.key === " ") && (e.target as HTMLElement | null)?.tagName === "BUTTON") return;
+    const k = e.key;
+    if (k === "d" || k === "D" || k === "Enter") {
+      e.preventDefault();
+      stageCurrent();
+    } else if (k === "s" || k === "S") {
+      e.preventDefault();
+      skipCurrent();
+    } else if (k === "b" || k === "B" || k === "Backspace") {
+      e.preventDefault();
+      backReview();
+    } else if (k === "ArrowRight") {
+      e.preventDefault();
+      cycleInCurrent(1);
+    } else if (k === "ArrowLeft") {
+      e.preventDefault();
+      cycleInCurrent(-1);
+    } else if (k === "k" || k === "K") {
+      e.preventDefault();
+      reviewKeepCandidate();
+    } else if (k === "a" || k === "A") {
+      e.preventDefault();
+      void applyStaged();
+    } else if (k === "Escape") {
+      e.preventDefault();
+      exitReview();
+    }
+  }
+
+  function reviewTitle(item: ReviewItem | undefined, pos: number, total: number): string {
+    if (!item) return "Review complete";
+    if (item.kind === "blur") return `Blurred photo ${pos + 1} of ${total}`;
+    const found = reviewGroupOf(item);
+    const n = found?.g.members.length ?? 0;
+    const what = item.kind === "dup" ? "Duplicate" : "Similar";
+    return `${what} group ${pos + 1} of ${total} · ${n} photo${n === 1 ? "" : "s"}`;
+  }
+
+  function blurAsMember(a: AssetRow): DuplicateMember {
+    return {
+      id: a.id,
+      path: a.path,
+      name: a.name,
+      isDuplicate: false,
+      capturedAt: a.capturedAt,
+      qualityScore: null
+    };
   }
 
   async function undoLast() {
@@ -3005,6 +3383,15 @@
       Settings
     </button>
       </div>
+      <div class="pinned" role="group" aria-label="Pinned">
+        <h3 class="sub">Pinned</h3>
+        <button type="button" class="tab" onclick={() => void pinFavorites()}>Favorites</button>
+        <button type="button" class="tab" onclick={() => void pinRecent()}>Recently Saved</button>
+        <button type="button" class="tab" onclick={pinMap}>Map</button>
+        <button type="button" class="tab" onclick={() => void pinVideos()}>Videos</button>
+        <button type="button" class="tab" onclick={() => void pinScreenshots()}>Screenshots</button>
+        <button type="button" class="tab" onclick={pinPeople}>People</button>
+      </div>
       <div class="sidebar-footer">
         <button
           type="button"
@@ -3049,6 +3436,13 @@
         </button>
         <button onclick={() => void runFindSimilar()} disabled={nearing}>
           {nearing ? "Comparing…" : "Find similar photos"}
+        </button>
+        <button
+          onclick={startReview}
+          disabled={groups.length + nearGroups.length + blurred.length === 0}
+          title="Step through every group one by one, keyboard-first"
+        >
+          Review all ({groups.length + nearGroups.length + blurred.length})
         </button>
       </div>
       <p class="hint">Exact duplicates share the same file hash · Similar photos just look alike · Blurred means a low sharpness score — “keeper” is the copy worth keeping.</p>
@@ -3099,95 +3493,181 @@
         {/if}
       {/snippet}
 
+      {#snippet groupArticle(g: DuplicateGroup | NearGroup, key: string, kind: "dup" | "near")}
+        {@const keeper = keeperMember(g)}
+        {@const cand = pickCandidate(g, key)}
+        {@const extras = g.members.filter((m) => m.id !== g.keptId)}
+        <article class="group">
+          <header>
+            {#if kind === "dup" && "sizeBytes" in g}
+              <span>{g.members.length} copies · {fmtBytes(g.sizeBytes)} each</span>
+              <span class="waste">keep 1, free {fmtBytes(g.wasteBytes)}</span>
+            {:else}
+              <span>{g.members.length} similar · keep 1</span>
+              <span class="waste">free {fmtBytes(g.wasteBytes)}</span>
+            {/if}
+          </header>
+          {#if keeper && cand}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions: keydown delegates to this panel's strip buttons only; compareStripKey guards to [data-strip-id] focus -->
+            <section
+              class="compare"
+              data-compare={key}
+              aria-label={kind === "dup" ? `Compare duplicates in group ${g.id}` : `Compare similar photos in group ${g.id}`}
+              onkeydown={(e) => compareStripKey(e, g, key)}
+            >
+              <div class="compare-panes">
+                <figure class="compare-pane" data-pane="keeper">
+                  <span class="badge keep">Keeper</span>
+                  <div class="compare-img">
+                    {@render comparePane(keeper)}
+                  </div>
+                </figure>
+                <figure class="compare-pane" data-pane="candidate">
+                  <span class="candidate-name">{cand.name}</span>
+                  <div class="compare-img">
+                    {@render comparePane(cand)}
+                  </div>
+                  <figcaption><span class="name" title={cand.path}>{cand.name}</span></figcaption>
+                </figure>
+              </div>
+              {#if cand.id !== g.keptId}
+                {#if kind === "dup"}
+                  <button class="tiny" onclick={() => void swapDuplicateKeeper(g.id, cand.id)}>
+                    Keep this one instead
+                  </button>
+                {:else}
+                  <button class="tiny" onclick={() => void swapNearKeeper(g.id, cand.id)}>
+                    Keep this one instead
+                  </button>
+                {/if}
+              {/if}
+            </section>
+          {/if}
+          <div class="members">
+            {#each g.members as member (member.id)}
+              <figure class:keeper={member.id === g.keptId}>
+                <button
+                  type="button"
+                  class="thumb small cleanup-preview strip"
+                  data-strip-id={member.id}
+                  aria-pressed={cand != null && member.id === cand.id}
+                  aria-label={`Show ${member.name} in compare`}
+                  title={`Show ${member.name} in compare`}
+                  onclick={() => {
+                    selectCandidate(key, member.id);
+                    void ensureCompareSrc(member);
+                  }}
+                >
+                  {#if thumbs[member.path]}
+                    <img src={thumbs[member.path]} alt="" loading="lazy" />
+                  {:else}
+                    <span class="placeholder">IMG</span>
+                  {/if}
+                </button>
+                <figcaption>
+                  <span class="name" title={member.path}>{member.name}</span>
+                  {#if member.id === g.keptId}
+                    <span class="badge keep">keeper</span>
+                  {:else if kind === "dup"}
+                    <div class="row-actions">
+                      <button class="tiny" onclick={() => void chooseKeeper(g.id, member.id)}>
+                        Keep this
+                      </button>
+                      <button class="tiny danger" onclick={() => (confirm = { ids: [member.id], label: member.name })}>
+                        Remove
+                      </button>
+                    </div>
+                  {:else}
+                    <span class="row-actions">
+                      <button class="tiny" onclick={() => void chooseNearKeeper(g.id, member.id)}>
+                        Keep this
+                      </button>
+                      <button class="tiny danger" onclick={() => (confirm = { ids: [member.id], label: member.name })}>
+                        Trash
+                      </button>
+                    </span>
+                  {/if}
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+          {#if extras.length > 0}
+            <button
+              class="tiny danger"
+              onclick={() => (confirm = { ids: extras.map((m) => m.id), label: `${extras.length} ${kind === "dup" ? "duplicates" : "similar photos"}` })}
+            >
+              Move {extras.length} extra {extras.length === 1 ? "copy" : "copies"} to Trash
+            </button>
+          {/if}
+        </article>
+      {/snippet}
+
+      {#if review}
+        {@const items = reviewItems}
+        {@const rpos = items.length === 0 ? 0 : Math.min(review.pos, items.length - 1)}
+        {@const item = items[rpos]}
+        {@const staged = stagedStats()}
+        {@const verdict = item ? verdicts[reviewKeyOf(item)] : undefined}
+        {@const found = item && item.kind !== "blur" ? reviewGroupOf(item) : null}
+        {@const blurAsset = item && item.kind === "blur" ? blurred.find((a) => a.id === item.assetId) : undefined}
+        {@const extrasCount = !item ? 0 : item.kind === "blur" ? 1 : reviewExtras(item).length}
+        <div class="review" role="region" aria-label="Cleanup review">
+          <div class="review-head">
+            <span>{reviewTitle(item, rpos, items.length)}</span>
+            {#if verdict}
+              <span class="chip on">Staged · {verdict.remove.length} photo{verdict.remove.length === 1 ? "" : "s"}</span>
+            {/if}
+            <button type="button" class="ghost" onclick={exitReview}>Exit review</button>
+          </div>
+          {#if item?.kind === "blur"}
+            {#if blurAsset}
+              <article class="group">
+                <header>
+                  <span>{blurAsset.name}</span>
+                  <span class="waste">{blurAsset.width && blurAsset.height ? `${blurAsset.width}×${blurAsset.height} · ` : ""}{fmtBytes(blurAsset.sizeBytes)}</span>
+                </header>
+                <div class="compare-img blur-review">
+                  {@render comparePane(blurAsMember(blurAsset))}
+                </div>
+              </article>
+            {:else}
+              <p class="hint">That photo is already decided — press S to move on.</p>
+            {/if}
+          {:else if found}
+            {@render groupArticle(found.g, found.key, found.kind)}
+          {:else if item}
+            <p class="hint">This group is already decided — press S to move on.</p>
+          {:else}
+            <p class="hint">Review complete.</p>
+          {/if}
+          {#if item}
+            <div class="review-controls">
+              {#if item.kind === "blur"}
+                <button type="button" onclick={() => stageCurrent()}>Stage for removal (D)</button>
+                <button type="button" class="ghost" onclick={() => skipCurrent()}>Keep · skip (S)</button>
+              {:else}
+                <button type="button" onclick={() => stageCurrent()}>Stage {extrasCount} extra{extrasCount === 1 ? "" : "s"} (D)</button>
+                <button type="button" class="ghost" onclick={() => skipCurrent()}>Skip (S)</button>
+                <button type="button" class="ghost" onclick={() => reviewKeepCandidate()}>Keep candidate (K)</button>
+              {/if}
+              <button type="button" class="ghost" onclick={() => backReview()} disabled={rpos === 0}>Back (B)</button>
+            </div>
+            <p class="hint">D stage · S skip · ←/→ candidate · K keep candidate · B back · A apply · Esc exit</p>
+          {/if}
+          {#if staged.decisions > 0}
+            <div class="batch-bar" aria-label="Staged cleanup decisions">
+              <span>{staged.photos} photo{staged.photos === 1 ? "" : "s"} staged in {staged.decisions} decision{staged.decisions === 1 ? "" : "s"}</span>
+              <button type="button" class="ghost" onclick={clearVerdicts}>Clear staged</button>
+              <button type="button" class="tiny danger" onclick={() => void applyStaged()}>Apply all (A)</button>
+            </div>
+          {/if}
+        </div>
+      {:else}
       {#if groups.length}
         <h3 class="sub">Duplicate groups</h3>
         {#each groups as group (group.id)}
           {@const dupKey = `dup${group.id}`}
-          {@const dupKeeper = keeperMember(group)}
-          {@const dupCand = pickCandidate(group, dupKey)}
-          <article class="group">
-            <header>
-              <span>{group.members.length} copies · {fmtBytes(group.sizeBytes)} each</span>
-              <span class="waste">keep 1, free {fmtBytes(group.wasteBytes)}</span>
-            </header>
-            {#if dupKeeper && dupCand}
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions: keydown delegates to this panel's strip buttons only; compareStripKey guards to [data-strip-id] focus -->
-              <section
-                class="compare"
-                data-compare={dupKey}
-                aria-label={`Compare duplicates in group ${group.id}`}
-                onkeydown={(e) => compareStripKey(e, group, dupKey)}
-              >
-                <div class="compare-panes">
-                  <figure class="compare-pane" data-pane="keeper">
-                    <span class="badge keep">Keeper</span>
-                    <div class="compare-img">
-                      {@render comparePane(dupKeeper)}
-                    </div>
-                  </figure>
-                  <figure class="compare-pane" data-pane="candidate">
-                    <span class="candidate-name">{dupCand.name}</span>
-                    <div class="compare-img">
-                      {@render comparePane(dupCand)}
-                    </div>
-                    <figcaption><span class="name" title={dupCand.path}>{dupCand.name}</span></figcaption>
-                  </figure>
-                </div>
-                {#if dupCand.id !== group.keptId}
-                  <button class="tiny" onclick={() => void swapDuplicateKeeper(group.id, dupCand.id)}>
-                    Keep this one instead
-                  </button>
-                {/if}
-              </section>
-            {/if}
-            <div class="members">
-              {#each group.members as member (member.id)}
-                <figure class:keeper={member.id === group.keptId}>
-                  <button
-                    type="button"
-                    class="thumb small cleanup-preview strip"
-                    data-strip-id={member.id}
-                    aria-pressed={dupCand != null && member.id === dupCand.id}
-                    aria-label={`Show ${member.name} in compare`}
-                    title={`Show ${member.name} in compare`}
-                    onclick={() => {
-                      selectCandidate(dupKey, member.id);
-                      void ensureCompareSrc(member);
-                    }}
-                  >
-                    {#if thumbs[member.path]}
-                      <img src={thumbs[member.path]} alt="" loading="lazy" />
-                    {:else}
-                      <span class="placeholder">IMG</span>
-                    {/if}
-                  </button>
-                  <figcaption>
-                    <span class="name" title={member.path}>{member.name}</span>
-                    {#if member.id === group.keptId}
-                      <span class="badge keep">keeper</span>
-                    {:else}
-            <div class="row-actions">
-                        <button class="tiny" onclick={() => void chooseKeeper(group.id, member.id)}>
-                          Keep this
-                        </button>
-                        <button class="tiny danger" onclick={() => (confirm = { ids: [member.id], label: member.name })}>
-                          Remove
-                        </button>
-                      </div>
-                    {/if}
-                  </figcaption>
-                </figure>
-              {/each}
-            </div>
-            {#if group.members.length > 1}
-              <button
-                class="tiny danger"
-                onclick={() => (confirm = { ids: group.members.filter((m) => m.id !== group.keptId).map((m) => m.id), label: `${group.members.length - 1} duplicates` })}
-              >
-                Move {group.members.length - 1} extra {group.members.length - 1 === 1 ? "copy" : "copies"} to Trash
-              </button>
-            {/if}
-          </article>
+          {@render groupArticle(group, dupKey, "dup")}
         {/each}
       {/if}
 
@@ -3196,91 +3676,7 @@
         <p class="hint">Perceptual matches (resaves, crops, resizes) — review before trashing.</p>
         {#each nearGroups as group (group.id)}
           {@const nearKey = `near${group.id}`}
-          {@const nearKeeper = keeperMember(group)}
-          {@const nearCand = pickCandidate(group, nearKey)}
-          <article class="group">
-            <header>
-              <span>{group.members.length} similar · keep 1</span>
-              <span class="waste">free {fmtBytes(group.wasteBytes)}</span>
-            </header>
-            {#if nearKeeper && nearCand}
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions: keydown delegates to this panel's strip buttons only; compareStripKey guards to [data-strip-id] focus -->
-              <section
-                class="compare"
-                data-compare={nearKey}
-                aria-label={`Compare similar photos in group ${group.id}`}
-                onkeydown={(e) => compareStripKey(e, group, nearKey)}
-              >
-                <div class="compare-panes">
-                  <figure class="compare-pane" data-pane="keeper">
-                    <span class="badge keep">Keeper</span>
-                    <div class="compare-img">
-                      {@render comparePane(nearKeeper)}
-                    </div>
-                  </figure>
-                  <figure class="compare-pane" data-pane="candidate">
-                    <span class="candidate-name">{nearCand.name}</span>
-                    <div class="compare-img">
-                      {@render comparePane(nearCand)}
-                    </div>
-                    <figcaption><span class="name" title={nearCand.path}>{nearCand.name}</span></figcaption>
-                  </figure>
-                </div>
-                {#if nearCand.id !== group.keptId}
-                  <button class="tiny" onclick={() => void swapNearKeeper(group.id, nearCand.id)}>
-                    Keep this one instead
-                  </button>
-                {/if}
-              </section>
-            {/if}
-            <div class="members">
-              {#each group.members as member (member.id)}
-                <figure class:keeper={member.id === group.keptId}>
-                  <button
-                    type="button"
-                    class="thumb small cleanup-preview strip"
-                    data-strip-id={member.id}
-                    aria-pressed={nearCand != null && member.id === nearCand.id}
-                    aria-label={`Show ${member.name} in compare`}
-                    title={`Show ${member.name} in compare`}
-                    onclick={() => {
-                      selectCandidate(nearKey, member.id);
-                      void ensureCompareSrc(member);
-                    }}
-                  >
-                    {#if thumbs[member.path]}
-                      <img src={thumbs[member.path]} alt="" loading="lazy" />
-                    {:else}
-                      <span class="placeholder">IMG</span>
-                    {/if}
-                  </button>
-                  <figcaption>
-                    <span class="name" title={member.path}>{member.name}</span>
-                    {#if member.id === group.keptId}
-                      <span class="badge keep">keeper</span>
-                    {:else}
-                      <span class="row-actions">
-                        <button class="tiny" onclick={() => void chooseNearKeeper(group.id, member.id)}>
-                          Keep this
-                        </button>
-                        <button class="tiny danger" onclick={() => (confirm = { ids: [member.id], label: member.name })}>
-                          Trash
-                        </button>
-                      </span>
-                    {/if}
-                  </figcaption>
-                </figure>
-              {/each}
-            </div>
-            {#if group.members.length > 1}
-              <button
-                class="tiny danger"
-                onclick={() => (confirm = { ids: group.members.filter((m) => m.id !== group.keptId).map((m) => m.id), label: `${group.members.length - 1} similar photos` })}
-              >
-                Move {group.members.length - 1} extra {group.members.length - 1 === 1 ? "copy" : "copies"} to Trash
-              </button>
-            {/if}
-          </article>
+          {@render groupArticle(group, nearKey, "near")}
         {/each}
       {/if}
 
@@ -3305,6 +3701,7 @@
             </figure>
           {/each}
         </div>
+      {/if}
       {/if}
     </section>
   {:else if tab === "library"}
@@ -4329,6 +4726,24 @@
     </div>
   {/if}
 
+  {#snippet infoPanel(a: AssetRow)}
+    {@const cam = cameraLabel(a)}
+    {@const expo = exposureParts(a)}
+    {@const loc = [a.place, gpsLabel(a)].filter((x): x is string => !!x).join(" · ")}
+    <dl class="info" aria-label="Photo info">
+      {#if cam}<div><dt>Camera</dt><dd>{cam}</dd></div>{/if}
+      {#if a.lens}<div><dt>Lens</dt><dd>{a.lens}</dd></div>{/if}
+      {#if expo.length > 0}<div><dt>Exposure</dt><dd>{expo.join(" · ")}</dd></div>{/if}
+      {#if loc}<div><dt>Location</dt><dd>{loc}</dd></div>{/if}
+      {#if a.width && a.height}
+        <div><dt>Dimensions</dt><dd>{a.width}×{a.height}{a.kind === "video" && a.duration ? ` · ${trimNum(a.duration)} s` : ""}</dd></div>
+      {/if}
+      <div><dt>Size</dt><dd>{fmtBytes(a.sizeBytes)}</dd></div>
+      <div><dt>Format</dt><dd>{a.ext.toUpperCase()}{a.mime ? ` · ${a.mime}` : ""}</dd></div>
+      {#if a.capturedAt}<div><dt>Taken</dt><dd>{fmtDate(a.capturedAt)}</dd></div>{/if}
+    </dl>
+  {/snippet}
+
   {#if viewer}
     {@const rows = viewerRows()}
     {@const current = rows[viewer.index]}
@@ -4371,6 +4786,14 @@
                 onclick={() => void removePhotoFromReview()}
               >Not {reviewCluster.name} — remove</button>
             {/if}
+            <button
+              type="button"
+              class="tiny"
+              aria-pressed={infoOpen}
+              aria-label="Photo info"
+              title="Camera, location and file info (I)"
+              onclick={() => (infoOpen = !infoOpen)}
+            >ⓘ</button>
             <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
             <button
               class="tiny"
@@ -4406,7 +4829,10 @@
             · {fmtBytes(current.sizeBytes)}
             {#if viewerTags.length > 0} · {viewerTags.map((t) => t.tag).join(", ")}{/if}
           </p>
-          <p class="hint">← → move · esc closes · S stars</p>
+          {#if infoOpen}
+            {@render infoPanel(current)}
+          {/if}
+          <p class="hint">← → move · esc closes · S stars · I shows info</p>
         </div>
       </div>
     {/if}
@@ -4426,6 +4852,13 @@
           <button class="tiny" onclick={() => zoomShow(-1)} disabled={showZoom <= 1} aria-label="Zoom out">−</button>
           <button class="tiny" onclick={resetShowZoom} disabled={showZoom === 1} aria-label="Reset zoom">{Math.round(showZoom * 100)}%</button>
           <button class="tiny" onclick={() => zoomShow(1)} disabled={showZoom >= 5} aria-label="Zoom in">+</button>
+          <button
+            class="tiny"
+            aria-pressed={infoOpen}
+            aria-label="Photo info"
+            title="Camera, location and file info (I)"
+            onclick={() => (infoOpen = !infoOpen)}
+          >ⓘ</button>
           <button class="tiny" onclick={closeShow} aria-label="Close slideshow">✕</button>
         </div>
       </div>
@@ -4463,6 +4896,11 @@
           <p class="hint">Loading full size…</p>
         {/if}
       </div>
+      {#if infoOpen}
+        <div class="theater-info">
+          {@render infoPanel(sc)}
+        </div>
+      {/if}
       <p class="hint theater-hint">‹ › move · +/− zoom · 0 reset · space plays/pauses · esc closes</p>
     </div>
   {/if}
@@ -5217,6 +5655,33 @@
   .group-head .show-all {
     margin-left: auto;
   }
+  /* Review mode: one item on screen, progress head, decision controls,
+     staged bulk bar. Reuses .group/.compare/.batch-bar wholesale. */
+  .review {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .review-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #cfd5e1;
+  }
+  .review-head button {
+    margin-left: auto;
+  }
+  .review-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .compare-img.blur-review {
+    max-width: 42rem;
+  }
   /* Drill-down banner: period label + count left, Back pushed right. */
   .drill-banner {
     display: flex;
@@ -5229,6 +5694,36 @@
   }
   .drill-banner button {
     margin-left: auto;
+  }
+  /* Photo info panel: label/value rows; rows without data are omitted. */
+  .info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin: 0.5rem 0 0;
+    padding: 0.6rem 0.8rem;
+    background: #0d0f14;
+    border: 1px solid #232733;
+    border-radius: 8px;
+    font-size: 0.78rem;
+  }
+  .info > div {
+    display: flex;
+    gap: 0.8rem;
+  }
+  .info dt {
+    flex: 0 0 5.5rem;
+    color: #8a93a5;
+  }
+  .info dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  /* Theater info floats centered under the stage. */
+  .theater-info {
+    align-self: center;
+    width: min(28rem, 92%);
   }
   .grid > figure {
     position: relative;
@@ -5441,6 +5936,16 @@
     text-align: center;
     padding-left: 0.4rem;
     padding-right: 0.4rem;
+  }
+  /* Pinned shortcuts: same full-width buttons as tabs, tighter stack. */
+  .sidebar .pinned {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.15rem;
+  }
+  .sidebar .pinned .sub {
+    margin: 0.3rem 0.2rem 0.15rem;
   }
   .sidebar-footer {
     display: flex;

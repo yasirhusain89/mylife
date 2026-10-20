@@ -21,6 +21,22 @@ export type AssetRow = {
   place: string | null;
   /** Sorted named people on this photo (empty when no one is tagged). */
   people: string[];
+  /** EXIF camera body make/model/lens (null when the file carries none). */
+  cameraMake: string | null;
+  cameraModel: string | null;
+  lens: string | null;
+  /** GPS coordinates from EXIF (null when the file carries none). */
+  latitude: number | null;
+  longitude: number | null;
+  /** Exposure settings from EXIF (null when the file carries none). */
+  iso: number | null;
+  fNumber: number | null;
+  /** Shutter speed in seconds (0.004 = 1/250). */
+  exposureTime: number | null;
+  /** Focal length in mm (actual). */
+  focalLength: number | null;
+  /** 35mm-equivalent focal length in mm. */
+  focalLength35: number | null;
 };
 
 export type LibraryStats = {
@@ -67,6 +83,8 @@ export type LibraryFilters = {
   sceneTag?: string;
   query?: string;
   hasPet?: boolean;
+  /** Newest-first by first_seen_at (Pinned "Recently Saved"). */
+  sortAdded?: boolean;
 };
 
 export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
@@ -81,7 +99,8 @@ export function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]> {
     favoriteOnly: opts.favoriteOnly ?? null,
     sceneTag: opts.sceneTag ?? null,
     query: opts.query?.trim() ? opts.query.trim() : null,
-    hasPet: opts.hasPet ?? null
+    hasPet: opts.hasPet ?? null,
+    sortAdded: opts.sortAdded ?? null
   });
 }
 

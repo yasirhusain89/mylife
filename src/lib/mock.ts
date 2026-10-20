@@ -86,13 +86,33 @@ function asset(
     sha256: null,
     place: null,
     people: [],
+    cameraMake: null,
+    cameraModel: null,
+    lens: null,
+    latitude: null,
+    longitude: null,
+    iso: null,
+    fNumber: null,
+    exposureTime: null,
+    focalLength: null,
+    focalLength35: null,
     ...opts
   };
 }
 
 const DUPLICATE_SHA = "a".repeat(64);
 const seed: AssetRow[] = [
-  asset(1, "IMG_20261007_185817.jpg", "image"),
+  asset(1, "IMG_20261007_185817.jpg", "image", {
+    cameraMake: "Apple",
+    cameraModel: "iPhone 16 Pro",
+    iso: 80,
+    fNumber: 1.78,
+    exposureTime: 1 / 120,
+    focalLength: 6.86,
+    focalLength35: 24,
+    latitude: 37.7749,
+    longitude: -122.4194
+  }),
   asset(2, "IMG_20261007_185822.jpg", "image"),
   asset(3, "IMG_20261007_185824.jpg", "image"),
   asset(4, "IMG_20261007_191433.jpg", "image"),
@@ -109,8 +129,9 @@ let nextId = 100;
 let trashedStore = new Map<number, AssetRow>();
 let scanHistory: string[] = ["/photos"];
 
-// AssetRow carries no location column; the mock tracks "has GPS" separately
-// so the With/No-location filter chips have something to chew on.
+// AssetRow carries lat/lng for the rare fully-tagged fixture; the mock
+// still tracks "has GPS" separately so the With/No-location filter chips
+// have something to chew on.
 let located = new Set<number>([1, 2, 4, 7]);
 
 // personCluster -> asset ids, filled by runFaceClustering.
@@ -245,6 +266,8 @@ function applyFilters(rows: AssetRow[], opts: LibraryFilters): AssetRow[] {
     const members = clusterMembers.get(opts.personCluster);
     out = members ? out.filter((a) => members.has(a.id)) : [];
   }
+  // Recently Saved: insertion order (id) stands in for first_seen_at.
+  if (opts.sortAdded) out = [...out].sort((a, b) => b.id - a.id);
   return out;
 }
 

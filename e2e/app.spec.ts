@@ -1703,3 +1703,112 @@ test("year drill opens that year's months with highlights", async ({ page }) => 
   await banner.getByRole("button", { name: "Back to years" }).click();
   await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
 });
+
+// ---------------------------------------------------------------------------
+// Pinned shortcuts (Favorites / Recently Saved / Map / Videos / Screenshots /
+// People) + the photo info panel (camera, exposure, GPS, file facts)
+// ---------------------------------------------------------------------------
+
+test("pinned shortcuts jump to tabs and library presets", async ({ page }) => {
+  // Star one photo so Favorites has something to find.
+  await page.getByRole("button", { name: "Star IMG_20261007_185817.jpg" }).click();
+  await page.getByRole("button", { name: "Favorites", exact: true }).click();
+  await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+  await expect(page.getByText("Filters: favorites")).toBeVisible();
+  // Recently Saved: newest first_seen_at first (mock: highest id).
+  await page.getByRole("button", { name: "Recently Saved", exact: true }).click();
+  await expect(page.getByText("Filters: recently added")).toBeVisible();
+  await expect(page.locator(".grid figure").first()).toContainText("VID_20261007_204512.mp4");
+  // Videos: kind preset.
+  await page.getByRole("button", { name: "Videos", exact: true }).click();
+  await expect(page.getByText("Showing 2 of 2")).toBeVisible();
+  await expect(page.getByText("Filters: videos")).toBeVisible();
+  // Screenshots: saved name search (no fixture matches — wiring check).
+  await page.getByRole("button", { name: "Screenshots", exact: true }).click();
+  await expect(page.getByLabel("Search library")).toHaveValue("screenshot");
+  await expect(page.locator(".grid figure")).toHaveCount(0);
+  // Map + People jump tabs.
+  await page.getByRole("button", { name: "Map", exact: true }).click();
+  await expect(page.locator(".leaflet-container")).toBeVisible();
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await expect(page.getByRole("tab", { name: /^People/ })).toHaveAttribute("aria-selected", "true");
+});
+
+test("photo info shows camera, exposure, gps and file facts", async ({ page }) => {  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  await expect(page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" })).toBeVisible();
+  await page.getByRole("button", { name: "Photo info" }).click();
+  const info = page.locator(".info");
+  await expect(info).toContainText("iPhone 16 Pro");
+  await expect(info).toContainText("ƒ/1.78");
+  await expect(info).toContainText("1/120");
+  await expect(info).toContainText("ISO 80");
+  await expect(info).toContainText("24 mm");
+  await expect(info).toContainText("37.7749, -122.4194");
+  await expect(info).toContainText("4032×3024");
+  // The I key toggles the panel.
+  await page.keyboard.press("i");
+  await expect(page.locator(".info")).toHaveCount(0);
+  await page.keyboard.press("i");
+  await expect(page.locator(".info")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  // A photo without EXIF shows file facts only — no camera rows. The
+  // inspector stays open across photos, so no second click is needed.
+  await page.getByTitle("Open IMG_20261007_185822.jpg").click();
+  const bare = page.locator(".info");
+  await expect(bare).toContainText("Dimensions");
+  await expect(bare).toContainText("Size");
+  await expect(bare).not.toContainText("iPhone");
+  await expect(bare).not.toContainText("Camera");
+});
+
+// ---------------------------------------------------------------------------
+// Cleanup review mode: keyboard triage queue + staged bulk apply
+// ---------------------------------------------------------------------------
+
+test("review triage stages with the keyboard and bulk-applies", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Review all (3)" }).click();
+  const review = page.getByRole("region", { name: "Cleanup review" });
+  await expect(review).toContainText("Duplicate group 1 of 3 · 2 photos");
+  // D stages the extra copy and auto-advances to the similar group.
+  await page.keyboard.press("d");
+  await expect(review).toContainText("Similar group 2 of 3 · 2 photos");
+  await expect(review.getByText("1 photo staged in 1 decision")).toBeVisible();
+  // B goes back; D again re-stages and moves on.
+  await page.keyboard.press("b");
+  await expect(review).toContainText("Duplicate group 1 of 3 · 2 photos");
+  await page.keyboard.press("d");
+  await expect(review).toContainText("Similar group 2 of 3 · 2 photos");
+  // S skips the similar group, landing on the blurred photo.
+  await page.keyboard.press("s");
+  await expect(review).toContainText("Blurred photo 3 of 3");
+  await expect(review).toContainText("IMG_20261007_185824.jpg");
+  await page.keyboard.press("d");
+  await expect(review.getByText("2 photos staged in 2 decisions")).toBeVisible();
+  // One bulk apply: single confirm, single undo entry.
+  await review.getByRole("button", { name: "Apply all (A)" }).click();
+  await expect(page.getByRole("alertdialog")).toContainText("Move 2 photos in 2 decisions to Trash?");
+  await page.getByRole("alertdialog").getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.locator(".toast")).toContainText("moved to Trash");
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.locator(".toast")).toContainText("Restored");
+});
+
+test("review keeper swap clears the staged verdict", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Review all (3)" }).click();
+  const review = page.getByRole("region", { name: "Cleanup review" });
+  await page.keyboard.press("d"); // stage the duplicate extra, advance.
+  await expect(review).toContainText("Similar group 2 of 3 · 2 photos");
+  // K makes the candidate the keeper: verdict cleared, swap offered back.
+  await page.keyboard.press("k");
+  await expect(review.getByRole("button", { name: "Keep this one instead" })).toBeVisible();
+  await expect(review.getByText("Staged ·", { exact: false })).toHaveCount(0);
+  // Re-decide under the new keeper: the other copy stages instead.
+  await page.keyboard.press("d");
+  await expect(review.getByText("2 photos staged in 2 decisions")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(review).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Duplicate groups" })).toBeVisible();
+});

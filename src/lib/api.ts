@@ -86,6 +86,7 @@ function libraryParams(opts: LibraryFilters): Record<string, string | number | b
   if (opts.favoriteOnly !== undefined) out["favoriteOnly"] = opts.favoriteOnly;
   if (opts.sceneTag !== undefined) out["sceneTag"] = opts.sceneTag;
   if (opts.hasPet !== undefined) out["hasPet"] = opts.hasPet;
+  if (opts.sortAdded !== undefined) out["sortAdded"] = opts.sortAdded;
   const q = opts.query?.trim();
   if (q) out["query"] = q;
   return out;
