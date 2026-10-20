@@ -277,6 +277,49 @@ test("Done exits select mode and drops the selection", async ({ page }) => {
   await expect(page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" })).not.toBeChecked();
 });
 
+test("grid arrow keys move focus across the library", async ({ page }) => {
+  const thumbs = page.locator(".grid figure button.thumb");
+  await thumbs.first().focus();
+  await expect(thumbs.first()).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(thumbs.nth(1)).toBeFocused();
+  await page.keyboard.press("ArrowLeft");
+  await expect(thumbs.first()).toBeFocused();
+});
+
+test("shift-range selects a run in select mode", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  const thumbs = page.locator(".grid figure button.thumb");
+  await thumbs.first().focus();
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect(page.locator(".batch-bar").getByText("2 selected")).toBeVisible();
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect(page.locator(".batch-bar").getByText("3 selected")).toBeVisible();
+});
+
+test("select-all selects the visible set in select mode", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.locator(".grid figure button.thumb").first().focus();
+  await page.keyboard.press("ControlOrMeta+a");
+  await expect(page.locator(".batch-bar").getByText("8 selected")).toBeVisible();
+});
+
+test("Delete opens the confirm dialog for the selection", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".grid figure button.thumb").first().focus();
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("moves the file to the macOS Trash")).toBeVisible();
+});
+
+test("S stars the focused photo", async ({ page }) => {
+  await page.locator(".grid figure button.thumb").first().focus();
+  await page.keyboard.press("s");
+  await expect(page.locator(".grid figure").first().getByRole("button", { name: /^Unstar / })).toBeVisible();
+});
+
 test("people can be named and merged", async ({ page }) => {
   await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();

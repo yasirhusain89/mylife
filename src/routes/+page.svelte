@@ -607,6 +607,76 @@
     selectMode = true;
   }
 
+  // Library grid keyboard support: roving focus over the visual grid plus
+  // select-mode shortcuts. Reuses the existing `selected` set, `confirm`
+  // flow (via batchTrash) and toggleFavorite — no parallel selection model.
+  let gridFocusId = $state<number | null>(null);
+  let rangeAnchorId = $state<number | null>(null);
+
+  function gridColumnCount(): number {
+    try {
+      const figs = Array.from(document.querySelectorAll(".grid figure"));
+      if (figs.length < 2) return 1;
+      const top = (figs[0] as HTMLElement).offsetTop;
+      let cols = 0;
+      for (const f of figs) {
+        if ((f as HTMLElement).offsetTop === top) cols++;
+        else break;
+      }
+      return Math.max(1, cols);
+    } catch {
+      return 1;
+    }
+  }
+
+  function gridFocusPos(): number {
+    const i = displayAssets.findIndex((x) => x.asset.id === gridFocusId);
+    return i < 0 ? 0 : i;
+  }
+
+  function focusGridAt(pos: number, extend = false) {
+    const items = displayAssets;
+    if (items.length === 0) return;
+    const at = Math.max(0, Math.min(pos, items.length - 1));
+    const prev = gridFocusId;
+    const entry = items[at];
+    gridFocusId = entry.asset.id;
+    try {
+      (document.querySelector(`[data-grid-id="${entry.asset.id}"]`) as HTMLElement | null)?.focus();
+    } catch {
+      /* focus stays where it was */
+    }
+    if (!selectMode) return;
+    if (extend) {
+      const anchor = rangeAnchorId ?? prev ?? entry.asset.id;
+      if (rangeAnchorId === null) rangeAnchorId = anchor;
+      const ai = items.findIndex((x) => x.asset.id === anchor);
+      const a = ai < 0 ? at : ai;
+      const next = new Set(selected);
+      for (let i = Math.min(a, at); i <= Math.max(a, at); i++) next.add(items[i].asset.id);
+      selected = next;
+    } else {
+      rangeAnchorId = entry.asset.id;
+    }
+  }
+
+  // Typing targets stay out of the way: text inputs, search boxes, selects,
+  // textareas and contenteditables never trigger grid shortcuts. Grid
+  // checkboxes/radios are controls, not text entry, so keys pass through.
+  function isTypingTarget(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    if (!el || !("tagName" in el)) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag === "INPUT") {
+      const type = (el as HTMLInputElement).type;
+      if (type === "checkbox" || type === "radio") return false;
+      return true;
+    }
+    return false;
+  }
+
   async function enterSelectMode() {
     selectMode = true;
     selected = new Set();
@@ -886,10 +956,65 @@
       else if (e.key === " ") { e.preventDefault(); toggleShowPlay(); }
       return;
     }
-    if (!viewer) return;
+    if (!viewer) {
+      if (tab !== "library") return;
+      if (confirm || picker || similar || nameDialog || deleteAlbumTarget || removeRootTarget) return;
+      if (isTypingTarget(e.target)) return;
+      const items = displayAssets;
+      if (items.length === 0) return;
+      if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A")) {
+        if (!selectMode) return;
+        e.preventDefault();
+        selected = new Set(items.map((x) => x.asset.id));
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const pos = gridFocusPos();
+      if (e.key === "ArrowRight") { e.preventDefault(); focusGridAt(gridFocusId === null ? 0 : pos + 1, e.shiftKey); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); focusGridAt(gridFocusId === null ? 0 : pos - 1, e.shiftKey); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); focusGridAt(gridFocusId === null ? 0 : pos + gridColumnCount(), e.shiftKey); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); focusGridAt(gridFocusId === null ? 0 : pos - gridColumnCount(), e.shiftKey); }
+      else if (e.key === "Home") { e.preventDefault(); focusGridAt(0, e.shiftKey); }
+      else if (e.key === "End") { e.preventDefault(); focusGridAt(items.length - 1, e.shiftKey); }
+      else if (e.key === "Enter") {
+        const cur = items[gridFocusId === null ? 0 : pos];
+        if (!cur) return;
+        e.preventDefault();
+        gridFocusId = cur.asset.id;
+        if (selectMode) { toggleSelect(cur.asset.id); rangeAnchorId = cur.asset.id; }
+        else openViewer(cur.index);
+      } else if (e.key === " ") {
+        if (!selectMode) return;
+        const cur = items[gridFocusId === null ? 0 : pos];
+        if (!cur) return;
+        e.preventDefault();
+        gridFocusId = cur.asset.id;
+        toggleSelect(cur.asset.id);
+        rangeAnchorId = cur.asset.id;
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        if (!selectMode || selected.size === 0) return;
+        e.preventDefault();
+        batchTrash();
+      } else if (e.key === "s" || e.key === "S") {
+        if (selectMode && selected.size > 0) { e.preventDefault(); void batchFavorite(); }
+        else {
+          const cur = items[gridFocusId === null ? 0 : pos];
+          if (!cur) return;
+          e.preventDefault();
+          gridFocusId = cur.asset.id;
+          void toggleFavorite(cur.asset);
+        }
+      }
+      return;
+    }
     if (e.key === "Escape") closeViewer();
     else if (e.key === "ArrowRight") { e.preventDefault(); stepViewer(1); }
     else if (e.key === "ArrowLeft") { e.preventDefault(); stepViewer(-1); }
+    else if ((e.key === "s" || e.key === "S") && !isTypingTarget(e.target)) {
+      const rows = viewerRows();
+      const cur = rows[viewer.index];
+      if (cur && cur.id >= 0) { e.preventDefault(); void toggleFavorite(cur); }
+    }
   }
 
   // A11y (issue #4): roving-tabindex tablist with automatic activation.
@@ -2539,13 +2664,16 @@
                 class="selbox"
                 checked={selected.has(asset.id)}
                 aria-label={`Select ${asset.name}`}
-                onchange={() => toggleSelect(asset.id)}
+                onchange={() => { toggleSelect(asset.id); rangeAnchorId = asset.id; gridFocusId = asset.id; }}
               />
             {/if}
             <button
               type="button"
               class="thumb clickable"
               use:observeThumb={asset.path}
+              data-grid-id={asset.id}
+              tabindex={gridFocusId === null ? (di === 0 ? 0 : -1) : gridFocusId === asset.id ? 0 : -1}
+              onfocus={() => { gridFocusId = asset.id; }}
               title={selectMode ? `Select ${asset.name}` : `Open ${asset.name}`}
               onclick={() => { if (selectMode) toggleSelect(asset.id); else openViewer(index); }}
             >
@@ -2588,6 +2716,7 @@
           </figure>
         {/each}
       </div>
+      <p class="hint">← → ↑ ↓ move · Enter opens · S stars{#if selectMode} · Shift+←/→ extends selection · Ctrl/⌘+A selects all · Del removes{/if}</p>
     {:else if !importing}
       <p class="hint">No assets yet — add a folder to build the index.</p>
     {/if}
@@ -3194,6 +3323,7 @@
             · {fmtBytes(current.sizeBytes)}
             {#if viewerTags.length > 0} · {viewerTags.map((t) => t.tag).join(", ")}{/if}
           </p>
+          <p class="hint">← → move · esc closes · S stars</p>
         </div>
       </div>
     {/if}
@@ -3897,6 +4027,10 @@
   }
   .thumb.clickable:hover {
     outline: 2px solid #2f6bff;
+  }
+  .thumb.clickable:focus-visible {
+    outline: 2px solid #2f6bff;
+    outline-offset: 2px;
   }
   .ename img {
     width: 1.6rem;
