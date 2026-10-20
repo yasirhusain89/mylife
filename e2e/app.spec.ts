@@ -443,7 +443,7 @@ test("indexed folders list every scanned root", async ({ page }) => {
 test("indexed folders collapse, expand, and remember across reload", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Indexed folders" })).toBeVisible();
   await expect(page.getByText("/photos", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Hide" }).click();
+  await page.getByRole("button", { name: "Hide", exact: true }).click();
   await expect(page.getByText("/photos", { exact: true })).toHaveCount(0);
   const show = page.getByRole("button", { name: /^Show \(\d+\)$/ });
   await expect(show).toBeVisible();
@@ -451,7 +451,7 @@ test("indexed folders collapse, expand, and remember across reload", async ({ pa
   await expect(page.getByText("/photos", { exact: true })).toHaveCount(0);
   await show.click();
   await expect(page.getByText("/photos", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide", exact: true })).toBeVisible();
 });
 
 test("group by sections the grid and clears back to flat", async ({ page }) => {
@@ -1441,7 +1441,7 @@ test("outside-app error explains the missing bridge in plain language", async ({
 // Frozen layout shell: sidebar rail + density
 // ---------------------------------------------------------------------------
 
-test("sidebar rail renders all 7 tabs, collapses, and persists width", async ({ page }) => {
+test("sidebar rail renders all 7 tabs, hides, and persists width", async ({ page }) => {
   const tablist = page.getByRole("tablist", { name: "Library sections" });
   await expect(tablist).toBeVisible();
   await expect(page.getByRole("tab", { name: "Library", exact: true })).toBeVisible();
@@ -1459,31 +1459,37 @@ test("sidebar rail renders all 7 tabs, collapses, and persists width", async ({ 
   await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveCSS("width", "280px");
 
-  // Collapse works and persists.
-  await page.getByRole("button", { name: "Collapse sidebar" }).click();
-  await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  // Hide removes the sidebar and widens the content; persists.
+  await page.getByRole("button", { name: "Hide sidebar" }).click();
+  await expect(page.locator(".sidebar")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Show sidebar" })).toBeVisible();
   await page.reload();
-  await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
-  await page.getByRole("button", { name: "Expand sidebar" }).click();
-  await expect(page.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
+  await expect(page.locator(".sidebar")).toHaveCount(0);
+  await page.getByRole("button", { name: "Show sidebar" }).click();
+  await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.locator(".sidebar")).toHaveCSS("width", "280px");
 });
 
-test("density toggle switches grid minima without resetting filters", async ({ page }) => {
+test("thumbnail slider resizes the grid continuum without resetting filters", async ({ page }) => {
   const grid = page.locator(".grid").first();
-  await expect(grid).toHaveAttribute("data-density", "comfortable");
-  // Narrow to photos, then switch density: the filter must survive.
+  const slider = page.getByRole("slider", { name: "Thumbnail size in rem" });
+  await expect(slider).toHaveValue("8.5");
+  await expect(grid).toHaveAttribute("style", /--grid-min: 8\.5rem/);
+  // Narrow to photos, then slide: the filter must survive.
   await page.getByRole("button", { name: /6 photos/ }).click();
   await expect(page.getByText("Showing 6 of 6")).toBeVisible();
-  await page.getByRole("button", { name: "Compact", exact: true }).click();
-  await expect(grid).toHaveAttribute("data-density", "compact");
+  await slider.evaluate((el, v) => {
+    const input = el as HTMLInputElement;
+    input.value = v;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, "5");
+  await expect(grid).toHaveAttribute("style", /--grid-min: 5rem/);
   await expect(page.getByText("Showing 6 of 6")).toBeVisible();
-  // Density persists across reload along with the filter.
+  // Size persists across reload along with the filter.
   await page.reload();
-  await expect(page.locator(".grid").first()).toHaveAttribute("data-density", "compact");
-  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
-  await page.getByRole("button", { name: "Comfortable", exact: true }).click();
-  await expect(page.locator(".grid").first()).toHaveAttribute("data-density", "comfortable");
+  await expect(page.getByRole("slider", { name: "Thumbnail size in rem" })).toHaveValue("5");
+  await expect(page.locator(".grid").first()).toHaveAttribute("style", /--grid-min: 5rem/);
   await expect(page.getByText("Showing 6 of 6")).toBeVisible();
 });
 
@@ -1597,49 +1603,39 @@ test("cleanup previews share one uniform size", async ({ page }) => {
 // Issue #8: Apple Photos-style library zoom + infinite scroll
 // ---------------------------------------------------------------------------
 
-test("library zoom cycles all to year with correct headers and disabled ends", async ({ page }) => {
-  const zoomOut = page.getByRole("button", { name: "Zoom out timeline" });
-  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+test("library zoom jumps directly to any level with pressed state", async ({ page }) => {
+  const level = (name: string) => page.getByRole("button", { name: `Zoom timeline: ${name}` });
   // "all" is the current ungrouped grid: no section headers.
   await expect(page.locator(".group-head")).toHaveCount(0);
-  await expect(zoomOut).toBeDisabled();
-  await expect(zoomIn).toBeEnabled();
-  // all → day: one section per UTC calendar day.
-  await zoomIn.click();
-  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
-  await expect(zoomOut).toBeEnabled();
-  // day → month.
-  await zoomIn.click();
-  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
-  // month → year.
-  await zoomIn.click();
+  await expect(level("All")).toHaveAttribute("aria-pressed", "true");
+  // Direct jump to each level, no stepping.
+  await level("Year").click();
   await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
-  await expect(zoomIn).toBeDisabled();
-  // Back down with no wrap: year → month → day → all.
-  await zoomOut.click();
-  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
-  await zoomOut.click();
+  await expect(level("Year")).toHaveAttribute("aria-pressed", "true");
+  await level("Day").click();
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
-  await expect(zoomIn).toBeEnabled();
-  await zoomOut.click();
+  await level("Month").click();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await level("All").click();
   await expect(page.locator(".group-head")).toHaveCount(0);
-  await expect(zoomOut).toBeDisabled();
+  await expect(level("All")).toHaveAttribute("aria-pressed", "true");
 });
 
 test("library zoom granularity persists across reload", async ({ page }) => {
-  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
-  await zoomIn.click();
-  await zoomIn.click();
+  await page.getByRole("button", { name: "Zoom timeline: Month" }).click();
   await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
   await page.reload();
   await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Zoom out timeline" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Zoom timeline: Month" })).toHaveAttribute(
+    "aria-pressed",
+    "true"
+  );
 });
 
 test("ctrl+wheel over the grid zooms the timeline, plain wheel only scrolls", async ({ page }) => {
   const grid = page.locator(".grid");
   await expect(page.locator(".group-head")).toHaveCount(0);
-  // Ctrl+wheel up = zoom in (all → day), matching the + button.
+  // Ctrl+wheel up = zoom in (all → day), matching the segmented control.
   await grid.dispatchEvent("wheel", { deltaY: -80, ctrlKey: true, bubbles: true, cancelable: true });
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
   await page.waitForTimeout(350);
@@ -1690,7 +1686,7 @@ test("library infinite scroll appends past the first page", async ({ page }) => 
 });
 
 test("zoomed group headers select the whole section and filters still apply", async ({ page }) => {
-  await page.getByRole("button", { name: "Zoom in timeline" }).click();
+  await page.getByRole("button", { name: "Zoom timeline: Day" }).click();
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
   // One-go group selection works at day granularity.
   await page.getByRole("checkbox", { name: "Select October 9, 2025" }).check();
@@ -1706,11 +1702,10 @@ test("zoomed group headers select the whole section and filters still apply", as
 test("month zoom shows a capped highlights reel with true counts", async ({ page }) => {
   await page.goto("/?web=1&highlights=3");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
-  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
-  await zoomIn.click(); // day: the full grid, uncapped.
+  await page.getByRole("button", { name: "Zoom timeline: Day" }).click(); // day: the full grid, uncapped.
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
   await expect(page.locator(".grid figure")).toHaveCount(8);
-  await zoomIn.click(); // month: curated reel, true header count.
+  await page.getByRole("button", { name: "Zoom timeline: Month" }).click(); // month: curated reel, true header count.
   await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
   await expect(page.locator(".grid figure")).toHaveCount(3);
   await expect(page.getByRole("button", { name: "Show all October 2025 (8)" })).toBeVisible();
@@ -1718,9 +1713,7 @@ test("month zoom shows a capped highlights reel with true counts", async ({ page
 
 test("show-all drills into the period and back restores the reel", async ({ page }) => {
   await page.goto("/?web=1&highlights=3");
-  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
-  await zoomIn.click();
-  await zoomIn.click(); // month reel.
+  await page.getByRole("button", { name: "Zoom timeline: Month" }).click(); // month reel.
   await expect(page.locator(".grid figure")).toHaveCount(3);
   await page.getByRole("button", { name: "Show all October 2025 (8)" }).click();
   // Drilled to the month's days: full grid plus a back banner.
@@ -1736,10 +1729,7 @@ test("show-all drills into the period and back restores the reel", async ({ page
 
 test("year drill opens that year's months with highlights", async ({ page }) => {
   await page.goto("/?web=1&highlights=3");
-  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
-  await zoomIn.click();
-  await zoomIn.click();
-  await zoomIn.click(); // year reel.
+  await page.getByRole("button", { name: "Zoom timeline: Year" }).click(); // year reel.
   await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
   await expect(page.locator(".grid figure")).toHaveCount(3);
   await page.getByRole("button", { name: "Show all 2025 (8)" }).click();

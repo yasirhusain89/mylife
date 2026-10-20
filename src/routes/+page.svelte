@@ -198,11 +198,11 @@
 
   let foldersOpen = $state(loadFoldersOpen());
 
-  // Frozen shell: resizable sidebar (208–300px, collapsible to a 64px
-  // icon rail) + Comfortable/Compact density. Same load/save + try/catch
-  // pattern as the flagged/folders/filter keys above.
+  // Frozen shell: resizable sidebar (208–300px, fully hideable for
+  // full-width photos) + thumbnail-size slider. Same load/save +
+  // try/catch pattern as the flagged/folders/filter keys above.
   const SIDEBAR_WIDTH_KEY = "fotoflow-sidebar-width";
-  const SIDEBAR_COLLAPSED_KEY = "fotoflow-sidebar-collapsed";
+  const SIDEBAR_HIDDEN_KEY = "fotoflow-sidebar-hidden";
   const DENSITY_KEY = "fotoflow-density";
   const GRID_DETAILS_KEY = "fotoflow-grid-details";
   const SIDEBAR_MIN = 208;
@@ -229,52 +229,64 @@
     }
   }
 
-  function loadSidebarCollapsed(): boolean {
+  function loadSidebarHidden(): boolean {
     try {
       if (typeof localStorage === "undefined") return false;
-      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+      // Migrates the old 64px-rail flag: collapsed then means hidden now.
+      if (localStorage.getItem(SIDEBAR_HIDDEN_KEY) === null) {
+        return localStorage.getItem("fotoflow-sidebar-collapsed") === "true";
+      }
+      return localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "true";
     } catch {
       return false;
     }
   }
 
-  function saveSidebarCollapsed(v: boolean) {
+  function saveSidebarHidden(v: boolean) {
     try {
-      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(v));
+      localStorage.setItem(SIDEBAR_HIDDEN_KEY, String(v));
     } catch {
       /* storage unavailable: preference just doesn't persist */
     }
   }
 
-  type Density = "comfortable" | "compact";
+  // Thumbnail size continuum (Apple Photos-style slider, not steps):
+  // grid tile minimum in rem, persisted. Migrates the old two-step flag.
+  const GRID_MIN_DEFAULT = 8.5;
+  const GRID_MIN_MIN = 4;
+  const GRID_MIN_MAX = 12;
 
-  function loadDensity(): Density {
+  function clampGridMin(n: number): number {
+    return Math.min(GRID_MIN_MAX, Math.max(GRID_MIN_MIN, n));
+  }
+
+  function loadGridMin(): number {
     try {
-      if (typeof localStorage === "undefined") return "comfortable";
+      if (typeof localStorage === "undefined") return GRID_MIN_DEFAULT;
       const raw = localStorage.getItem(DENSITY_KEY);
-      return raw === "compact" ? "compact" : "comfortable";
+      if (raw === "compact") return 6.5;
+      if (raw !== null && raw !== "comfortable") {
+        const n = Number(raw);
+        if (Number.isFinite(n)) return clampGridMin(n);
+      }
+      return GRID_MIN_DEFAULT;
     } catch {
-      return "comfortable";
+      return GRID_MIN_DEFAULT;
     }
   }
 
-  function saveDensity(d: Density) {
+  function saveGridMin(v: number) {
     try {
-      localStorage.setItem(DENSITY_KEY, d);
+      localStorage.setItem(DENSITY_KEY, String(v));
     } catch {
       /* storage unavailable: preference just doesn't persist */
     }
   }
 
   let sidebarWidth = $state(loadSidebarWidth());
-  let sidebarCollapsed = $state(loadSidebarCollapsed());
-  let density = $state<Density>(loadDensity());
-
-  // Density never touches filters: no refresh(), no filter writes.
-  function setDensity(d: Density) {
-    density = d;
-    saveDensity(d);
-  }
+  let sidebarHidden = $state(loadSidebarHidden());
+  // Slider position never touches filters: no refresh(), no filter writes.
+  let gridMin = $state(loadGridMin());
 
   // Wall-to-wall grid vs captioned cards (name, star, meta, Similar).
   // Default on: selection/star controls live in the caption.
@@ -299,12 +311,12 @@
   let gridDetails = $state(loadGridDetails());
 
   function toggleSidebar() {
-    sidebarCollapsed = !sidebarCollapsed;
-    saveSidebarCollapsed(sidebarCollapsed);
+    sidebarHidden = !sidebarHidden;
+    saveSidebarHidden(sidebarHidden);
   }
 
   function onResizeStart(e: PointerEvent) {
-    if (sidebarCollapsed) return;
+    if (sidebarHidden) return;
     e.preventDefault();
     const startX = e.clientX;
     const startW = sidebarWidth;
@@ -347,6 +359,7 @@
   type LibZoom = "all" | "day" | "month" | "year";
   const LIB_ZOOM_KEY = "fotoflow-lib-zoom";
   const LIB_ZOOMS: LibZoom[] = ["all", "day", "month", "year"];
+  const LIB_ZOOM_LABELS: Record<LibZoom, string> = { all: "All", day: "Day", month: "Month", year: "Year" };
 
   function loadLibZoom(): LibZoom {
     try {
@@ -369,15 +382,19 @@
   let libZoom = $state<LibZoom>(loadLibZoom());
 
   // Apple Photos-style timeline zoom: all (flat) → day → month → year.
-  // Clamped at both ends, never wraps. Manual zooming always exits a
-  // drill-down (see zoomDrill): the Back button is the way back.
+  // Direct level jump (segmented control), clamped steps (keys/wheel).
+  // Manual zooming always exits a drill-down (see zoomDrill).
+  function setLibZoom(z: LibZoom) {
+    if (libZoom === z) return;
+    libZoom = z;
+    zoomDrill = null;
+    saveLibZoom(z);
+  }
+
   function zoomLib(dir: 1 | -1) {
     const i = LIB_ZOOMS.indexOf(libZoom);
     const next = Math.min(LIB_ZOOMS.length - 1, Math.max(0, i + dir));
-    if (LIB_ZOOMS[next] === libZoom) return;
-    libZoom = LIB_ZOOMS[next];
-    zoomDrill = null;
-    saveLibZoom(libZoom);
+    setLibZoom(LIB_ZOOMS[next]);
   }
 
   // Drill-down from a highlights section: month → that month's days,
@@ -3578,14 +3595,24 @@
 </script>
 
 <svelte:window onkeydown={viewerKey} />
-<main class="container" data-density={density}>
+  <main class="container">
   <header>
     <h1>fotoflow</h1>
     <p class="tagline">on-device library management for photo and video</p>
   </header>
 
-  <div class="shell" style="--sidebar-width: {sidebarCollapsed ? 64 : sidebarWidth}px">
-    <aside class="sidebar" data-collapsed={sidebarCollapsed ? "true" : "false"} aria-label="Library navigation">
+  <div class="shell" style="--sidebar-width: {sidebarWidth}px">
+    {#if !sidebarHidden}
+    <aside class="sidebar" aria-label="Library navigation">
+      <div class="sidebar-top">
+        <button
+          type="button"
+          class="ghost sidebar-hide"
+          aria-label="Hide sidebar"
+          title="Hide sidebar for full-width photos"
+          onclick={toggleSidebar}
+        >«</button>
+      </div>
       <!-- svelte-ignore a11y_interactive_supports_focus: roving-tabindex tablist, only the active tab is a tab stop -->
       <div class="tabs" role="tablist" aria-label="Library sections" onkeydown={tabKey}>
     <button id="tab-library" class="tab" class:on={tab === "library"} role="tab" aria-selected={tab === "library"} tabindex={tab === "library" ? 0 : -1} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
@@ -3618,17 +3645,7 @@
         <button type="button" class="tab" onclick={pinPeople}>People</button>
         <button type="button" class="tab" onclick={() => void openTrash()}>Recently Deleted</button>
       </div>
-      <div class="sidebar-footer">
-        <button
-          type="button"
-          class="tiny ghost collapse-btn"
-          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-          aria-expanded={!sidebarCollapsed}
-          title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-          onclick={toggleSidebar}
-        >{sidebarCollapsed ? "»" : "«"}</button>
-      </div>
-      <!-- svelte-ignore a11y_no_static_element_interactions: pointer drag handle, keyboard users use the collapse button -->
+      <!-- svelte-ignore a11y_no_static_element_interactions: pointer-only drag handle; width persists once set -->
       <div
         class="resize-handle"
         role="separator"
@@ -3638,7 +3655,17 @@
         onpointerdown={onResizeStart}
       ></div>
     </aside>
+    {/if}
     <div class="content">
+      {#if sidebarHidden}
+        <button
+          type="button"
+          class="ghost sidebar-show"
+          aria-label="Show sidebar"
+          title="Show sidebar"
+          onclick={toggleSidebar}
+        >» Show sidebar</button>
+      {/if}
 
   {#if error}
     <div class="error global-error" role="alert">
@@ -3947,41 +3974,35 @@
   <section class="card" aria-labelledby="library-heading">
     <div class="card-head toolbar">
       <h2 id="library-heading">Library</h2>
-      <div class="zoom-toggle" role="group" aria-label="Timeline zoom">
-        <button
-          type="button"
-          class="ghost"
-          aria-label="Zoom out timeline"
-          title="Zoom out timeline"
-          disabled={libZoom === "all"}
-          onclick={() => zoomLib(-1)}
-        >−</button>
-        <button
-          type="button"
-          class="ghost"
-          aria-label="Zoom in timeline"
-          title="Zoom in timeline"
-          disabled={libZoom === "year"}
-          onclick={() => zoomLib(1)}
-        >+</button>
+      <div class="zoom-toggle seg" role="group" aria-label="Timeline zoom">
+        {#each LIB_ZOOMS as z (z)}
+          <button
+            type="button"
+            class="ghost"
+            class:on={libZoom === z}
+            aria-pressed={libZoom === z}
+            aria-label={`Zoom timeline: ${LIB_ZOOM_LABELS[z]}`}
+            title={`Zoom timeline: ${LIB_ZOOM_LABELS[z]}`}
+            onclick={() => setLibZoom(z)}
+          >{LIB_ZOOM_LABELS[z]}</button>
+        {/each}
       </div>
-      <div class="density-toggle" role="group" aria-label="Grid density">
-        <button
-          type="button"
-          class="ghost"
-          class:on={density === "comfortable"}
-          aria-pressed={density === "comfortable"}
-          title="Comfortable grid"
-          onclick={() => setDensity("comfortable")}
-        >Comfortable</button>
-        <button
-          type="button"
-          class="ghost"
-          class:on={density === "compact"}
-          aria-pressed={density === "compact"}
-          title="Compact grid"
-          onclick={() => setDensity("compact")}
-        >Compact</button>
+      <div class="density-slider" role="group" aria-label="Thumbnail size">
+        <span class="hint" aria-hidden="true">Size</span>
+        <input
+          id="thumb-size"
+          type="range"
+          min={GRID_MIN_MIN}
+          max={GRID_MIN_MAX}
+          step="0.5"
+          aria-label="Thumbnail size in rem"
+          title={`Thumbnail size (${gridMin} rem)`}
+          bind:value={gridMin}
+          onchange={() => {
+            gridMin = clampGridMin(gridMin);
+            saveGridMin(gridMin);
+          }}
+        />
         <button
           type="button"
           class="ghost"
@@ -4341,7 +4362,7 @@
           >Back to {zoomDrill.from === "month" ? "months" : "years"}</button>
         </div>
       {/if}
-      <div class="grid" data-density={density} data-details={gridDetails} use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
+      <div class="grid" data-details={gridDetails} style="--grid-min: {gridMin}rem" use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if effGroup !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
             {@const gkey = groupKeyOf(asset)}
@@ -5984,7 +6005,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(8.5rem, 100%), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(var(--grid-min, 8.5rem), 100%), 1fr));
     gap: 3px;
     margin-top: 0.6rem;
   }
@@ -6314,10 +6335,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .sidebar[data-collapsed="true"] .tab {
-    text-align: center;
-    padding-left: 0.4rem;
-    padding-right: 0.4rem;
+  /* Sidebar top row: hide toggle pushed right; show toggle sits atop
+     the content when the sidebar is hidden. */
+  .sidebar-top {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .sidebar-hide {
+    padding: 0.2rem 0.5rem;
+  }
+  .sidebar-show {
+    margin-bottom: 0.6rem;
   }
   /* Pinned shortcuts: same full-width buttons as tabs, tighter stack. */
   .sidebar .pinned {
@@ -6328,12 +6356,6 @@
   }
   .sidebar .pinned .sub {
     margin: 0.3rem 0.2rem 0.15rem;
-  }
-  .sidebar-footer {
-    display: flex;
-  }
-  .sidebar-footer .collapse-btn {
-    width: 100%;
   }
   .resize-handle {
     position: absolute;
@@ -6365,9 +6387,14 @@
   .card-head h2 {
     margin-right: auto;
   }
-  .density-toggle, .zoom-toggle {
+  .density-slider, .zoom-toggle {
     display: flex;
+    align-items: center;
     gap: 0.3rem;
+  }
+  .density-slider input[type="range"] {
+    width: 6rem;
+    accent-color: #2f6bff;
   }
   /* Segmented two-option group (map layer toggle): ghost buttons with a
      visible active state, mirroring .chip.on. */
@@ -6407,13 +6434,6 @@
   .group > button.tiny.danger {
     width: 100%;
     margin-top: 0.4rem;
-  }
-  /* Density minima: Comfortable 8.5rem (default), Compact 6.5rem. */
-  .grid[data-density="compact"] {
-    grid-template-columns: repeat(auto-fit, minmax(min(6.5rem, 100%), 1fr));
-  }
-  [data-density="compact"] .grid {
-    grid-template-columns: repeat(auto-fit, minmax(min(6.5rem, 100%), 1fr));
   }
   /* Issue #7: one shared preview size for every cleanup figure. Duplicates
      and similar render in .members (6rem tiles) while blurred renders in
