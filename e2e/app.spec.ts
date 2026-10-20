@@ -1251,3 +1251,62 @@ test("viewer similar button opens results and closing returns", async ({ page })
   await expect(viewer).toBeHidden();
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
+
+// ---------------------------------------------------------------------------
+// Issue #6 minor roll-up
+// ---------------------------------------------------------------------------
+
+test("toast auto-dismisses when no undo is pending", async ({ page }) => {
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("ToastAlbum");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  const toast = page.getByRole("status");
+  await expect(toast).toContainText("Created");
+  await expect(toast).toBeHidden({ timeout: 10_000 });
+});
+
+test("toast persists while an undo is pending", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+  const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await card.getByRole("button", { name: "remove" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Flag", exact: true }).click();
+  const toast = page.getByRole("status");
+  await expect(toast).toContainText("flagged only");
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+  // Past the ~6s auto-dismiss: the undo toast must still be up.
+  await page.waitForTimeout(7_000);
+  await expect(toast).toBeVisible();
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+});
+
+test("kind filter persists across reload with a summary", async ({ page }) => {
+  await page.getByRole("button", { name: /6 photos/ }).click();
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+  await expect(page.getByText(/Filters:/)).toContainText("photos");
+  await page.reload();
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+  await expect(page.getByText(/Filters:/)).toContainText("photos");
+});
+
+test("person jump shows a filter chip that clear-all resets", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "View in Library" }).first().click();
+  await expect(page.getByText("Showing 4 of 4")).toBeVisible();
+  // The person filter is active even though the person dropdown has no
+  // options yet — the summary chip makes it visible.
+  await expect(page.getByText(/Filters:/)).toBeVisible();
+  await page.getByRole("button", { name: "Clear all filters" }).click();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.getByText(/Filters:/)).toBeHidden();
+});
+
+test("outside-app error explains the missing bridge in plain language", async ({ page }) => {
+  // Engine/sidecar failures (ENOENT, dead sidecar, trash partials) cannot be
+  // produced by the in-memory mock — this covers the plain-language path.
+  await page.goto("/");
+  await expect(page.getByRole("alert")).toContainText("fotoflow app window");
+});

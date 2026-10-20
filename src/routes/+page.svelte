@@ -263,9 +263,46 @@
     }
   }
 
-  let filter = $state<"all" | "image" | "video">("all");
-  let favFilter = $state(false);
-  let petFilter = $state(false);
+  const FILTERS_KEY = "fotoflow-filters";
+
+  // Filter persistence (issue #6): same load/save + try/catch pattern as the
+  // flagged/group-by keys above. Validated field-by-field so a stale or
+  // hand-edited entry can never break the filter types.
+  function loadSavedFilters(): {
+    filter?: "all" | "image" | "video";
+    favFilter?: boolean;
+    petFilter?: boolean;
+    monthFilter?: string | null;
+    locFilter?: "all" | "with" | "without";
+    personFilter?: number | null;
+    sceneFilter?: string | null;
+  } {
+    try {
+      if (typeof localStorage === "undefined") return {};
+      const raw = localStorage.getItem(FILTERS_KEY);
+      if (!raw) return {};
+      const p: unknown = JSON.parse(raw);
+      if (typeof p !== "object" || p === null) return {};
+      const q = p as Record<string, unknown>;
+      return {
+        ...(q.filter === "all" || q.filter === "image" || q.filter === "video" ? { filter: q.filter } : {}),
+        ...(typeof q.favFilter === "boolean" ? { favFilter: q.favFilter } : {}),
+        ...(typeof q.petFilter === "boolean" ? { petFilter: q.petFilter } : {}),
+        ...(typeof q.monthFilter === "string" ? { monthFilter: q.monthFilter } : {}),
+        ...(q.locFilter === "all" || q.locFilter === "with" || q.locFilter === "without" ? { locFilter: q.locFilter } : {}),
+        ...(typeof q.personFilter === "number" ? { personFilter: q.personFilter } : {}),
+        ...(typeof q.sceneFilter === "string" ? { sceneFilter: q.sceneFilter } : {})
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  const savedFilters = loadSavedFilters();
+
+  let filter = $state<"all" | "image" | "video">(savedFilters.filter ?? "all");
+  let favFilter = $state(savedFilters.favFilter ?? false);
+  let petFilter = $state(savedFilters.petFilter ?? false);
   let searchText = $state("");
   let searchQuery = $state<string | null>(null);
   let recentSearches = $state<string[]>(loadRecentSearches());
@@ -300,16 +337,71 @@
     searchQuery = null;
     void refresh();
   }
-  let sceneFilter = $state<string | null>(null);
+  let sceneFilter = $state<string | null>(savedFilters.sceneFilter ?? null);
   let tagOptions = $state<SceneTagCount[]>([]);
   let tagging = $state(false);
   let tagState = $state<TagProgress | null>(null);
-  let monthFilter = $state<string | null>(null);
-  let locFilter = $state<"all" | "with" | "without">("all");
-  let personFilter = $state<number | null>(null);
+  let monthFilter = $state<string | null>(savedFilters.monthFilter ?? null);
+  let locFilter = $state<"all" | "with" | "without">(savedFilters.locFilter ?? "all");
+  let personFilter = $state<number | null>(savedFilters.personFilter ?? null);
   let months = $state<LibraryMonth[]>([]);
   let personOptions = $state<FaceClusterRow[]>([]);
   let filteredTotal = $state(0);
+
+  function saveFilters() {
+    try {
+      localStorage.setItem(
+        FILTERS_KEY,
+        JSON.stringify({ filter, favFilter, petFilter, monthFilter, locFilter, personFilter, sceneFilter })
+      );
+    } catch {
+      /* storage unavailable: filters just don't persist */
+    }
+  }
+
+  // Every filter assignment above flows through here (reads inside an
+  // effect subscribe); writing storage never re-triggers the effect.
+  $effect(() => {
+    saveFilters();
+  });
+
+  function personFilterName(): string | null {
+    if (personFilter === null) return null;
+    const hit =
+      personOptions.find((c) => c.id === personFilter) ?? people.find((c) => c.id === personFilter);
+    return hit?.name ?? `Cluster ${personFilter}`;
+  }
+
+  // Active-filter summary (issue #6): one line like
+  // "Filters: photos · October 2025 · Lake". Rendered whenever any of the
+  // seven persisted filters is active, so a People→Library jump (which sets
+  // personFilter while the person dropdown may have no options yet) stays
+  // visible with a way back.
+  let activeFilterParts = $derived.by(() => {
+    const parts: string[] = [];
+    if (filter === "image") parts.push("photos");
+    else if (filter === "video") parts.push("videos");
+    if (favFilter) parts.push("favorites");
+    if (petFilter) parts.push("pets");
+    if (monthFilter) parts.push(monthLabelOf(monthFilter));
+    const pn = personFilterName();
+    if (pn) parts.push(pn);
+    if (sceneFilter) parts.push(sceneFilter);
+    if (locFilter === "with") parts.push("with location");
+    else if (locFilter === "without") parts.push("no location");
+    return parts;
+  });
+
+  function clearAllFilters() {
+    filter = "all";
+    favFilter = false;
+    petFilter = false;
+    monthFilter = null;
+    locFilter = "all";
+    personFilter = null;
+    sceneFilter = null;
+    void refresh();
+  }
 
   function monthBounds(m: string): [number, number] {
     const [y, mo] = m.split("-").map(Number);
@@ -402,6 +494,18 @@
   };
   let lastAction = $state<UndoAction | null>(null);
 
+  // Toast auto-dismiss (issue #6): plain notices fade after ~6s. A pending
+  // Undo keeps the toast up so the action stays reversible; assigning a new
+  // toast replaces the old one and restarts the timer via effect cleanup.
+  $effect(() => {
+    if (toast && !lastAction) {
+      const t = setTimeout(() => {
+        toast = null;
+      }, 6000);
+      return () => clearTimeout(t);
+    }
+  });
+
   async function checkEngine() {
     status = { state: "checking" };
     const t0 = performance.now();
@@ -437,6 +541,26 @@
       month: "short",
       day: "numeric"
     });
+  }
+
+  // Plain-language errors (issue #6): known engine/sidecar jargon maps to a
+  // short friendly line; the raw text stays as a suffix in parentheses.
+  function friendlyError(e: unknown): string {
+    const raw = (e instanceof Error ? e.message : String(e)).replace(/^Error:\s*/, "");
+    const lower = raw.toLowerCase();
+    let plain: string | null = null;
+    if (lower.includes("enoent") || lower.includes("no such file")) plain = "That file wasn't found";
+    else if (lower.includes("eacces") || lower.includes("permission")) plain = "Fotoflow can't open that file";
+    else if (lower.includes("cannot decode") || lower.includes("unreadable")) plain = "That photo couldn't be read";
+    else if (lower.includes("sidecar") || lower.includes("did not answer")) plain = "The photo engine isn't responding";
+    else if (lower.includes("not mocked")) plain = "That needs the desktop app";
+    else if (lower.includes("vector")) plain = "Similarity search needs a one-time setup first";
+    return plain ? `${plain} (${raw})` : raw;
+  }
+
+  // Partial-failure lists (issue #6): up to 3 failed names, never bare counts.
+  function partialNames(failed: string[]): string {
+    return failed.slice(0, 3).join(", ") + (failed.length > 3 ? ", …" : "");
   }
 
   async function refresh() {
@@ -1113,7 +1237,7 @@
       await refresh();
       void runPipeline();
     } catch (e) {
-      error = String(e).replace(/^Error: /, "");
+      error = friendlyError(e);
     } finally {
       importing = false;
     }
@@ -1139,7 +1263,7 @@
       toast = `Library organized: ${bits.join(" · ")}`;
       await refresh();
     } catch (e) {
-      error = String(e).replace(/^Error: /, "");
+      error = friendlyError(e);
     } finally {
       pipelining = false;
     }
@@ -1191,7 +1315,7 @@
       exportResult = await exportBundle(src, name, mode, dest);
       toast = `Exported ${exportResult.exported} photos for ${mode === "drive" ? "Drive" : "WhatsApp"}`;
     } catch (e) {
-      error = String(e).replace(/^Error: /, "");
+      error = friendlyError(e);
     } finally {
       exportBusy = null;
     }
@@ -1206,7 +1330,7 @@
       highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase());
       toast = "Highlight video exported";
     } catch (e) {
-      error = String(e).replace(/^Error: /, "");
+      error = friendlyError(e);
     } finally {
       highlightBusy = null;
     }
@@ -1221,11 +1345,14 @@
       const r = await verifyLibrary();
       await refresh();
       toast =
-        r.missing === 0 && r.restored === 0
+        r.missing === 0 && r.restored === 0 && r.unreadable === 0
           ? "All indexed files are present"
-          : `${r.missing} missing · ${r.restored} restored`;
+          : `${r.missing} missing · ${r.restored} restored` +
+            (r.unreadable > 0
+              ? ` · ${r.unreadable} unreadable (${partialNames(r.unreadablePaths)}) — reconnect the volume and retry Check files`
+              : "");
     } catch (e) {
-      error = String(e).replace(/^Error: /, "");
+      error = friendlyError(e);
     }
   }
 
@@ -1236,6 +1363,7 @@
     try {
       people = await clustersList();
       void loadClusterFaces();
+      void loadPersonOptions();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -1300,6 +1428,7 @@
   function viewPersonInLibrary(clusterId: number) {
     personFilter = clusterId;
     tab = "library";
+    void loadPersonOptions();
     void refresh();
   }
 
@@ -1765,6 +1894,7 @@
       await runFaceClustering();
       people = await clustersList();
       void loadClusterFaces();
+      void loadPersonOptions();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -1996,7 +2126,7 @@
       if (deleteMode === "trash") {
         const result = await trashAssets(ids);
         if (result.failed.length > 0) {
-          error = `${result.trashed} moved to Trash, ${result.failed.length} failed`;
+          error = `${result.trashed} moved to Trash, ${result.failed.length} couldn't be moved (${partialNames(result.failed)}) — check the files and try again`;
         }
         lastAction = { kind: "trash", ids, label };
       } else {
@@ -2030,7 +2160,7 @@
       } else if (action.kind === "trash") {
         const result = await restoreAssets(action.ids);
         if (result.failed.length > 0) {
-          error = `${result.restored} restored, ${result.failed.length} failed`;
+          error = `${result.restored} restored, ${result.failed.length} couldn't be restored (${partialNames(result.failed)}) — try again`;
         }
         await refresh();
         await refreshCleanup();
@@ -2244,6 +2374,7 @@
           {nearing ? "Comparing…" : "Find similar photos"}
         </button>
       </div>
+      <p class="hint">Exact duplicates share the same file hash · Similar photos just look alike · Blurred means a low sharpness score — “keeper” is the copy worth keeping.</p>
 
       {#if hashState}
         <p class="hint">{hashState.hashed ?? 0} hashed across {hashState.buckets ?? 0} size buckets</p>
@@ -2634,6 +2765,12 @@
           <option value="media" selected={groupBy === "media"}>Media type</option>
         </select>
       </div>
+      {#if activeFilterParts.length > 0}
+        <p class="hint">
+          Filters: {activeFilterParts.join(" · ")}
+          <button class="tiny" onclick={clearAllFilters}>Clear all filters</button>
+        </p>
+      {/if}
 
       {#if stats.missing > 0}
         <p class="error">
