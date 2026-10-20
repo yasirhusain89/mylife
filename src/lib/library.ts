@@ -71,6 +71,28 @@ export function importFolder(root: string, recursive = true): Promise<ImportSumm
   return invoke("import_folder", { root, recursive });
 }
 
+// SSD ingest: mirror a camera card / device folder to a destination with
+// progress. Desktop-only (no HTTP route): the browser cannot read disk.
+export type IngestProgress = {
+  copied: number;
+  skipped: number;
+  failed: string[];
+  bytes: number;
+  total: number;
+  totalBytes: number;
+  dest: string;
+};
+
+export type IngestSummary = IngestProgress;
+
+export function ingestCopy(src: string, dest: string): Promise<IngestSummary> {
+  return invoke("ingest_copy", { src, dest });
+}
+
+export function onIngestProgress(cb: (p: IngestProgress) => void): Promise<() => void> {
+  return listen<IngestProgress>("ingest-progress", (e) => cb(e.payload));
+}
+
 export type LibraryFilters = {
   kind?: "image" | "video";
   offset?: number;
@@ -651,20 +673,27 @@ export function albumAdd(albumId: number, assetIds: number[]): Promise<{ added: 
   return invoke("album_add", { albumId, assetIds });
 }
 
+/** Best-of-place pick: the event's sharpest members into an album. */
+export function addEventPicksToAlbum(eventId: number, albumId: number, limit = 12): Promise<number> {
+  return invoke("add_event_picks_to_album", { eventId, albumId, limit });
+}
+
 export function albumRemove(albumId: number, assetId: number): Promise<void> {
   return invoke("album_remove", { albumId, assetId });
 }
 
-// Highlight / bundle exports accept either source; pass exactly one id.
+// Highlight / bundle exports accept one source: an event, an album, or an
+// adhoc id list (space-saver bundles of dupes + blurred).
 export function exportBundle(
-  source: { eventId?: number; albumId?: number },
+  source: { eventId?: number; albumId?: number; assetIds?: number[] },
   eventName: string,
-  mode: "drive" | "whatsapp",
+  mode: "drive" | "whatsapp" | "compact",
   destDir: string,
 ): Promise<ExportSummary> {
   return invoke("export_bundle", {
     eventId: source.eventId ?? null,
     albumId: source.albumId ?? null,
+    assetIds: source.assetIds ?? null,
     eventName,
     mode,
     destDir

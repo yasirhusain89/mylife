@@ -1860,3 +1860,42 @@ test("review keeper swap clears the staged verdict", async ({ page }) => {
   await expect(review).toBeHidden();
   await expect(page.getByRole("heading", { name: "Duplicate groups" })).toBeVisible();
 });
+
+// ---------------------------------------------------------------------------
+// Trip workflow: SSD ingest, best-of-place picks, space-saver compress
+// ---------------------------------------------------------------------------
+
+test("ingest copies to SSD then indexes the copy", async ({ page }) => {
+  await page.getByRole("button", { name: "Copy to SSD…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Copy photos to fast storage" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Copy photos from").fill("/mock/sd-card");
+  await dialog.getByLabel("Copy photos to").fill("/mock/ssd/trip");
+  await dialog.getByRole("button", { name: "Start copy" }).click();
+  await expect(dialog).toContainText("Copied 8 · skipped 0 identical");
+  await dialog.getByRole("button", { name: "Index this folder" }).click();
+  await expect(dialog).toBeHidden();
+  // Indexing the copy imports its photos into the library.
+  await expect(page.getByText("Showing 12 of 12")).toBeVisible();
+});
+
+test("event top picks land in the chosen album", async ({ page }) => {
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("Trip Best");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("Trip Best").first()).toBeVisible();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  await page.getByRole("button", { name: "＋ Top 12" }).first().click();
+  await expect(page.locator(".toast")).toContainText("Added 8 top picks to “Trip Best”");
+});
+
+test("space saver compresses dup extras plus blurred", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Compress extras (2)" }).click();
+  await expect(page.locator(".toast")).toContainText("Compressed 2 photos");
+  await expect(page.getByText("Compressed 2 to /mock/picked-folder/space-saver")).toBeVisible();
+});

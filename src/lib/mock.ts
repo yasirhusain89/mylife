@@ -21,6 +21,8 @@ import type {
   HighlightResult,
   ImportProgress,
   ImportSummary,
+  IngestProgress,
+  IngestSummary,
   LibraryFilters,
   LibraryMonth,
   LibraryStats,
@@ -912,17 +914,49 @@ export async function albumRemove(albumId: number, assetId: number): Promise<voi
 }
 
 export async function exportBundle(
-  _source: { eventId?: number; albumId?: number },
+  _source: { eventId?: number; albumId?: number; assetIds?: number[] },
   eventName: string,
-  _mode: "drive" | "whatsapp",
+  _mode: "drive" | "whatsapp" | "compact",
   destDir: string,
 ): Promise<ExportSummary> {
+  const ids = _source.assetIds;
+  const rows = ids ? assets.filter((a) => ids.includes(a.id)) : assets;
   return {
     dir: `${destDir}/${eventName}`,
-    exported: assets.length,
+    exported: rows.length,
     skipped: 0,
-    bytes: assets.reduce((s, a) => s + a.sizeBytes, 0)
+    bytes: rows.reduce((s, a) => s + a.sizeBytes, 0)
   };
+}
+
+/** Best-of pick: the event's first members stand in for quality ranking. */
+export async function addEventPicksToAlbum(
+  eventId: number,
+  albumId: number,
+  limit = 12,
+): Promise<number> {
+  const picks = (await eventAssets(eventId)).slice(0, Math.max(1, limit));
+  const { added } = await albumAdd(albumId, picks.map((p) => p.id));
+  return added;
+}
+
+/** SSD ingest stand-in: everything "copies" instantly, nothing fails. */
+export async function ingestCopy(src: string, dest: string): Promise<IngestSummary> {
+  void src;
+  const bytes = assets.reduce((s, a) => s + a.sizeBytes, 0);
+  return {
+    copied: assets.length,
+    skipped: 0,
+    failed: [],
+    bytes,
+    total: assets.length,
+    totalBytes: bytes,
+    dest
+  };
+}
+
+export function onIngestProgress(_cb: (p: IngestProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
 }
 
 export async function exportHighlight(

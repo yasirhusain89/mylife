@@ -32,6 +32,11 @@
     exportBundle,
     type ExportSummary,
     type HighlightResult,
+    ingestCopy,
+    onIngestProgress,
+    type IngestProgress,
+    type IngestSummary,
+    addEventPicksToAlbum,
     faceThumb,
     facesInCluster,
     duplicatesList,
@@ -1877,6 +1882,103 @@
     }
   }
 
+  // SSD ingest: copy a camera card / device folder to fast storage first,
+  // then index the copy. Progress streams on ingest-progress; the result
+  // offers one-click indexing of the destination.
+  let ingest = $state<{
+    src: string;
+    dest: string;
+    running: boolean;
+    progress: IngestProgress | null;
+    result: IngestSummary | null;
+  } | null>(null);
+
+  function openIngest() {
+    ingest = { src: "", dest: "", running: false, progress: null, result: null };
+  }
+
+  async function pickIngestDir(which: "src" | "dest") {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: which === "src" ? "Copy photos from…" : "Copy photos to…"
+    });
+    if (typeof picked === "string" && picked !== "" && ingest) ingest[which] = picked;
+  }
+
+  async function runIngest() {
+    if (!ingest || ingest.running) return;
+    const src = ingest.src.trim();
+    const dest = ingest.dest.trim();
+    if (src === "" || dest === "") {
+      error = "Pick a source folder and a destination first";
+      return;
+    }
+    ingest.running = true;
+    ingest.progress = null;
+    ingest.result = null;
+    try {
+      const summary = await ingestCopy(src, dest);
+      if (ingest) ingest.result = summary;
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      if (ingest) ingest.running = false;
+    }
+  }
+
+  // Best-of-place pick: the event's sharpest dozen into the chosen album.
+  async function addEventPicks(eventId: number) {
+    const albumId = eventAlbumChoice[eventId] ?? albumOptions[0]?.id;
+    const members = eventMembers[eventId] ?? [];
+    if (albumId == null || members.length === 0 || eventAlbumBusy !== null) return;
+    eventAlbumBusy = eventId;
+    try {
+      const added = await addEventPicksToAlbum(eventId, albumId, 12);
+      const target = albumOptions.find((a) => a.id === albumId);
+      await loadAlbums();
+      toast =
+        target != null
+          ? `Added ${added} top pick${added === 1 ? "" : "s"} to “${target.name}”`
+          : `Added ${added} top pick${added === 1 ? "" : "s"} to the album`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      eventAlbumBusy = null;
+    }
+  }
+
+  // Space saver: duplicate extras + blurred, recoded small into one folder.
+  // Near-group lookalikes stay out: those deserve a review decision first.
+  let spaceSaverIds = $derived.by(() => {
+    const ids = new Set<number>();
+    for (const g of groups) {
+      for (const m of g.members) {
+        if (m.id !== g.keptId) ids.add(m.id);
+      }
+    }
+    for (const a of blurred) ids.add(a.id);
+    return [...ids];
+  });
+
+  async function runSpaceSaver() {
+    const ids = spaceSaverIds;
+    if (ids.length === 0 || exportBusy !== null) return;
+    const dest = await open({ directory: true, multiple: false, title: "Compressed copies go to…" });
+    if (typeof dest !== "string" || dest === "") return;
+    exportBusy = "space-saver";
+    exportResult = null;
+    try {
+      exportResult = await exportBundle({ assetIds: ids }, "space-saver", "compact", dest);
+      exportKey = "space-saver";
+      toast = `Compressed ${exportResult.exported} photo${exportResult.exported === 1 ? "" : "s"} (${fmtBytes(exportResult.bytes)}) to ${exportResult.dir}`;
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      exportBusy = null;
+    }
+  }
+
   async function runPipeline() {
     if (pipelining) return;
     pipelining = true;
@@ -3354,6 +3456,9 @@
       onImportProgress((p) => {
         if (importing) progress = p;
       }),
+      onIngestProgress((p) => {
+        if (ingest) ingest.progress = p;
+      }),
       onImportError((m) => {
         error = m;
       }),
@@ -3500,7 +3605,20 @@
         >
           Review all ({groups.length + nearGroups.length + blurred.length})
         </button>
+        <button
+          onclick={() => void runSpaceSaver()}
+          disabled={spaceSaverIds.length === 0 || exportBusy !== null}
+          title="Recode duplicate extras + blurred small (1280px) into one folder — originals stay put"
+        >
+          {exportBusy === "space-saver" ? "Compressing…" : `Compress extras (${spaceSaverIds.length})`}
+        </button>
       </div>
+      {#if exportResult && exportKey === "space-saver"}
+        <p class="hint">
+          Compressed {exportResult.exported} to {exportResult.dir} ({fmtBytes(exportResult.bytes)})
+          {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
+        </p>
+      {/if}
       <p class="hint">Exact duplicates share the same file hash · Similar photos just look alike · Blurred means a low sharpness score — “keeper” is the copy worth keeping.</p>
 
       {#if hashState}
@@ -3817,6 +3935,12 @@
       <button onclick={chooseFolder} disabled={importing}>
         {importing ? "Importing…" : "Add folder"}
       </button>
+      <button
+        type="button"
+        class="ghost"
+        title="Copy a camera card to fast storage, then index the copy"
+        onclick={openIngest}
+      >Copy to SSD…</button>
     </div>
 
     <div class="path-entry" role="search">
@@ -4489,6 +4613,14 @@
                 >
                   {eventAlbumBusy === event.id ? "Adding…" : "＋ Album"}
                 </button>
+                <button
+                  class="tiny"
+                  disabled={(eventMembers[event.id] ?? []).length === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                  title="Sharpest 12 photos, blurred excluded, into the selected album"
+                  onclick={() => void addEventPicks(event.id)}
+                >
+                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Top 12"}
+                </button>
               {/if}
             </div>
             {#if highlightResult && highlightKey === `e${event.id}`}
@@ -4684,6 +4816,61 @@
   {/if}
     </div><!-- /.content -->
   </div><!-- /.shell -->
+
+  {#if ingest}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget && !ingest?.running) ingest = null; }}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="ingest-heading" tabindex={-1} use:dialogFocus={() => { if (!ingest?.running) ingest = null; }}>
+        <h3 id="ingest-heading">Copy photos to fast storage</h3>
+        <p class="hint">Mirrors a camera card or device folder to an SSD, skipping files that are already there. Index the copy afterwards with one click.</p>
+        <div class="path-entry">
+          <input
+            type="text"
+            placeholder="Copy from… (camera card)"
+            aria-label="Copy photos from"
+            bind:value={ingest.src}
+            disabled={ingest.running}
+          />
+          <button type="button" class="ghost" disabled={ingest.running} onclick={() => void pickIngestDir("src")}>Browse…</button>
+        </div>
+        <div class="path-entry">
+          <input
+            type="text"
+            placeholder="Copy to… (SSD folder)"
+            aria-label="Copy photos to"
+            bind:value={ingest.dest}
+            disabled={ingest.running}
+          />
+          <button type="button" class="ghost" disabled={ingest.running} onclick={() => void pickIngestDir("dest")}>Browse…</button>
+        </div>
+        {#if ingest.progress}
+          {@const p = ingest.progress}
+          <progress max={Math.max(1, p.total)} value={p.copied + p.skipped}></progress>
+          <p class="hint">
+            {p.copied + p.skipped} of {p.total} · {fmtBytes(p.bytes)} of {fmtBytes(p.totalBytes)}{#if p.failed.length > 0} · {p.failed.length} failed{/if}
+          </p>
+        {/if}
+        {#if ingest.result}
+          {@const r = ingest.result}
+          <p class="hint">
+            Copied {r.copied} · skipped {r.skipped} identical · {fmtBytes(r.bytes)}{#if r.failed.length > 0} · {r.failed.length} failed: {r.failed.slice(0, 3).join("; ")}{/if}
+          </p>
+        {/if}
+        <div class="dialog-actions">
+          {#if ingest.result}
+            <button class="ghost" onclick={() => (ingest = null)}>Close</button>
+            <button onclick={() => { const d = ingest?.result?.dest; ingest = null; if (d) void runImport(d); }}>Index this folder</button>
+          {:else}
+            <button class="ghost" disabled={ingest.running} onclick={() => (ingest = null)}>Cancel</button>
+            <button disabled={ingest.running} onclick={() => void runIngest()}>
+              {ingest.running || ingest.progress ? "Copying…" : "Start copy"}
+            </button>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if confirm}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
