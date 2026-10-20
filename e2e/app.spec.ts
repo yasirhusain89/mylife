@@ -1439,6 +1439,29 @@ test("density toggle switches grid minima without resetting filters", async ({ p
   await expect(page.getByText("Showing 6 of 6")).toBeVisible();
 });
 
+test("details toggle swaps captioned cards and wall-to-wall photos", async ({ page }) => {
+  const grid = page.locator(".grid").first();
+  const details = page.getByRole("button", { name: "Toggle photo details" });
+  // Details on by default: names, stars and meta under photos.
+  await expect(details).toHaveAttribute("aria-pressed", "true");
+  await expect(grid).toHaveAttribute("data-details", "true");
+  await expect(grid.getByText("IMG_20261007_185817.jpg")).toBeVisible();
+  // Off: wall-to-wall photos, selection still works.
+  await details.click();
+  await expect(details).toHaveAttribute("aria-pressed", "false");
+  await expect(grid).toHaveAttribute("data-details", "false");
+  await expect(grid.getByText("IMG_20261007_185817.jpg")).toBeHidden();
+  await expect(grid.getByRole("button", { name: /Star|Unstar/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await expect(page.locator(".batch-bar").getByText("1 selected")).toBeVisible();
+  // Persists across reload, then back on.
+  await page.reload();
+  await expect(page.locator(".grid").first()).toHaveAttribute("data-details", "false");
+  await page.getByRole("button", { name: "Toggle photo details" }).click();
+  await expect(page.locator(".grid").first().getByText("IMG_20261007_185817.jpg")).toBeVisible();
+});
+
 // ---------------------------------------------------------------------------
 // Issue #7: side-by-side duplicate review + uniform cleanup preview sizes
 // ---------------------------------------------------------------------------

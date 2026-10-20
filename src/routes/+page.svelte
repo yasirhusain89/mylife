@@ -180,6 +180,7 @@
   const SIDEBAR_WIDTH_KEY = "fotoflow-sidebar-width";
   const SIDEBAR_COLLAPSED_KEY = "fotoflow-sidebar-collapsed";
   const DENSITY_KEY = "fotoflow-density";
+  const GRID_DETAILS_KEY = "fotoflow-grid-details";
   const SIDEBAR_MIN = 208;
   const SIDEBAR_MAX = 300;
   const SIDEBAR_DEFAULT = 248;
@@ -250,6 +251,28 @@
     density = d;
     saveDensity(d);
   }
+
+  // Wall-to-wall grid vs captioned cards (name, star, meta, Similar).
+  // Default on: selection/star controls live in the caption.
+  function loadGridDetails(): boolean {
+    try {
+      if (typeof localStorage === "undefined") return true;
+      const raw = localStorage.getItem(GRID_DETAILS_KEY);
+      return raw === null ? true : raw !== "false";
+    } catch {
+      return true;
+    }
+  }
+
+  function saveGridDetails(v: boolean) {
+    try {
+      localStorage.setItem(GRID_DETAILS_KEY, String(v));
+    } catch {
+      /* storage unavailable: preference just doesn't persist */
+    }
+  }
+
+  let gridDetails = $state(loadGridDetails());
 
   function toggleSidebar() {
     sidebarCollapsed = !sidebarCollapsed;
@@ -3211,6 +3234,15 @@
           title="Compact grid"
           onclick={() => setDensity("compact")}
         >Compact</button>
+        <button
+          type="button"
+          class="ghost"
+          class:on={gridDetails}
+          aria-pressed={gridDetails}
+          aria-label="Toggle photo details"
+          title="Names, stars and info under photos"
+          onclick={() => { gridDetails = !gridDetails; saveGridDetails(gridDetails); }}
+        >Details</button>
       </div>
       {#if selectMode}
         <button class="ghost" onclick={() => { selectMode = false; selected = new Set(); }}>Done</button>
@@ -3545,7 +3577,7 @@
     {/if}
 
     {#if assets.length}
-      <div class="grid" data-density={density} use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
+      <div class="grid" data-density={density} data-details={gridDetails} use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if effGroup !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
             {@const gkey = groupKeyOf(asset)}
@@ -3587,6 +3619,7 @@
                 <span class="placeholder">{asset.ext.toUpperCase()}</span>
               {/if}
             </button>
+            {#if gridDetails}
             <figcaption>
               <span class="caption-row">
                 <button
@@ -3617,6 +3650,7 @@
                 {/if}
               </span>
             </figcaption>
+            {/if}
           </figure>
         {/each}
       </div>
