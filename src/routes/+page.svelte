@@ -1742,7 +1742,7 @@
       img.alt = "";
       img.onload = () => done(undefined, img);
       img.onerror = () => done(new Error(`tile ${coords.z}/${coords.x}/${coords.y} failed to load`), img);
-      mapTile(coords.z, coords.x, coords.y).then(
+      mapTile(coords.z, coords.x, coords.y, tileSource).then(
         (url) => {
           img.src = url;
         },
@@ -1755,9 +1755,40 @@
   let mapEl = $state<HTMLDivElement | null>(null);
   let mapObj: LeafletMap | null = null;
   let pinLayer: LayerGroup | null = null;
+  let tileLayer: L.GridLayer | null = null;
   let mapPinsRows = $state<MapPin[]>([]);
   let mapLoading = $state(false);
   let mapError = $state<string | null>(null);
+
+  const TILE_SOURCE_KEY = "fotoflow-map-source";
+  const TILE_MAX_ZOOM = { osm: 19, topo: 17 } as const;
+
+  function loadTileSource(): "osm" | "topo" {
+    try {
+      if (typeof localStorage === "undefined") return "osm";
+      return localStorage.getItem(TILE_SOURCE_KEY) === "topo" ? "topo" : "osm";
+    } catch {
+      return "osm";
+    }
+  }
+
+  let tileSource = $state<"osm" | "topo">(loadTileSource());
+
+  function setTileSource(next: "osm" | "topo") {
+    if (tileSource === next) return;
+    tileSource = next;
+    try {
+      localStorage.setItem(TILE_SOURCE_KEY, next);
+    } catch {
+      /* storage unavailable: layer choice just doesn't persist */
+    }
+    if (tileLayer && mapObj) {
+      // Terrain caps at z17: pull back before reloading so tiles exist.
+      if (mapObj.getZoom() > TILE_MAX_ZOOM[next]) mapObj.setZoom(TILE_MAX_ZOOM[next]);
+      (tileLayer.options as L.GridLayerOptions).maxZoom = TILE_MAX_ZOOM[next];
+      tileLayer.redraw();
+    }
+  }
 
   async function loadMap() {
     if (mapLoading) return;
@@ -1780,17 +1811,24 @@
       mapObj.remove();
       mapObj = null;
       pinLayer = null;
+      tileLayer = null;
     }
     if (!mapObj) {
-      const opts: MapOptions = { attributionControl: true };
+      // preferCanvas: pins redraw per pan/zoom frame — canvas stays smooth
+      // where hundreds of SVG circleMarkers jank. minZoom 2 avoids
+      // whole-world tile loads on deep zoom-out. attributionControl is off:
+      // the single required tile credit lives in the hint line below the map.
+      const opts: MapOptions = { attributionControl: false, preferCanvas: true, minZoom: 2 };
       mapObj = L.map(mapEl, opts).setView([20, 0], 2);
-      new CachedTiles({
-        attribution: "© OpenStreetMap contributors",
+      // Test affordance: canvas pins aren't DOM-queryable, so e2e drives a
+      // real click through these instead of counting SVG paths.
+      (window as unknown as { __ffMap?: LeafletMap }).__ffMap = mapObj;
+      tileLayer = new CachedTiles({
         tileSize: 256,
-        maxZoom: 19, // backend serves z 0–19; never request beyond it
+        maxZoom: TILE_MAX_ZOOM[tileSource],
         updateWhenZooming: false, // load once per finished zoom, not mid-animation
-        keepBuffer: 3, // prefetch margin so zoom-out targets are often already cached
-        updateInterval: 150
+        keepBuffer: 2, // prefetch margin; larger values over-request whole worlds at low z
+        updateInterval: 200 // fewer mid-pan bursts contending for the 2 download slots
       }).addTo(mapObj);
     }
     renderPins();
@@ -1818,6 +1856,9 @@
         { padding: [30, 30] }
       );
     }
+    (window as unknown as { __ffMapPins?: [number, number][] }).__ffMapPins = mapPinsRows.map(
+      (p) => [p.latitude, p.longitude] as [number, number]
+    );
   }
 
   function pinPopupEl(pin: MapPin): HTMLElement {
@@ -3774,6 +3815,20 @@
     <div class="card-head">
       <h2 id="map-heading">Map</h2>
       <span class="hint">{mapPinsRows.length} geotagged photo{mapPinsRows.length === 1 ? "" : "s"}</span>
+      <div class="seg" role="group" aria-label="Map layer">
+        <button
+          class="ghost"
+          class:on={tileSource === "osm"}
+          aria-pressed={tileSource === "osm"}
+          onclick={() => setTileSource("osm")}
+        >Streets</button>
+        <button
+          class="ghost"
+          class:on={tileSource === "topo"}
+          aria-pressed={tileSource === "topo"}
+          onclick={() => setTileSource("topo")}
+        >Terrain</button>
+      </div>
     </div>
     {#if mapLoading}
       <p class="hint">Loading pins…</p>
@@ -3783,7 +3838,7 @@
       <p class="hint">No geotagged photos yet — photos with GPS land here after Refresh metadata.</p>
     {/if}
     <div class="map-wrap" bind:this={mapEl} role="application" aria-label="Photo map"></div>
-    <p class="hint">Tiles © OpenStreetMap contributors · cached on this device · select a pin, then “Show in Library”.</p>
+    <p class="hint">{tileSource === "topo" ? "Topo tiles © OpenStreetMap contributors, SRTM · style © OpenTopoMap (CC-BY-SA)" : "Tiles © OpenStreetMap contributors"} · cached on this device · select a pin, then “Show in Library”.</p>
   </section>
   {/if}
 
@@ -4559,11 +4614,11 @@
     border: 1px solid #232733;
     border-radius: 12px;
     overflow: hidden;
-    background: #0b0e14;
+    background: #e5e3df;
   }
   .map-wrap :global(.leaflet-container) {
     height: 100%;
-    background: #0b0e14;
+    background: #e5e3df;
     font: inherit;
   }
   :global(.map-popup) {
@@ -5051,6 +5106,17 @@
   .density-toggle {
     display: flex;
     gap: 0.3rem;
+  }
+  /* Segmented two-option group (map layer toggle): ghost buttons with a
+     visible active state, mirroring .chip.on. */
+  .seg {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .seg button.ghost.on {
+    background: #2f6bff;
+    border-color: #2f6bff;
+    color: #fff;
   }
   /* Sticky filter rail beneath the toolbar. */
   .filters {

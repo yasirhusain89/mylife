@@ -124,11 +124,18 @@ export function mapPins(): Promise<MapPin[]> {
 
 /**
  * HTTP-mode tiles skip the Rust disk cache (the server is a LAN service, not
- * the desktop app): plain OSM URLs, browser-cached. Attribution is still
+ * the desktop app): plain upstream URLs, browser-cached. Attribution is still
  * rendered by the map UI.
  */
-export async function mapTile(z: number, x: number, y: number): Promise<string> {
-  return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+export async function mapTile(
+  z: number,
+  x: number,
+  y: number,
+  source: "osm" | "topo" = "osm"
+): Promise<string> {
+  return source === "topo"
+    ? `https://tile.opentopomap.org/${z}/${x}/${y}.png`
+    : `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
 }
 
 export function clustersList(): Promise<FaceClusterRow[]> {

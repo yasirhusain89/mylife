@@ -2281,16 +2281,29 @@ static TILE_DL_SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>
 static TILE_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const TILE_PRUNE_EVERY: u64 = 32;
 
-/// One cached OSM tile as an app-data file path, served under
-/// `app_data/maptiles/{z}/{x}/{y}.png`. The UI turns it into an asset-protocol
-/// URL (browser-cached, no base64/IPC per tile); repeat pans and zooms cost no
-/// network and no re-encode. Upstream tile usage policy (valid User-Agent,
-/// ≤2 parallel) is honored by the app UA below and the download semaphore.
-/// Attribution "© OpenStreetMap contributors" is rendered by the map UI.
+/// One cached map tile as an app-data file path, served under
+/// `app_data/maptiles/{source}/{z}/{x}/{y}.png` (`source` is `osm` streets or
+/// `topo` terrain relief). The UI turns it into an asset-protocol URL
+/// (browser-cached, no base64/IPC per tile); repeat pans and zooms cost no
+/// network and no re-encode. Upstream tile usage policies (valid User-Agent,
+/// ≤2 parallel) are honored by the app UA below and the download semaphore.
+/// Attribution per source is rendered by the map UI. (Pre-source caches at
+/// `maptiles/{z}/…` are orphaned but still pruned by the root walk.)
 #[tauri::command]
-async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<String, String> {
-    if z > 19 {
-        return Err("tile zoom out of range (0-19)".to_string());
+async fn map_tile(
+    app: tauri::AppHandle,
+    z: u32,
+    x: u32,
+    y: u32,
+    source: String,
+) -> Result<String, String> {
+    let (ns, url_fmt, max_z) = match source.as_str() {
+        "osm" => ("osm", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", 19u32),
+        "topo" => ("topo", "https://tile.opentopomap.org/{z}/{x}/{y}.png", 17u32),
+        _ => return Err("unknown tile source (osm|topo)".to_string()),
+    };
+    if z > max_z {
+        return Err(format!("tile zoom out of range (0-{max_z})"));
     }
     let n = 1u32 << z;
     if x >= n || y >= n {
@@ -2301,6 +2314,7 @@ async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<Strin
         .app_data_dir()
         .map_err(|e| format!("app data dir: {e}"))?
         .join("maptiles")
+        .join(ns)
         .join(z.to_string())
         .join(x.to_string())
         .join(format!("{y}.png"));
@@ -2320,7 +2334,10 @@ async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<Strin
             std::fs::create_dir_all(parent).map_err(|e| format!("create tile dir: {e}"))?;
         }
         if !file.is_file() {
-            let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
+            let url = url_fmt
+                .replace("{z}", &z.to_string())
+                .replace("{x}", &x.to_string())
+                .replace("{y}", &y.to_string());
             let bytes = ureq::get(&url)
                 .header("User-Agent", "fotoflow/0.1.0 (local photo manager; map tile cache)")
                 .header("Accept", "image/png")

@@ -581,12 +581,40 @@ test("map tab plots located photos and jumps to the library", async ({ page }) =
   await page.getByRole("tab", { name: "Map", exact: true }).click();
   const map = page.locator(".leaflet-container");
   await expect(map).toBeVisible();
-  await expect(map.locator("path.leaflet-interactive")).toHaveCount(4);
-  await expect(map.locator(".leaflet-control-attribution")).toContainText("OpenStreetMap");
+  await expect(map.locator(".leaflet-control-attribution")).toHaveCount(0);
   await expect.poll(() => map.locator(".leaflet-tile-pane img").count()).toBeGreaterThan(0);
-  await map.locator("path.leaflet-interactive").first().click();
+  // Pins render on canvas (smooth per-frame redraw while panning/zooming).
+  await expect(map.locator("canvas")).toBeAttached();
+  // Drive a real click through the first pin pixel: popup opens, jump works.
+  const box = await map.boundingBox();
+  const pt = await page.evaluate(() => {
+    const w = window as unknown as {
+      __ffMap?: { latLngToContainerPoint(a: [number, number]): { x: number; y: number } };
+      __ffMapPins?: [number, number][];
+    };
+    return w.__ffMap!.latLngToContainerPoint(w.__ffMapPins![0]);
+  });
+  await page.mouse.click(box!.x + pt.x, box!.y + pt.y);
   await page.getByRole("button", { name: "Show in Library" }).click();
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
+});
+
+test("map layer toggle switches streets and terrain", async ({ page }) => {
+  await page.getByRole("tab", { name: "Map", exact: true }).click();
+  const map = page.locator(".leaflet-container");
+  await expect(map).toBeVisible();
+  await expect(page.getByRole("button", { name: "Streets" })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "Terrain" }).click();
+  await expect(page.getByRole("button", { name: "Terrain" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("Topo tiles © OpenStreetMap contributors")).toBeVisible();
+  await expect
+    .poll(() => map.locator(".leaflet-tile-pane img").first().getAttribute("src"))
+    .toContain("topo");
+  await page.getByRole("button", { name: "Streets" }).click();
+  await expect(page.getByText("Tiles © OpenStreetMap contributors")).toBeVisible();
+  await expect
+    .poll(() => map.locator(".leaflet-tile-pane img").first().getAttribute("src"))
+    .not.toContain("topo");
 });
 
 test("indexed folder removal forgets the root and can be cancelled", async ({ page }) => {

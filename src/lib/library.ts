@@ -259,14 +259,17 @@ export function mapPins(): Promise<MapPin[]> {
   return invoke("map_pins");
 }
 
+/** Map tile source: `osm` streets or `topo` terrain relief. */
+export type TileSource = "osm" | "topo";
+
 /**
- * One cached OSM tile as a browser-loadable URL (desktop only — see api.ts
+ * One cached map tile as a browser-loadable URL (desktop only — see api.ts
  * for the HTTP fallback). The backend returns an app-data file path;
  * convertFileSrc turns it into an asset-protocol URL the browser caches
  * natively, so tiles cost no base64/IPC per view.
  */
-export function mapTile(z: number, x: number, y: number): Promise<string> {
-  return invoke<string>("map_tile", { z, x, y }).then((p) => convertFileSrc(p));
+export function mapTile(z: number, x: number, y: number, source: TileSource): Promise<string> {
+  return invoke<string>("map_tile", { z, x, y, source }).then((p) => convertFileSrc(p));
 }
 
 export function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {

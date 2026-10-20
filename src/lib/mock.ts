@@ -373,11 +373,17 @@ export async function mapPins(): Promise<MapPin[]> {
 }
 
 // Web-mock tiles: a labeled grid data URL — no network in tests.
-export async function mapTile(z: number, x: number, y: number): Promise<string> {
+// Fill/label vary by source so layer-toggle tests can tell them apart.
+export async function mapTile(
+  z: number,
+  x: number,
+  y: number,
+  source: "osm" | "topo" = "osm"
+): Promise<string> {
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256">` +
-    `<rect width="256" height="256" fill="#1a2030"/>` +
-    `<text x="128" y="128" fill="#5a6a8a" font-size="16" text-anchor="middle">${z}/${x}/${y}</text></svg>`;
+    `<rect width="256" height="256" fill="${source === "topo" ? "#2a3038" : "#1a2030"}"/>` +
+    `<text x="128" y="128" fill="#5a6a8a" font-size="16" text-anchor="middle">${source} ${z}/${x}/${y}</text></svg>`;
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
