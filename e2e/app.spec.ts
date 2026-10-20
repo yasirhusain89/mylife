@@ -1360,3 +1360,86 @@ test("density toggle switches grid minima without resetting filters", async ({ p
   await expect(page.locator(".grid").first()).toHaveAttribute("data-density", "comfortable");
   await expect(page.getByText("Showing 6 of 6")).toBeVisible();
 });
+
+// ---------------------------------------------------------------------------
+// Issue #7: side-by-side duplicate review + uniform cleanup preview sizes
+// ---------------------------------------------------------------------------
+
+test("compare panels render keeper and candidate panes with names", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find exact duplicates" }).click();
+  await page.getByRole("button", { name: "Find similar photos" }).click();
+  // Duplicate group: keeper pane labeled Keeper, candidate pane named.
+  const dup = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
+  const dupCompare = dup.locator("[data-compare]");
+  await expect(dupCompare.locator('[data-pane="keeper"]')).toContainText("Keeper");
+  await expect(dupCompare.locator('[data-pane="keeper"] img')).toHaveAttribute(
+    "alt",
+    "IMG_20261007_191434.jpg"
+  );
+  await expect(dupCompare.locator('[data-pane="candidate"]')).toContainText("IMG_20261007_191434_copy.jpg");
+  await expect(dupCompare.locator('[data-pane="keeper"] img')).toBeVisible();
+  await expect(dupCompare.locator('[data-pane="candidate"] img')).toBeVisible();
+  // Similar group: same two-pane shape with its own keeper and candidate.
+  const near = page.locator("article.group").filter({ hasText: "similar" });
+  const nearCompare = near.locator("[data-compare]");
+  await expect(nearCompare.locator('[data-pane="keeper"]')).toContainText("Keeper");
+  await expect(nearCompare.locator('[data-pane="keeper"] img')).toHaveAttribute(
+    "alt",
+    "IMG_20261007_185824.jpg"
+  );
+  await expect(nearCompare.locator('[data-pane="candidate"]')).toContainText("IMG_20261007_191433.jpg");
+  await expect(nearCompare.locator('[data-pane="candidate"] img')).toBeVisible();
+});
+
+test("picking another member updates the candidate pane", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find exact duplicates" }).click();
+  const dup = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
+  const cmp = dup.locator("[data-compare]");
+  await expect(cmp.locator('[data-pane="candidate"]')).toContainText("IMG_20261007_191434_copy.jpg");
+  // Strip buttons are keyboard-focusable.
+  const keeperStrip = dup.getByRole("button", { name: "Show IMG_20261007_191434.jpg in compare" });
+  await keeperStrip.focus();
+  await expect(keeperStrip).toBeFocused();
+  await keeperStrip.click();
+  await expect(cmp.locator('[data-pane="candidate"]')).toContainText("IMG_20261007_191434.jpg");
+});
+
+test("keep-swap updates the keeper pane", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find exact duplicates" }).click();
+  const dup = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
+  const cmp = dup.locator("[data-compare]");
+  await expect(cmp.locator('[data-pane="keeper"] img')).toHaveAttribute("alt", "IMG_20261007_191434.jpg");
+  await cmp.getByRole("button", { name: "Keep this one instead" }).click();
+  await expect(cmp.locator('[data-pane="keeper"] img')).toHaveAttribute(
+    "alt",
+    "IMG_20261007_191434_copy.jpg"
+  );
+});
+
+test("cleanup previews share one uniform size", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByRole("button", { name: "Find exact duplicates" }).click();
+  await page.getByRole("button", { name: "Find similar photos" }).click();
+  const dup = page.locator("article.group", { hasText: "IMG_20261007_191434_copy.jpg" });
+  const near = page.locator("article.group").filter({ hasText: "similar" });
+  const blurredH3 = page.getByRole("heading", { name: "Likely blurred" });
+  await expect(dup.locator(".cleanup-preview").first()).toBeVisible();
+  await expect(near.locator(".cleanup-preview").first()).toBeVisible();
+  await expect(blurredH3).toBeVisible();
+  const heights = await page.evaluate(() => {
+    const first = (root: ParentNode | null) => root?.querySelector(".cleanup-preview") ?? null;
+    const dupEl = first(document.querySelector("article.group"));
+    const groups = [...document.querySelectorAll("article.group")];
+    const nearEl = groups.length > 1 ? first(groups[groups.length - 1]) : null;
+    const h3 = [...document.querySelectorAll("h3.sub")].find((h) =>
+      h.textContent?.includes("Likely blurred")
+    );
+    const blurredEl = h3?.nextElementSibling ? first(h3.nextElementSibling) : null;
+    return [dupEl, nearEl, blurredEl].map((el) => el?.getBoundingClientRect().height ?? -1);
+  });
+  expect(heights.every((h) => h > 0)).toBe(true);
+  expect(Math.max(...heights) - Math.min(...heights)).toBeLessThanOrEqual(2);
+});

@@ -81,6 +81,7 @@
     type GeocodeProgress,
     type FaceRow,
     type DuplicateGroup,
+    type DuplicateMember,
     type NearGroup,
     type EnrichProgress,
     type ImportProgress,
@@ -1385,6 +1386,8 @@
     for (const g of nearGroups) {
       for (const m of g.members) void loadThumbs([{ path: m.path } as AssetRow]);
     }
+    for (const g of groups) primeCompare(g, `dup${g.id}`);
+    for (const g of nearGroups) primeCompare(g, `near${g.id}`);
   }
 
   let highlightBusy = $state<string | null>(null);
@@ -2217,6 +2220,115 @@
     groups = await keepCopy(groupId, keepId);
   }
 
+  // Compare panels (issue #7): per duplicate/similar group, two large panes
+  // (keeper left, selected candidate right). Selection + viewer-quality
+  // sources live here; keeper swaps reuse chooseKeeper/chooseNearKeeper.
+  type CompareGroup = { id: number; keptId: number | null; members: DuplicateMember[] };
+  let compareSel = $state<Record<string, number | null>>({});
+  let compareBig = $state<Record<string, string>>({});
+  let compareErr = $state<Record<string, string>>({});
+  let compareBusy = $state<Record<string, boolean>>({});
+
+  function keeperMember(g: CompareGroup): DuplicateMember | undefined {
+    return g.members.find((m) => m.id === g.keptId) ?? g.members[0];
+  }
+
+  function pickCandidate(g: CompareGroup, key: string): DuplicateMember | undefined {
+    const sel = compareSel[key];
+    // An explicit pick (even the keeper) wins; otherwise the first
+    // non-keeper so the right pane never mirrors the left by default.
+    return (
+      g.members.find((m) => m.id === sel) ??
+      g.members.find((m) => m.id !== g.keptId) ??
+      g.members[0]
+    );
+  }
+
+  function selectCandidate(key: string, id: number) {
+    compareSel = { ...compareSel, [key]: id };
+  }
+
+  function memberKind(m: DuplicateMember): "image" | "video" {
+    return assets.find((a) => a.id === m.id)?.kind ?? "image";
+  }
+
+  function comparePaneSrc(m: DuplicateMember): string | null {
+    // Mock mode (?web=1): engineThumb resolves for any maxPx so the
+    // viewer-quality src below normally wins; while it is in flight (or if
+    // a viewer-quality fetch ever fails) fall back to the pooled thumbnail
+    // so panes still render in tests.
+    return compareBig[m.path] ?? thumbs[m.path] ?? null;
+  }
+
+  // Viewer-quality source for a compare pane: same pipeline as loadViewer
+  // (engineThumb at 1600px for photos, assetUrl for video incl. its
+  // loading/error states) — no new engine commands.
+  async function ensureCompareSrc(m: DuplicateMember) {
+    if (compareBig[m.path] || compareErr[m.path] || compareBusy[m.path]) return;
+    compareBusy[m.path] = true;
+    try {
+      if (memberKind(m) === "video") {
+        const url = assetUrl(m.path);
+        // Empty in web mode (bridge.assetUrl): the pane falls back to the
+        // thumbnail poster, same as the viewer markup.
+        if (url) compareBig[m.path] = url;
+        else if (thumbs[m.path]) compareBig[m.path] = thumbs[m.path];
+        else throw new Error("no playable file in the web preview");
+      } else {
+        const { image } = await engineThumb(m.path, 1600);
+        if (!image) throw new Error("engine returned no image");
+        compareBig[m.path] = thumbSrc(image);
+      }
+    } catch (e) {
+      compareErr[m.path] = String(e).replace(/^Error: /, "");
+    } finally {
+      compareBusy[m.path] = false;
+    }
+  }
+
+  function primeCompare(g: CompareGroup, key: string) {
+    const k = keeperMember(g);
+    if (k) void ensureCompareSrc(k);
+    const c = pickCandidate(g, key);
+    if (c && c.path !== k?.path) void ensureCompareSrc(c);
+  }
+
+  async function swapDuplicateKeeper(groupId: number, keepId: number) {
+    await chooseKeeper(groupId, keepId);
+    const g = groups.find((x) => x.id === groupId);
+    if (g) primeCompare(g, `dup${groupId}`);
+  }
+
+  async function swapNearKeeper(groupId: number, keepId: number) {
+    await chooseNearKeeper(groupId, keepId);
+    const g = nearGroups.find((x) => x.id === groupId);
+    if (g) primeCompare(g, `near${groupId}`);
+  }
+
+  // Candidate strip keyboard: ←/→ cycles the candidate, guarded to the
+  // compare panel that owns the focused strip button so the global
+  // viewerKey handler on <svelte:window> keeps every other context.
+  function compareStripKey(e: KeyboardEvent, g: CompareGroup, key: string) {
+    const panel = (e.currentTarget as HTMLElement | null)?.closest?.("[data-compare]");
+    const t = e.target as HTMLElement | null;
+    if (!panel || !t || !panel.contains(t)) return;
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    if (t.dataset.stripId === undefined) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const ids = g.members.filter((m) => m.id !== g.keptId).map((m) => m.id);
+    if (ids.length === 0) return;
+    const cur = pickCandidate(g, key)?.id ?? ids[0];
+    const at = ids.indexOf(cur);
+    const next = ids[(((at < 0 ? 0 : at) + (e.key === "ArrowRight" ? 1 : -1)) % ids.length + ids.length) % ids.length];
+    selectCandidate(key, next);
+    const m = g.members.find((x) => x.id === next);
+    if (m) void ensureCompareSrc(m);
+    requestAnimationFrame(() => {
+      panel.querySelector<HTMLElement>(`[data-strip-id="${next}"]`)?.focus();
+    });
+  }
+
   async function applyDeletion() {
     if (!confirm) return;
     const { ids, label } = confirm;
@@ -2524,24 +2636,88 @@
         </select>
       </label>
 
+      {#snippet comparePane(m: DuplicateMember)}
+        {#if memberKind(m) === "video" && compareBig[m.path]}
+          {#key compareBig[m.path]}
+            <!-- svelte-ignore a11y_media_has_caption: library files ship no caption tracks -->
+            <video src={compareBig[m.path]} controls playsinline></video>
+          {/key}
+        {:else if memberKind(m) === "video"}
+          {#if comparePaneSrc(m)}
+            <img src={comparePaneSrc(m)!} alt={m.name} />
+          {/if}
+          <p class="hint">Video playback needs the desktop app — the web preview has no file to play.</p>
+        {:else if comparePaneSrc(m)}
+          <img src={comparePaneSrc(m)!} alt={m.name} />
+        {:else if compareErr[m.path]}
+          <p class="error">{compareErr[m.path]}</p>
+        {:else}
+          <p class="hint">Loading full size…</p>
+        {/if}
+      {/snippet}
+
       {#if groups.length}
         <h3 class="sub">Duplicate groups</h3>
         {#each groups as group (group.id)}
+          {@const dupKey = `dup${group.id}`}
+          {@const dupKeeper = keeperMember(group)}
+          {@const dupCand = pickCandidate(group, dupKey)}
           <article class="group">
             <header>
               <span>{group.members.length} copies · {fmtBytes(group.sizeBytes)} each</span>
               <span class="waste">keep 1, free {fmtBytes(group.wasteBytes)}</span>
             </header>
+            {#if dupKeeper && dupCand}
+              <!-- svelte-ignore a11y_no_noninteractive_element_interactions: keydown delegates to this panel's strip buttons only; compareStripKey guards to [data-strip-id] focus -->
+              <section
+                class="compare"
+                data-compare={dupKey}
+                aria-label={`Compare duplicates in group ${group.id}`}
+                onkeydown={(e) => compareStripKey(e, group, dupKey)}
+              >
+                <div class="compare-panes">
+                  <figure class="compare-pane" data-pane="keeper">
+                    <span class="badge keep">Keeper</span>
+                    <div class="compare-img">
+                      {@render comparePane(dupKeeper)}
+                    </div>
+                  </figure>
+                  <figure class="compare-pane" data-pane="candidate">
+                    <span class="candidate-name">{dupCand.name}</span>
+                    <div class="compare-img">
+                      {@render comparePane(dupCand)}
+                    </div>
+                    <figcaption><span class="name" title={dupCand.path}>{dupCand.name}</span></figcaption>
+                  </figure>
+                </div>
+                {#if dupCand.id !== group.keptId}
+                  <button class="tiny" onclick={() => void swapDuplicateKeeper(group.id, dupCand.id)}>
+                    Keep this one instead
+                  </button>
+                {/if}
+              </section>
+            {/if}
             <div class="members">
               {#each group.members as member (member.id)}
                 <figure class:keeper={member.id === group.keptId}>
-                  <div class="thumb small">
+                  <button
+                    type="button"
+                    class="thumb small cleanup-preview strip"
+                    data-strip-id={member.id}
+                    aria-pressed={dupCand != null && member.id === dupCand.id}
+                    aria-label={`Show ${member.name} in compare`}
+                    title={`Show ${member.name} in compare`}
+                    onclick={() => {
+                      selectCandidate(dupKey, member.id);
+                      void ensureCompareSrc(member);
+                    }}
+                  >
                     {#if thumbs[member.path]}
-                      <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                      <img src={thumbs[member.path]} alt="" loading="lazy" />
                     {:else}
                       <span class="placeholder">IMG</span>
                     {/if}
-                  </div>
+                  </button>
                   <figcaption>
                     <span class="name" title={member.path}>{member.name}</span>
                     {#if member.id === group.keptId}
@@ -2576,21 +2752,65 @@
         <h3 class="sub">Similar photos</h3>
         <p class="hint">Perceptual matches (resaves, crops, resizes) — review before trashing.</p>
         {#each nearGroups as group (group.id)}
+          {@const nearKey = `near${group.id}`}
+          {@const nearKeeper = keeperMember(group)}
+          {@const nearCand = pickCandidate(group, nearKey)}
           <article class="group">
             <header>
               <span>{group.members.length} similar · keep 1</span>
               <span class="waste">free {fmtBytes(group.wasteBytes)}</span>
             </header>
+            {#if nearKeeper && nearCand}
+              <!-- svelte-ignore a11y_no_noninteractive_element_interactions: keydown delegates to this panel's strip buttons only; compareStripKey guards to [data-strip-id] focus -->
+              <section
+                class="compare"
+                data-compare={nearKey}
+                aria-label={`Compare similar photos in group ${group.id}`}
+                onkeydown={(e) => compareStripKey(e, group, nearKey)}
+              >
+                <div class="compare-panes">
+                  <figure class="compare-pane" data-pane="keeper">
+                    <span class="badge keep">Keeper</span>
+                    <div class="compare-img">
+                      {@render comparePane(nearKeeper)}
+                    </div>
+                  </figure>
+                  <figure class="compare-pane" data-pane="candidate">
+                    <span class="candidate-name">{nearCand.name}</span>
+                    <div class="compare-img">
+                      {@render comparePane(nearCand)}
+                    </div>
+                    <figcaption><span class="name" title={nearCand.path}>{nearCand.name}</span></figcaption>
+                  </figure>
+                </div>
+                {#if nearCand.id !== group.keptId}
+                  <button class="tiny" onclick={() => void swapNearKeeper(group.id, nearCand.id)}>
+                    Keep this one instead
+                  </button>
+                {/if}
+              </section>
+            {/if}
             <div class="members">
               {#each group.members as member (member.id)}
                 <figure class:keeper={member.id === group.keptId}>
-                  <div class="thumb small">
+                  <button
+                    type="button"
+                    class="thumb small cleanup-preview strip"
+                    data-strip-id={member.id}
+                    aria-pressed={nearCand != null && member.id === nearCand.id}
+                    aria-label={`Show ${member.name} in compare`}
+                    title={`Show ${member.name} in compare`}
+                    onclick={() => {
+                      selectCandidate(nearKey, member.id);
+                      void ensureCompareSrc(member);
+                    }}
+                  >
                     {#if thumbs[member.path]}
-                      <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                      <img src={thumbs[member.path]} alt="" loading="lazy" />
                     {:else}
                       <span class="placeholder">IMG</span>
                     {/if}
-                  </div>
+                  </button>
                   <figcaption>
                     <span class="name" title={member.path}>{member.name}</span>
                     {#if member.id === group.keptId}
@@ -2626,7 +2846,7 @@
         <div class="grid">
           {#each blurred as asset (asset.id)}
             <figure>
-              <div class="thumb">
+              <div class="thumb cleanup-preview">
                 {#if thumbs[asset.path]}
                   <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
                 {:else}
@@ -4753,5 +4973,94 @@
   }
   [data-density="compact"] .grid {
     grid-template-columns: repeat(auto-fit, minmax(min(6.5rem, 100%), 1fr));
+  }
+  /* Issue #7: one shared preview size for every cleanup figure. Duplicates
+     and similar render in .members (6rem tiles) while blurred renders in
+     .grid (8.5rem tiles); the fixed clamp height normalizes the oversized
+     blurred preview down/up to match, with a responsive minimum. */
+  .thumb.cleanup-preview {
+    width: 100%;
+    height: clamp(7rem, 18vw, 10rem);
+    min-height: 7rem;
+    aspect-ratio: auto;
+  }
+  .thumb.cleanup-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  button.strip {
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  button.strip[aria-pressed="true"] {
+    outline: 2px solid #2f6bff;
+    outline-offset: 1px;
+  }
+  button.strip:focus-visible {
+    outline: 2px solid #2f6bff;
+    outline-offset: 2px;
+  }
+  /* Issue #7 compare panel: two large panes (keeper left, candidate
+     right) plus the member strip of small thumbs that picks the candidate. */
+  .compare {
+    border: 1px solid #232733;
+    border-radius: 10px;
+    padding: 0.6rem;
+    margin-bottom: 0.6rem;
+    background: #10131a;
+  }
+  .compare-panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  @media (max-width: 560px) {
+    .compare-panes {
+      grid-template-columns: 1fr;
+    }
+  }
+  .compare-pane {
+    margin: 0;
+    min-width: 0;
+  }
+  .compare-pane .badge {
+    margin-bottom: 0.3rem;
+  }
+  .candidate-name {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #e7eaf0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+    margin-bottom: 0.3rem;
+  }
+  .compare-img {
+    height: clamp(10rem, 28vw, 18rem);
+    min-height: 10rem;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+  .compare-img img,
+  .compare-img video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .compare-img .hint,
+  .compare-img .error {
+    margin: 0.5rem;
+    text-align: center;
+  }
+  .compare > button.tiny {
+    margin-bottom: 0.5rem;
   }
 </style>
