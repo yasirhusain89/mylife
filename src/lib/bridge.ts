@@ -92,6 +92,7 @@ export const keepCopy = pick("keepCopy");
 export const cleanupStats = pick("cleanupStats");
 export const blurredAssets = pick("blurredAssets");
 export const trashAssets = pick("trashAssets");
+export const restoreAssets = pick("restoreAssets");
 export const faceThumb = pick("faceThumb");
 export const runFaceClustering = pick("runFaceClustering");
 export const verifyLibrary = pick("verifyLibrary");
@@ -99,7 +100,9 @@ export const onClusterProgress = pick("onClusterProgress");
 export const clustersList = pickRead("clustersList");
 export const renameCluster = pick("renameCluster");
 export const mergeClusters = pick("mergeClusters");
+export const restoreCluster = pick("restoreCluster");
 export const unassignFace = pick("unassignFace");
+export const assignFace = pick("assignFace");
 export const detectPets = pick("detectPets");
 export const onPetProgress = pick("onPetProgress");
 export const onPetError = pick("onPetError");
@@ -186,6 +189,7 @@ export type {
   SceneTag,
   SceneTagCount,
   RemoveRootSummary,
+  RestoreSummary,
   SimilarHit,
   TagProgress,
   TagScenesSummary

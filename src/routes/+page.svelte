@@ -6,7 +6,9 @@
     clustersList,
     renameCluster,
     mergeClusters,
+    restoreCluster,
     unassignFace,
+    assignFace,
     detectPets,
     onPetProgress,
     onPetError,
@@ -47,6 +49,7 @@
     onQualityProgress,
     scoreQuality,
     trashAssets,
+    restoreAssets,
     importFolder,
     onEnrichProgress,
     libraryList,
@@ -383,6 +386,21 @@
   let albumOptions = $state<AlbumRow[]>([]);
   let batchAlbum = $state<number | null>(null);
   let toast = $state<string | null>(null);
+
+  // Session-only undo: the last destructive action (trash/flag/merge/
+  // unassign). Replaced by the next destructive action, never persisted.
+  type UndoAction = {
+    kind: "trash" | "flag" | "merge" | "unassign";
+    ids: number[];
+    label: string;
+    extra?: {
+      faceId?: number;
+      clusterId?: number;
+      into?: number;
+      snapshots?: { id: number; name: string | null; faceIds: number[] }[];
+    };
+  };
+  let lastAction = $state<UndoAction | null>(null);
 
   async function checkEngine() {
     status = { state: "checking" };
@@ -1289,12 +1307,25 @@
     if (mergeSelect.size < 2) return;
     const ids = [...mergeSelect].sort((a, b) => a - b);
     const into = ids[0];
+    // Snapshot every absorbed cluster BEFORE merging so Undo can split back.
+    const snapshots: { id: number; name: string | null; faceIds: number[] }[] = [];
+    for (let k = 1; k < ids.length; k++) {
+      const cluster = people.find((c) => c.id === ids[k]);
+      let faces: FaceRow[] = [];
+      try {
+        faces = await facesInCluster(ids[k]);
+      } catch {
+        faces = [];
+      }
+      snapshots.push({ id: ids[k], name: cluster?.name ?? null, faceIds: faces.map((f) => f.id) });
+    }
     try {
       for (let k = 1; k < ids.length; k++) await mergeClusters(ids[k], into);
       mergeSelect = new Set();
       people = await clustersList();
       void loadClusterFaces();
       void loadPersonOptions();
+      lastAction = { kind: "merge", ids: ids.slice(1), label: `merge into #${into}`, extra: { into, snapshots } };
       toast = `Merged into one person (${people.find((c) => c.id === into)?.faceCount ?? 0} faces)`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1312,6 +1343,7 @@
       const shown = openClusterId === clusterId ? all : all.slice(0, 8);
       peopleFaces = { ...peopleFaces, [clusterId]: shown };
       void loadPersonOptions();
+      lastAction = { kind: "unassign", ids: [faceId], label: "face", extra: { faceId, clusterId } };
       toast = "Removed that face from this person";
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1966,17 +1998,66 @@
         if (result.failed.length > 0) {
           error = `${result.trashed} moved to Trash, ${result.failed.length} failed`;
         }
+        lastAction = { kind: "trash", ids, label };
       } else {
         // Flag only: nothing on disk changes, the choice stays reversible.
         for (const id of ids) flagged.add(id);
         flagged = flagged;
         saveFlagged(flagged);
+        lastAction = { kind: "flag", ids, label };
       }
       await refreshCleanup();
       // Drop only the acted-on ids so unrelated Library selection survives
       // Cleanup-initiated deletes (which never touch `selected`).
       selected = new Set([...selected].filter((id) => !ids.includes(id)));
       toast = `${label} · ${deleteMode === "trash" ? "moved to Trash" : "flagged only"}`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function undoLast() {
+    const action = lastAction;
+    if (!action) return;
+    lastAction = null;
+    try {
+      if (action.kind === "flag") {
+        for (const id of action.ids) flagged.delete(id);
+        flagged = flagged;
+        saveFlagged(flagged);
+        await refreshCleanup();
+        toast = `Undid flag on ${action.label}`;
+      } else if (action.kind === "trash") {
+        const result = await restoreAssets(action.ids);
+        if (result.failed.length > 0) {
+          error = `${result.restored} restored, ${result.failed.length} failed`;
+        }
+        await refresh();
+        await refreshCleanup();
+        toast = `Restored ${action.label} from Trash`;
+      } else if (action.kind === "unassign") {
+        const faceId = action.extra?.faceId;
+        const clusterId = action.extra?.clusterId;
+        if (faceId == null || clusterId == null) {
+          error = "Nothing to undo";
+          return;
+        }
+        await assignFace(faceId, clusterId);
+        people = await clustersList();
+        const all = await facesInCluster(clusterId);
+        const shown = openClusterId === clusterId ? all : all.slice(0, 8);
+        peopleFaces = { ...peopleFaces, [clusterId]: shown };
+        void loadPersonOptions();
+        toast = "Reattached that face — undo complete";
+      } else {
+        for (const snap of action.extra?.snapshots ?? []) {
+          await restoreCluster(snap.name, snap.faceIds);
+        }
+        people = await clustersList();
+        void loadClusterFaces();
+        void loadPersonOptions();
+        toast = "Split the merge back apart — undo complete";
+      }
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
@@ -3489,7 +3570,12 @@
   {/if}
 
   {#if toast}
-    <p class="toast" role="status">{toast}</p>
+    <p class="toast" role="status">
+      {toast}
+      {#if lastAction}
+        <button class="ghost" onclick={() => void undoLast()}>Undo</button>
+      {/if}
+    </p>
   {/if}
 </main>
 

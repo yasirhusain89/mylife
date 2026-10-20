@@ -104,6 +104,9 @@ const seed: AssetRow[] = [
 
 let assets: AssetRow[] = [...seed];
 let nextId = 100;
+// Session-undo shelf: trashAssets moves rows here, restoreAssets moves them
+// back. Mirrors the backend keeping DB rows with missing=1.
+let trashedStore = new Map<number, AssetRow>();
 let scanHistory: string[] = ["/photos"];
 
 // AssetRow carries no location column; the mock tracks "has GPS" separately
@@ -154,6 +157,9 @@ function memberOf(a: AssetRow): DuplicateMember {
 
 let clusters: FaceClusterRow[] = [];
 let facesByCluster = new Map<number, FaceRow[]>();
+// Faces detached by unassignFace wait here until assignFace reattaches them
+// (or restoreCluster pulls them into a recreated cluster).
+let unassignedFaces = new Map<number, FaceRow>();
 let clusterNames = new Map<number, string>();
 let faceId = 1;
 
@@ -470,8 +476,27 @@ export async function blurredAssets(limit = 60): Promise<AssetRow[]> {
 
 export async function trashAssets(ids: number[]): Promise<{ trashed: number; failed: string[] }> {
   const drop = new Set(ids);
+  const found = assets.filter((a) => drop.has(a.id));
+  for (const a of found) trashedStore.set(a.id, a);
   assets = assets.filter((a) => !drop.has(a.id));
-  return { trashed: ids.length, failed: [] };
+  return { trashed: found.length, failed: [] };
+}
+
+export async function restoreAssets(ids: number[]): Promise<{ restored: number; failed: string[] }> {
+  const failed: string[] = [];
+  let restored = 0;
+  for (const id of ids) {
+    const row = trashedStore.get(id);
+    if (!row) {
+      failed.push(`${id}: already emptied or renamed — restore from Finder`);
+      continue;
+    }
+    trashedStore.delete(id);
+    assets = [...assets, { ...row, missing: 0 }];
+    restored++;
+  }
+  assets.sort((x, y) => x.id - y.id);
+  return { restored, failed };
 }
 
 export async function setFavorite(assetId: number, favorite: boolean): Promise<void> {
@@ -600,16 +625,93 @@ export async function facesInCluster(clusterId: number): Promise<FaceRow[]> {
 
 export async function unassignFace(faceId: number): Promise<number> {
   for (const [cid, list] of facesByCluster) {
-    if (list.some((f) => f.id === faceId)) {
+    const hit = list.find((f) => f.id === faceId);
+    if (hit) {
       facesByCluster.set(
         cid,
         list.filter((f) => f.id !== faceId)
       );
+      unassignedFaces.set(faceId, hit);
+      // The asset stays linked while a sibling face in the same cluster
+      // still shows the same photo.
+      const siblingKeeps = (facesByCluster.get(cid) ?? []).some((f) => f.path === hit.path);
+      if (!siblingKeeps) {
+        const assetId = [...assets, ...trashedStore.values()].find((a) => a.path === hit.path)?.id;
+        if (assetId !== undefined) clusterMembers.get(cid)?.delete(assetId);
+      }
       clusters = clusters.map((c) => (c.id === cid ? { ...c, faceCount: c.faceCount - 1 } : c));
       return cid;
     }
   }
   throw new Error(`face ${faceId} is not assigned to any cluster`);
+}
+
+export async function assignFace(faceId: number, clusterId: number): Promise<void> {
+  if (!clusters.some((c) => c.id === clusterId)) {
+    throw new Error(`cluster ${clusterId} not found`);
+  }
+  const face = unassignedFaces.get(faceId);
+  if (!face) throw new Error(`face ${faceId} not found`);
+  unassignedFaces.delete(faceId);
+  facesByCluster.set(clusterId, [...(facesByCluster.get(clusterId) ?? []), face]);
+  const assetId = assets.find((a) => a.path === face.path)?.id;
+  if (assetId !== undefined) {
+    const ids = clusterMembers.get(clusterId) ?? new Set<number>();
+    ids.add(assetId);
+    clusterMembers.set(clusterId, ids);
+  }
+  clusters = clusters.map((c) =>
+    c.id === clusterId ? { ...c, faceCount: (facesByCluster.get(clusterId) ?? []).length } : c,
+  );
+}
+
+export async function restoreCluster(name: string | null, faceIds: number[]): Promise<number> {
+  if (faceIds.length === 0) throw new Error("no faces to restore");
+  const wanted = new Set(faceIds);
+  const moving: FaceRow[] = [];
+  for (const [cid, list] of [...facesByCluster]) {
+    facesByCluster.set(
+      cid,
+      list.filter((f) => {
+        if (wanted.has(f.id)) {
+          moving.push(f);
+          return false;
+        }
+        return true;
+      }),
+    );
+  }
+  // Detached faces (unassigned since the merge) rejoin too.
+  for (const fid of faceIds) {
+    const f = unassignedFaces.get(fid);
+    if (f) {
+      unassignedFaces.delete(fid);
+      moving.push(f);
+    }
+  }
+  if (moving.length !== faceIds.length) throw new Error("one of the faces does not exist");
+  const nid = Math.max(0, ...clusters.map((c) => c.id)) + 1;
+  const clean = name?.trim() ? name.trim() : null;
+  if (clean) clusterNames.set(nid, clean);
+  facesByCluster.set(nid, moving);
+  const memberIds = new Set<number>();
+  for (const f of moving) {
+    const assetId = [...assets, ...trashedStore.values()].find((a) => a.path === f.path)?.id;
+    if (assetId !== undefined) {
+      memberIds.add(assetId);
+      for (const ids of clusterMembers.values()) ids.delete(assetId);
+    }
+  }
+  clusterMembers.set(nid, memberIds);
+  clusters = clusters.map((c) => ({
+    ...c,
+    faceCount: (facesByCluster.get(c.id) ?? []).length,
+  }));
+  clusters = [
+    ...clusters,
+    { id: nid, faceCount: moving.length, representativePath: moving[0]?.path ?? null, name: clean },
+  ];
+  return nid;
 }
 
 export async function facesCount(): Promise<number> {

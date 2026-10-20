@@ -1296,6 +1296,29 @@ fn unassign_face(conn: tauri::State<'_, DbState>, face_id: i64) -> Result<i64, S
     db::unassign_face(&conn, face_id)
 }
 
+/// Reattaches one face to a cluster (undo for unassign_face).
+#[tauri::command]
+fn assign_face(
+    conn: tauri::State<'_, DbState>,
+    face_id: i64,
+    cluster_id: i64,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::assign_face(&conn, face_id, cluster_id)
+}
+
+/// Reinserts one face_clusters row and moves the given faces into it
+/// (undo for merge_clusters). Returns the new cluster id.
+#[tauri::command]
+fn restore_cluster(
+    conn: tauri::State<'_, DbState>,
+    name: Option<String>,
+    face_ids: Vec<i64>,
+) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::restore_cluster(&conn, name.as_deref(), &face_ids)
+}
+
 #[tauri::command]
 fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
@@ -2146,6 +2169,70 @@ struct TrashSummary {
     failed: Vec<String>,
 }
 
+/// Undo for trash_assets: moves same-base-name files from ~/.Trash back to
+/// their indexed paths and clears the missing flag. Exact-name match only —
+/// anything else lands in `failed` with a plain-language reason.
+#[tauri::command]
+async fn restore_assets(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+) -> Result<RestoreSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+        let rows = db::asset_paths(&conn, &ids)?;
+        if rows.is_empty() {
+            return Err("no matching assets".into());
+        }
+
+        let home = std::env::var("HOME").map_err(|_| "home directory unavailable")?;
+        let trash = std::path::PathBuf::from(home).join(".Trash");
+
+        let mut restored = Vec::new();
+        let mut failed = Vec::new();
+        for (id, path) in &rows {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name else {
+                failed.push(format!("{path}: already emptied or renamed — restore from Finder"));
+                continue;
+            };
+            let src = trash.join(&name);
+            if !src.exists() {
+                failed.push(format!("{path}: already emptied or renamed — restore from Finder"));
+                continue;
+            }
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    failed.push(format!("{path}: {e}"));
+                    continue;
+                }
+            }
+            match std::fs::rename(&src, path) {
+                Ok(()) => restored.push(*id),
+                Err(e) => failed.push(format!("{path}: {e}")),
+            }
+        }
+
+        if !restored.is_empty() {
+            db::clear_missing(&conn, &restored)?;
+        }
+
+        Ok(RestoreSummary { restored: restored.len(), failed })
+    })
+    .await
+    .map_err(|e| format!("restore task join failed: {e}"))?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreSummary {
+    restored: usize,
+    failed: Vec<String>,
+}
+
 #[tauri::command]
 fn library_stats(conn: tauri::State<'_, DbState>) -> Result<db::LibraryStats, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
@@ -2668,6 +2755,7 @@ pub fn run() {
             duplicates_keep,
             cleanup_stats_cmd,
             trash_assets,
+            restore_assets,
             cluster_faces,
             verify_library,
             clusters_list,
@@ -2675,7 +2763,9 @@ pub fn run() {
             faces_count,
             rename_cluster,
             merge_clusters,
+            restore_cluster,
             unassign_face,
+            assign_face,
             detect_pets,
             sightings_list,
             cluster_events,

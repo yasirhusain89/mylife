@@ -840,6 +840,173 @@ pub fn unassign_face(conn: &Connection, face_id: i64) -> Result<i64, String> {
     Ok(cluster_id)
 }
 
+/// (id, path) lookup for undo-restore. The ~/.Trash move itself lives in
+/// the command layer (main-thread NSFileManager), so this DB half stays
+/// unit-testable and the filesystem hop is mock-covered.
+pub fn asset_paths(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, String)>, String> {
+    let json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, path FROM assets WHERE id IN (SELECT value FROM json_each(?1))")
+        .map_err(|e| format!("restore lookup: {e}"))?;
+    let rows = stmt
+        .query_map(params![json], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("restore lookup: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("restore row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Clears the missing flag for rows moved back from the Trash.
+pub fn clear_missing(conn: &Connection, ids: &[i64]) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    let changed = conn
+        .execute(
+            "UPDATE assets SET missing = 0 WHERE id IN (SELECT value FROM json_each(?1))",
+            params![json],
+        )
+        .map_err(|e| format!("restore flag: {e}"))?;
+    Ok(changed)
+}
+
+/// Reattaches one face to a cluster (undo for unassign_face). Recounts the
+/// target (and the previous cluster when the face moves between two live
+/// clusters). Errors when the face or the cluster is unknown.
+pub fn assign_face(conn: &Connection, face_id: i64, cluster_id: i64) -> Result<(), String> {
+    let face: Option<Option<i64>> = conn
+        .query_row("SELECT cluster_id FROM faces WHERE id = ?1", params![face_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| format!("face lookup: {e}"))?;
+    let prev = match face {
+        None => return Err(format!("face {face_id} not found")),
+        Some(v) => v,
+    };
+    let cluster_exists: i64 = conn
+        .query_row("SELECT COUNT(*) FROM face_clusters WHERE id = ?1", params![cluster_id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("cluster lookup: {e}"))?;
+    if cluster_exists == 0 {
+        return Err(format!("cluster {cluster_id} not found"));
+    }
+    if prev == Some(cluster_id) {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| format!("assign tx: {e}"))?;
+    tx.execute("UPDATE faces SET cluster_id = ?2 WHERE id = ?1", params![face_id, cluster_id])
+        .map_err(|e| format!("assign face: {e}"))?;
+    tx.execute(
+        "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM faces WHERE cluster_id = ?1)
+         WHERE id = ?1",
+        params![cluster_id],
+    )
+    .map_err(|e| format!("assign recount: {e}"))?;
+    if let Some(old) = prev {
+        tx.execute(
+            "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM faces WHERE cluster_id = ?1)
+             WHERE id = ?1",
+            params![old],
+        )
+        .map_err(|e| format!("assign recount: {e}"))?;
+    }
+    sync_person_tags(&tx, cluster_id)?;
+    if let Some(old) = prev {
+        sync_person_tags(&tx, old)?;
+    }
+    tx.commit().map_err(|e| format!("assign commit: {e}"))?;
+    Ok(())
+}
+
+/// Reinserts one face_clusters row (undo for merge_clusters) and moves the
+/// given faces into it. The name is the snapshot from before the merge;
+/// blank snapshots restore as NULL so the card renders "Cluster <id>".
+/// Returns the new cluster id (a fresh rowid, not the dropped one).
+pub fn restore_cluster(
+    conn: &Connection,
+    name: Option<&str>,
+    face_ids: &[i64],
+) -> Result<i64, String> {
+    if face_ids.is_empty() {
+        return Err("no faces to restore".into());
+    }
+    let clean = name.map(str::trim).filter(|n| !n.is_empty());
+    let json = serde_json::to_string(face_ids).map_err(|e| e.to_string())?;
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM faces WHERE id IN (SELECT value FROM json_each(?1))",
+            params![json],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("restore faces lookup: {e}"))?;
+    if found != face_ids.len() as i64 {
+        return Err("one of the faces does not exist".into());
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| format!("restore tx: {e}"))?;
+    // Survivors losing members need a recount + tag re-sync afterwards.
+    let mut prev: Vec<i64> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT cluster_id FROM faces
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND cluster_id IS NOT NULL",
+            )
+            .map_err(|e| format!("restore survivors: {e}"))?;
+        let rows = stmt
+            .query_map(params![json], |r| r.get::<_, i64>(0))
+            .map_err(|e| format!("restore survivors: {e}"))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("restore survivor row: {e}"))?);
+        }
+        v
+    };
+    prev.sort_unstable();
+    prev.dedup();
+    tx.execute(
+        "INSERT INTO face_clusters (face_count, created_at, name) VALUES (0, ?1, ?2)",
+        params![now(), clean],
+    )
+    .map_err(|e| format!("restore cluster: {e}"))?;
+    let nid = tx.last_insert_rowid();
+    for fid in face_ids {
+        tx.execute("UPDATE faces SET cluster_id = ?2 WHERE id = ?1", params![fid, nid])
+            .map_err(|e| format!("restore link: {e}"))?;
+    }
+    let count: i64 = tx
+        .query_row("SELECT COUNT(*) FROM faces WHERE cluster_id = ?1", params![nid], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("restore count: {e}"))?;
+    tx.execute(
+        "UPDATE face_clusters SET face_count = ?2 WHERE id = ?1",
+        params![nid, count],
+    )
+    .map_err(|e| format!("restore recount: {e}"))?;
+    for pid in &prev {
+        if *pid == nid {
+            continue;
+        }
+        tx.execute(
+            "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM faces WHERE cluster_id = ?1)
+             WHERE id = ?1",
+            params![pid],
+        )
+        .map_err(|e| format!("restore recount: {e}"))?;
+    }
+    sync_person_tags(&tx, nid)?;
+    for pid in &prev {
+        if *pid == nid {
+            continue;
+        }
+        sync_person_tags(&tx, *pid)?;
+    }
+    tx.commit().map_err(|e| format!("restore commit: {e}"))?;
+    Ok(nid)
+}
+
 pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRow>, String> {
     let mut stmt = conn
         .prepare(
@@ -3235,6 +3402,107 @@ mod tests {
         // Repeats, ghosts, and double-detaches fail cleanly.
         assert!(unassign_face(&conn, ids[0]).is_err(), "already unassigned errors");
         assert!(unassign_face(&conn, 9999).is_err(), "unknown face errors");
+    }
+
+    #[test]
+    fn assign_face_reattaches_and_recounts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()
+        };
+        let ids = mk("/a.jpg");
+        let cid = save_cluster(&conn, &ids).unwrap();
+        unassign_face(&conn, ids[0]).unwrap();
+        assert!(faces_in_cluster(&conn, cid).unwrap().is_empty());
+
+        // Undo re-links the face and restores the count.
+        assign_face(&conn, ids[0], cid).unwrap();
+        assert_eq!(faces_in_cluster(&conn, cid).unwrap().len(), 1);
+        assert_eq!(clusters_list(&conn).unwrap()[0].face_count, 1);
+
+        // Re-attaching to the same cluster is a no-op, not an error.
+        assign_face(&conn, ids[0], cid).unwrap();
+
+        // Ghosts fail cleanly.
+        assert!(assign_face(&conn, 9999, cid).is_err(), "unknown face errors");
+        assert!(assign_face(&conn, ids[0], 9999).is_err(), "unknown cluster errors");
+    }
+
+    #[test]
+    fn restore_cluster_recreates_split_after_merge() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mk = |path: &str| {
+            save_faces(
+                &conn,
+                path,
+                &[serde_json::json!({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "confidence": 0.9})],
+            )
+            .unwrap()
+        };
+        let a = save_cluster(&conn, &mk("/a.jpg")).unwrap();
+        let b = save_cluster(&conn, &mk("/b.jpg")).unwrap();
+        rename_cluster(&conn, a, "Maya").unwrap();
+        let from_faces: Vec<i64> =
+            faces_in_cluster(&conn, a).unwrap().iter().map(|f| f.id).collect();
+
+        // Merge drops the source row; undo re-inserts it and pulls the
+        // faces back out of the survivor.
+        merge_clusters(&conn, a, b).unwrap();
+        assert_eq!(clusters_list(&conn).unwrap().len(), 1);
+        let nid = restore_cluster(&conn, Some("Maya"), &from_faces).unwrap();
+        let clusters = clusters_list(&conn).unwrap();
+        assert_eq!(clusters.len(), 2, "split restores two clusters");
+        let back = clusters.iter().find(|c| c.id == nid).unwrap();
+        assert_eq!(back.name.as_deref(), Some("Maya"));
+        assert_eq!(back.face_count, from_faces.len() as i64);
+        assert_eq!(faces_in_cluster(&conn, nid).unwrap().len(), from_faces.len());
+        assert_eq!(
+            clusters.iter().find(|c| c.id == b).unwrap().face_count,
+            1,
+            "survivor recounts after losing members"
+        );
+
+        // Empty and ghost restores fail cleanly.
+        assert!(restore_cluster(&conn, Some("Nobody"), &[]).is_err(), "empty errors");
+        assert!(restore_cluster(&conn, Some("Nobody"), &[9999]).is_err(), "unknown face errors");
+    }
+
+    #[test]
+    fn asset_paths_and_clear_missing_round_trip() {
+        // DB halves of the Trash undo: the ~/.Trash move itself runs on the
+        // main thread in the app and is mock-covered in e2e.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        let (a, b) = (id_for("/a.jpg"), id_for("/b.jpg"));
+
+        let rows = asset_paths(&conn, &[a, b]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&(a, "/a.jpg".to_string())));
+
+        // Flagged missing (as trash_assets leaves them), then cleared.
+        conn.execute("UPDATE assets SET missing = 1 WHERE id IN (?1, ?2)", params![a, b]).unwrap();
+        assert_eq!(clear_missing(&conn, &[a]).unwrap(), 1);
+        let missing: i64 =
+            conn.query_row("SELECT missing FROM assets WHERE id = ?1", params![a], |r| r.get(0)).unwrap();
+        assert_eq!(missing, 0, "restored row is visible again");
+        let still: i64 =
+            conn.query_row("SELECT missing FROM assets WHERE id = ?1", params![b], |r| r.get(0)).unwrap();
+        assert_eq!(still, 1, "untouched rows stay flagged");
+        assert_eq!(clear_missing(&conn, &[]).unwrap(), 0);
     }
 
     fn person_tags(conn: &Connection, asset_id: i64) -> Vec<String> {

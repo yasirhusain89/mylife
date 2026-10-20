@@ -255,6 +255,85 @@ test("flags survive a reload", async ({ page }) => {
   await expect(reloaded.getByRole("button", { name: "flagged" })).toBeVisible();
 });
 
+test("flag undo unflags the photo", async ({ page }) => {
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+  const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await card.getByRole("button", { name: "remove" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Flag", exact: true }).click();
+  await expect(card.getByRole("button", { name: "flagged" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByRole("status")).toContainText("Undid flag");
+  await expect(card.getByRole("button", { name: "remove" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Undo" })).toBeHidden();
+});
+
+test("trash undo restores the asset", async ({ page }) => {
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".batch-bar").getByRole("button", { name: "Trash", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.getByRole("status")).toContainText("moved to Trash");
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByRole("status")).toContainText("Restored");
+  await expect(page.getByRole("button", { name: "Undo" })).toBeHidden();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.getByText("IMG_20261007_185817.jpg").first()).toBeVisible();
+});
+
+test("unassign undo reattaches the face", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  await expect(page.getByText("4 faces")).toBeVisible();
+  await page.getByRole("button", { name: "Remove this face from Cluster 1" }).first().click();
+  await expect(page.getByText("Removed that face from this person")).toBeVisible();
+  await expect(page.getByText("3 faces")).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByText("Reattached that face")).toBeVisible();
+  await expect(page.getByText("4 faces")).toBeVisible();
+});
+
+test("merge undo splits the clusters back apart", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("checkbox", { name: "Select cluster 1 for merge" }).check();
+  await page.getByRole("checkbox", { name: "Select cluster 2 for merge" }).check();
+  await page.getByRole("button", { name: "Merge into #1" }).click();
+  await expect(page.getByText("Cluster 2")).toBeHidden();
+  await expect(page.getByText("6 faces", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByText("Split the merge back apart")).toBeVisible();
+  await expect(page.getByText("4 faces")).toBeVisible();
+  await expect(page.getByText("2 faces")).toBeVisible();
+});
+
+test("a new destructive action replaces the pending undo", async ({ page }) => {
+  // Flag first: Undo is pending for the flagged photo.
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await page.getByLabel(/Deleting moves files/).selectOption("flag");
+  const card = page.locator("figure", { hasText: "IMG_20261007_185824.jpg" });
+  await card.getByRole("button", { name: "remove" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Flag", exact: true }).click();
+  await expect(card.getByRole("button", { name: "flagged" })).toBeVisible();
+  // Trash second: the pending flag undo is discarded.
+  await page.getByLabel(/Deleting moves files/).selectOption("trash");
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".batch-bar").getByRole("button", { name: "Trash", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Move to Trash" }).click();
+  await expect(page.getByRole("status")).toContainText("moved to Trash");
+  // Undo now restores the trash; the flag stands.
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByRole("status")).toContainText("Restored");
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await page.getByRole("tab", { name: /^Cleanup/ }).click();
+  await expect(page.locator("figure", { hasText: "IMG_20261007_185824.jpg" }).getByRole("button", { name: "flagged" })).toBeVisible();
+});
+
 test("Clear empties the batch selection", async ({ page }) => {
   await page.getByRole("button", { name: "Select", exact: true }).click();
   await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();

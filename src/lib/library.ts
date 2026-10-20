@@ -419,6 +419,13 @@ export function trashAssets(ids: number[]): Promise<{ trashed: number; failed: s
   return invoke("trash_assets", { ids });
 }
 
+export type RestoreSummary = { restored: number; failed: string[] };
+
+/** Session-undo for trash_assets: moves files back from ~/.Trash. */
+export function restoreAssets(ids: number[]): Promise<RestoreSummary> {
+  return invoke("restore_assets", { ids });
+}
+
 export type FaceRow = {
   id: number;
   path: string;
@@ -497,6 +504,16 @@ export function facesInCluster(clusterId: number): Promise<FaceRow[]> {
 
 export function unassignFace(faceId: number): Promise<number> {
   return invoke("unassign_face", { faceId });
+}
+
+/** Session-undo for unassign_face: reattaches a detached face. */
+export function assignFace(faceId: number, clusterId: number): Promise<void> {
+  return invoke("assign_face", { faceId, clusterId });
+}
+
+/** Session-undo for merge_clusters: recreates a cluster around these faces. */
+export function restoreCluster(name: string | null, faceIds: number[]): Promise<number> {
+  return invoke("restore_cluster", { name, faceIds });
 }
 
 export function facesCount(): Promise<number> {
