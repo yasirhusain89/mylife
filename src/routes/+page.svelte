@@ -736,6 +736,88 @@
     viewerError = null;
   }
 
+  // Picasa-style slideshow: fullscreen theater overlay advancing on a timer.
+  // Fixed overlay (not the Fullscreen API) so it works in the Tauri WebView
+  // everywhere; videos pause the timer since they play on their own clock.
+  const SLIDE_MS = 3000;
+  let show = $state<{
+    items: AssetRow[];
+    index: number;
+    playing: boolean;
+    src: string | null;
+    error: string | null;
+  } | null>(null);
+  let showTimer: ReturnType<typeof setInterval> | null = null;
+
+  function stopShowTimer() {
+    if (showTimer !== null) {
+      clearInterval(showTimer);
+      showTimer = null;
+    }
+  }
+
+  function showCurrent(): AssetRow | null {
+    return show && show.items.length > 0 ? show.items[show.index] : null;
+  }
+
+  async function loadShow(a: AssetRow) {
+    if (!show) return;
+    show.src = null;
+    show.error = null;
+    try {
+      if (a.kind === "video") {
+        const url = assetUrl(a.path);
+        if (url) show.src = url;
+        // A video holds the screen: pause auto-advance until the user moves on.
+        stopShowTimer();
+        if (show) show.playing = false;
+      } else {
+        const { image } = await engineThumb(a.path, 1600);
+        if (!image) throw new Error("engine returned no image");
+        if (show) show.src = thumbSrc(image);
+      }
+    } catch (e) {
+      if (show) show.error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  function restartShowTimer() {
+    stopShowTimer();
+    if (show?.playing) showTimer = setInterval(() => stepShow(1), SLIDE_MS);
+  }
+
+  function startShow(items: AssetRow[], index = 0) {
+    if (items.length === 0) return;
+    closeViewer();
+    stopShowTimer();
+    const at = Math.min(Math.max(index, 0), items.length - 1);
+    show = { items, index: at, playing: true, src: null, error: null };
+    void loadShow(items[at]);
+    showTimer = setInterval(() => stepShow(1), SLIDE_MS);
+  }
+
+  function stepShow(delta: number) {
+    if (!show || show.items.length === 0) return;
+    const next = (show.index + delta + show.items.length) % show.items.length;
+    show.index = next;
+    void loadShow(show.items[next]);
+    // Manual steps restart the countdown so the new slide gets full time.
+    if (show.playing) restartShowTimer();
+  }
+
+  function toggleShowPlay() {
+    if (!show) return;
+    show.playing = !show.playing;
+    restartShowTimer();
+    // Resuming on a video would stall instantly; step to the next photo.
+    if (show.playing && showCurrent()?.kind === "video") stepShow(1);
+  }
+
+  function closeShow() {
+    stopShowTimer();
+    show = null;
+  }
+
   async function openSimilar(a: AssetRow) {
     // Videos never get vectors (embed backfill is images-only by design),
     // so fail fast with a friendly message instead of the raw error.
@@ -768,6 +850,13 @@
   }
 
   function viewerKey(e: KeyboardEvent) {
+    if (show) {
+      if (e.key === "Escape") closeShow();
+      else if (e.key === "ArrowRight") { e.preventDefault(); stepShow(1); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); stepShow(-1); }
+      else if (e.key === " ") { e.preventDefault(); toggleShowPlay(); }
+      return;
+    }
     if (!viewer) return;
     if (e.key === "Escape") closeViewer();
     else if (e.key === "ArrowRight") { e.preventDefault(); stepViewer(1); }
@@ -2136,6 +2225,12 @@
       <div class="enrich batch-bar">
         <span class="hint">{selected.size} selected</span>
         <button class="ghost" disabled={selected.size === 0} onclick={() => void batchFavorite()}>★ Star</button>
+        <button
+          class="ghost"
+          disabled={selected.size === 0}
+          title="Play the selected photos fullscreen"
+          onclick={() => startShow(assets.filter((a) => selected.has(a.id)))}
+        >▶ Play</button>
         {#if albumOptions.length > 0}
           <select
             aria-label="Add selected to album"
@@ -2801,6 +2896,12 @@
               >Not {reviewCluster.name} — remove</button>
             {/if}
             <button class="tiny" onclick={closeViewer} aria-label="Close viewer">✕</button>
+            <button
+              class="tiny"
+              title="Play slideshow from here"
+              aria-label="Play slideshow"
+              onclick={() => startShow(viewerRows(), viewer?.index ?? 0)}
+            >▶ Play</button>
           </div>
           <div class="viewer-stage">
             <button class="viewer-nav" onclick={() => stepViewer(-1)} aria-label="Previous">‹</button>
@@ -2832,6 +2933,45 @@
         </div>
       </div>
     {/if}
+  {/if}
+
+  {#if show && showCurrent()}
+    {@const sc = showCurrent()!}
+    <div class="theater" role="dialog" aria-modal="true" aria-label="Slideshow" tabindex={-1}>
+      <div class="theater-top">
+        <span class="hint">{show.index + 1} of {show.items.length} · {sc.name}</span>
+        <div class="theater-controls">
+          <button class="tiny" onclick={() => stepShow(-1)} aria-label="Previous">‹</button>
+          <button class="tiny" onclick={toggleShowPlay} aria-label={show.playing ? "Pause" : "Play"}>
+            {show.playing ? "❚❚" : "▶"}
+          </button>
+          <button class="tiny" onclick={() => stepShow(1)} aria-label="Next">›</button>
+          <button class="tiny" onclick={closeShow} aria-label="Close slideshow">✕</button>
+        </div>
+      </div>
+      <div class="theater-stage">
+        {#if sc.kind === "video" && show.src}
+          {#key show.src}
+            <!-- svelte-ignore a11y_media_has_caption: library files ship no caption tracks -->
+            <video src={show.src} controls autoplay playsinline></video>
+          {/key}
+        {:else if sc.kind === "video"}
+          {#if thumbs[sc.path]}
+            <img src={thumbs[sc.path]} alt={sc.name} />
+          {/if}
+          <p class="hint">Video playback needs the desktop app — the web preview has no file to play.</p>
+        {:else if show.src}
+          {#key show.src}
+            <img src={show.src} alt={sc.name} />
+          {/key}
+        {:else if show.error}
+          <p class="error">{show.error}</p>
+        {:else}
+          <p class="hint">Loading full size…</p>
+        {/if}
+      </div>
+      <p class="hint theater-hint">‹ › move · space plays/pauses · esc closes</p>
+    </div>
   {/if}
 
   {#if similar}
@@ -3298,6 +3438,47 @@
   .dialog h3 {
     margin: 0 0 0.5rem;
     font-size: 0.95rem;
+  }
+  .theater {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    padding: 0.8rem 1rem;
+  }
+  .theater-top {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+  }
+  .theater-top .hint {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .theater-controls {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .theater-stage {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+  }
+  .theater-stage img,
+  .theater-stage video {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  .theater-hint {
+    text-align: center;
+    margin: 0.4rem 0 0;
   }
   .dialog.wide {
     width: min(52rem, 96vw);

@@ -175,6 +175,38 @@ test("group headers select and clear the whole section in one go", async ({ page
   await expect(page.getByText("2 selected")).toBeVisible();
 });
 
+test("slideshow plays from the viewer with pause and step", async ({ page }) => {
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  const viewer = page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" });
+  await expect(viewer).toBeVisible();
+  await viewer.getByRole("button", { name: "Play slideshow" }).click();
+  const show = page.getByRole("dialog", { name: "Slideshow" });
+  await expect(show).toBeVisible();
+  await expect(show.getByText("1 of 8")).toBeVisible();
+  // Freeze autoplay, then stepping is deterministic.
+  await show.getByRole("button", { name: "Pause" }).click();
+  await expect(show.getByRole("button", { name: "Play" })).toBeVisible();
+  await show.getByRole("button", { name: "Next" }).click();
+  await expect(show.getByText("2 of 8")).toBeVisible();
+  await show.getByRole("button", { name: "Close slideshow" }).click();
+  await expect(show).toBeHidden();
+});
+
+test("slideshow plays just the current selection", async ({ page }) => {
+  await page.getByLabel("Group by").selectOption("media");
+  await page.getByRole("checkbox", { name: "Select Photos" }).check();
+  await expect(page.getByText("6 selected")).toBeVisible();
+  await page.getByRole("button", { name: "▶ Play" }).click();
+  const show = page.getByRole("dialog", { name: "Slideshow" });
+  await expect(show).toBeVisible();
+  await expect(show.getByText("1 of 6")).toBeVisible();
+  await show.getByRole("button", { name: "Pause" }).click();
+  await show.getByRole("button", { name: "Close slideshow" }).click();
+  await expect(show).toBeHidden();
+  // Selection survives the show.
+  await expect(page.getByText("6 selected")).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
