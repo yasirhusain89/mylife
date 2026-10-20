@@ -11,7 +11,8 @@ import type {
   RemoveRootSummary,
   ScanRoot,
   SceneTagCount,
-  TagScenesSummary
+  TagScenesSummary,
+  TripRow
 } from "./library";
 
 /**
@@ -145,6 +146,14 @@ export function clustersList(): Promise<FaceClusterRow[]> {
 
 export function eventsList(): Promise<EventRow[]> {
   return getJson<EventRow[]>("/api/events");
+}
+
+export function tripsList(): Promise<TripRow[]> {
+  return getJson<TripRow[]>("/api/trips");
+}
+
+export function curatePicksToAlbum(eventIds: number[], albumId: number, limit = 24): Promise<number> {
+  return postJson<number>("/api/curate", { eventIds, albumId, limit });
 }
 
 export function albumsList(): Promise<AlbumRow[]> {

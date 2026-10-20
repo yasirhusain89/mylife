@@ -609,6 +609,27 @@ export function eventAssets(eventId: number): Promise<EventAssetRow[]> {
   return invoke("event_assets", { eventId });
 }
 
+export type TripRow = {
+  id: string;
+  name: string;
+  place: string | null;
+  startedAt: number;
+  endedAt: number;
+  stopCount: number;
+  assetCount: number;
+  eventIds: number[];
+};
+
+/** Trip → stop hierarchy over the event list (dynamic, display keys only). */
+export function tripsList(): Promise<TripRow[]> {
+  return invoke("trips_list");
+}
+
+/** Balanced coverage curation across several events into an album. */
+export function curatePicksToAlbum(eventIds: number[], albumId: number, limit = 24): Promise<number> {
+  return invoke("curate_picks_to_album", { eventIds, albumId, limit });
+}
+
 export function renameEvent(eventId: number, name: string): Promise<void> {
   return invoke("rename_event", { event_id: eventId, name });
 }
@@ -674,7 +695,7 @@ export function albumAdd(albumId: number, assetIds: number[]): Promise<{ added: 
   return invoke("album_add", { albumId, assetIds });
 }
 
-/** Best-of-place pick: the event's sharpest members into an album. */
+/** Best-of-place pick: balanced coverage curation (day × stop quotas, favorites, named faces, diversity, video mix) into an album. */
 export function addEventPicksToAlbum(eventId: number, albumId: number, limit = 12): Promise<number> {
   return invoke("add_event_picks_to_album", { eventId, albumId, limit });
 }

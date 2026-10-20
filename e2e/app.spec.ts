@@ -718,7 +718,7 @@ test("event place names resolve from coordinates", async ({ page }) => {
   await expect(page.getByText("InlawsVisit2026")).toBeVisible();
   await expect(page.getByText("37.7749, -122.4194")).toBeVisible();
   await page.getByRole("button", { name: "Resolve place names" }).click();
-  await expect(page.getByText("San Francisco, California")).toBeVisible();
+  await expect(page.locator(".timeline").getByText("San Francisco, California")).toBeVisible();
 });
 
 test("highlight video reports photos and clips", async ({ page }) => {
@@ -1879,8 +1879,24 @@ test("event top picks land in the chosen album", async ({ page }) => {
   await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Show photos" }).first().click();
-  await page.getByRole("button", { name: "＋ Top 12" }).first().click();
+  await page.getByRole("button", { name: "＋ Best 12" }).first().click();
   await expect(page.locator(".toast")).toContainText("Added 8 top picks to “Trip Best”");
+});
+
+test("trips group events with album and curated-best actions", async ({ page }) => {
+  await page.getByRole("tab", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "New album" }).click();
+  const dialog = page.getByRole("dialog", { name: "New album" });
+  await dialog.getByLabel("New album").fill("Trip Share");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByText("Trip Share").first()).toBeVisible();
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  // One mock event → one trip card with both actions, no expand needed.
+  await expect(page.getByText("Trips · 1")).toBeVisible();
+  await page.getByRole("button", { name: /Curate best 24 from trip/ }).click();
+  await expect(page.locator(".toast")).toContainText("Added 8 trip picks from");
+  await expect(page.locator(".toast")).toContainText("Trip Share");
 });
 
 test("space saver compresses dup extras plus blurred", async ({ page }) => {

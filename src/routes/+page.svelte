@@ -16,6 +16,8 @@
     clusterEvents,
     eventsList,
     eventAssets,
+    tripsList,
+    curatePicksToAlbum,
     renameEvent,
     resolvePlaces,
     onGeocodeProgress,
@@ -86,6 +88,7 @@
     type PetSighting,
     type EventRow,
     type EventAssetRow,
+    type TripRow,
     type GeocodeProgress,
     type FaceRow,
     type DuplicateGroup,
@@ -845,6 +848,11 @@
   let gapHours = $state(4);
   let openEventId = $state<number | null>(null);
   let eventMembers = $state<Record<number, EventAssetRow[]>>({});
+  // Trips: dynamic Trip → Stop grouping over events (Stage 2). Loaded with
+  // events; per-trip album target mirrors the per-event dropdown.
+  let trips = $state<TripRow[]>([]);
+  let tripAlbumChoice = $state<Record<string, number | null>>({});
+  let tripAlbumBusy = $state<string | null>(null);
   let resolvingPlaces = $state(false);
   let geocodeState = $state<GeocodeProgress | null>(null);
   // Lightbox viewer over the current library page (index into `assets`),
@@ -1947,7 +1955,7 @@
     }
   }
 
-  // Best-of-place pick: the event's sharpest dozen into the chosen album.
+  // Best-of-place pick: balanced coverage curation for one event.
   // Loads members on demand like addEventToAlbum (no expand-first needed).
   async function addEventPicks(eventId: number) {
     const albumId = eventAlbumChoice[eventId] ?? albumOptions[0]?.id;
@@ -2931,6 +2939,7 @@
     try {
       events = await eventsList();
       await ensureAlbumOptions();
+      await loadTrips();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -2944,11 +2953,80 @@
       await clusterEvents(gapHours, 500);
       events = await eventsList();
       await ensureAlbumOptions();
+      await loadTrips();
       toast = `Grouped into ${events.length} event${events.length === 1 ? "" : "s"}`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       eventsLoading = false;
+    }
+  }
+
+  async function loadTrips() {
+    try {
+      trips = await tripsList();
+      // Default each trip's album target like the per-event dropdowns.
+      if (albumOptions.length > 0) {
+        const next: Record<string, number | null> = { ...tripAlbumChoice };
+        for (const t of trips) {
+          if (next[t.id] == null || !albumOptions.some((a) => a.id === next[t.id])) {
+            next[t.id] = albumOptions[0].id;
+          }
+        }
+        tripAlbumChoice = next;
+      }
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    }
+  }
+
+  async function addTripToAlbum(trip: TripRow) {
+    const albumId = tripAlbumChoice[trip.id] ?? albumOptions[0]?.id;
+    if (albumId == null || tripAlbumBusy !== null) return;
+    tripAlbumBusy = trip.id;
+    try {
+      let total = 0;
+      for (const eid of trip.eventIds) {
+        let members = eventMembers[eid];
+        if (members === undefined) {
+          members = await eventAssets(eid);
+          eventMembers = { ...eventMembers, [eid]: members };
+        }
+        if (members.length === 0) continue;
+        const r = await albumAdd(albumId, members.map((m) => m.id));
+        total += r.added;
+      }
+      const target = albumOptions.find((a) => a.id === albumId);
+      await loadAlbums();
+      toast =
+        target != null
+          ? `Added ${total} photo${total === 1 ? "" : "s"} from “${trip.name}” to “${target.name}”`
+          : `Added ${total} photo${total === 1 ? "" : "s"} to the album`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      tripAlbumBusy = null;
+    }
+  }
+
+  // Trip-scale balanced curation: 24 best across the trip's stops (every
+  // day and stop covered, dupes/blur excluded, videos mixed in).
+  async function addTripPicks(trip: TripRow) {
+    const albumId = tripAlbumChoice[trip.id] ?? albumOptions[0]?.id;
+    if (albumId == null || tripAlbumBusy !== null) return;
+    tripAlbumBusy = trip.id;
+    try {
+      const added = await curatePicksToAlbum(trip.eventIds, albumId, 24);
+      const target = albumOptions.find((a) => a.id === albumId);
+      await loadAlbums();
+      toast =
+        target != null
+          ? `Added ${added} trip pick${added === 1 ? "" : "s"} from “${trip.name}” to “${target.name}”`
+          : `Added ${added} trip pick${added === 1 ? "" : "s"} to the album`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      tripAlbumBusy = null;
     }
   }
 
@@ -2973,6 +3051,7 @@
     try {
       const summary = await resolvePlaces();
       events = await eventsList();
+      await loadTrips();
       toast =
         summary.total === 0
           ? "Every located event already has a place name"
@@ -4671,6 +4750,62 @@
         </p>
       {/if}
       <p class="hint">Place names come from OpenStreetMap and are cached on this device.</p>
+      {#if trips.length}
+        <h3 class="sub">Trips · {trips.length}</h3>
+        {#each trips as trip (trip.id)}
+          <article class="group event-card">
+            <header>
+              <span title={`${trip.stopCount} stops`}>{trip.name}</span>
+              <span class="waste">
+                {new Date(trip.startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                – {new Date(trip.endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+              </span>
+            </header>
+            <p class="meta">
+              {trip.stopCount} stop{trip.stopCount === 1 ? "" : "s"} ·
+              {trip.assetCount} asset{trip.assetCount === 1 ? "" : "s"}{#if trip.place} · {trip.place}{/if}
+            </p>
+            {#if albumOptions.length > 0}
+              <div class="row-actions">
+                <select
+                  aria-label={`Add ${trip.name} to album`}
+                  onchange={(e) => {
+                    tripAlbumChoice = {
+                      ...tripAlbumChoice,
+                      [trip.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
+                    };
+                  }}
+                >
+                  {#each albumOptions as a (a.id)}
+                    <option
+                      value={a.id}
+                      selected={(tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) === a.id}
+                    >{a.name}</option>
+                  {/each}
+                </select>
+                <button
+                  class="tiny"
+                  disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
+                  aria-label={`Add trip ${trip.name} to album`}
+                  title={`Add trip ${trip.name} to album`}
+                  onclick={() => void addTripToAlbum(trip)}
+                >
+                  {tripAlbumBusy === trip.id ? "Adding…" : "＋ Album"}
+                </button>
+                <button
+                  class="tiny"
+                  disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
+                  aria-label={`Curate best 24 from trip ${trip.name}`}
+                  title="Balanced best across every day and stop — favorites, named people, videos mixed in"
+                  onclick={() => void addTripPicks(trip)}
+                >
+                  {tripAlbumBusy === trip.id ? "Adding…" : "＋ Best 24"}
+                </button>
+              </div>
+            {/if}
+          </article>
+        {/each}
+      {/if}
       {#if events.length}
         <div class="timeline">
           {#each groupEventsByMonth(events) as g (g.month)}
@@ -4732,10 +4867,10 @@
                 <button
                   class="tiny"
                   disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
-                  title="Sharpest 12 photos, blurred excluded, into the selected album"
+                  title="Balanced best across the event — favorites, named people, videos mixed in"
                   onclick={() => void addEventPicks(event.id)}
                 >
-                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Top 12"}
+                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Best 12"}
                 </button>
               {/if}
             </div>

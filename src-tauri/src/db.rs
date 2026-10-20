@@ -1651,6 +1651,105 @@ pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), 
     Ok(())
 }
 
+// MARK: - Trips (Stop groups)
+
+/// Trip-scale grouping over events: consecutive stops whose time gap fits in
+/// TRIP_GAP_HOURS and whose centroids sit within TRIP_RADIUS_M merge into one
+/// trip. A lone event is a one-stop trip, so every event belongs to exactly
+/// one trip. Dynamic (no table): recomputed from the event list per call, so
+/// ids are positional and unstable across rebuilds — display keys only.
+pub const TRIP_GAP_HOURS: f64 = 48.0;
+pub const TRIP_RADIUS_M: f64 = 50_000.0;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TripRow {
+    pub id: String,
+    pub name: String,
+    pub place: Option<String>,
+    pub started_at: f64,
+    pub ended_at: f64,
+    pub stop_count: i64,
+    pub asset_count: i64,
+    pub event_ids: Vec<i64>,
+}
+
+pub fn trips_list(conn: &Connection) -> Result<Vec<TripRow>, String> {
+    let mut events = events_list(conn)?;
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    events.sort_by(|a, b| {
+        a.started_at
+            .partial_cmp(&b.started_at)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let gap_seconds = TRIP_GAP_HOURS * 3600.0;
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = vec![0];
+    for i in 1..events.len() {
+        let prev = &events[current[current.len() - 1]];
+        let next = &events[i];
+        let time_ok = next.started_at - prev.ended_at <= gap_seconds;
+        let dist_ok = match (prev.latitude, prev.longitude, next.latitude, next.longitude) {
+            (Some(a), Some(b), Some(x), Some(y)) => haversine_m(a, b, x, y) <= TRIP_RADIUS_M,
+            _ => true,
+        };
+        if time_ok && dist_ok {
+            current.push(i);
+        } else {
+            groups.push(std::mem::take(&mut current));
+            current.push(i);
+        }
+    }
+    groups.push(current);
+
+    let mut trips: Vec<TripRow> = groups
+        .into_iter()
+        .enumerate()
+        .map(|(n, idxs)| {
+            let first = &events[idxs[0]];
+            let last = &events[idxs[idxs.len() - 1]];
+            let asset_count: i64 = idxs.iter().map(|&k| events[k].asset_count).sum();
+            // Modal place across stops; ties keep the earliest stop's label.
+            let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+            for &k in &idxs {
+                if let Some(p) = events[k].place.as_deref() {
+                    *counts.entry(p).or_insert(0) += 1;
+                }
+            }
+            let mut best: Option<&str> = None;
+            let mut best_n = 0i64;
+            for &k in &idxs {
+                if let Some(p) = events[k].place.as_deref() {
+                    let c = counts.get(p).copied().unwrap_or(0);
+                    if c > best_n {
+                        best_n = c;
+                        best = Some(p);
+                    }
+                }
+            }
+            let span = format_event_range(first.started_at, last.ended_at);
+            let name = match best {
+                Some(p) => format!("{p} · {span}"),
+                None => span,
+            };
+            TripRow {
+                id: format!("trip-{n}"),
+                name,
+                place: best.map(str::to_string),
+                started_at: first.started_at,
+                ended_at: last.ended_at,
+                stop_count: idxs.len() as i64,
+                asset_count,
+                event_ids: idxs.iter().map(|&k| events[k].id).collect(),
+            }
+        })
+        .collect();
+    trips.reverse();
+    Ok(trips)
+}
+
 /// Top picks for an event: sharpest first (quality_score), blurred excluded,
 /// unscored sink below scored. Powers the "best of this place" album pick.
 pub fn event_top_picks(
@@ -1675,10 +1774,350 @@ pub fn event_top_picks(
             })
         })
         .map_err(|e| format!("query event top picks: {e}"))?;
-    let mut out = Vec::new();
+        let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(|e| format!("event top pick row: {e}"))?);
     }
+    Ok(out)
+}
+
+// MARK: - Coverage curation (auto-best across days, stops, people, videos)
+
+/// One curated pick: the asset id, its composite score, and its kind.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratePick {
+    pub id: i64,
+    pub score: f64,
+    pub kind: String,
+}
+
+struct CurateCandidate {
+    id: i64,
+    kind: String,
+    taken: f64,
+    event_id: i64,
+    favorite: bool,
+    quality: Option<f64>,
+    megapixels: f64,
+    named_faces: i64,
+    dhash: Option<String>,
+    day: i64,
+    score: f64,
+}
+
+/// Balanced auto-best across the given events: every (day × stop) cell with
+/// candidates earns picks first (largest-remainder quotas), so a 12-pick
+/// pull from a 4-day trip cannot spend everything on one afternoon.
+///
+/// Pipeline per candidate:
+/// 1. Hard exclusions (SQL): missing files, blurred shots, and non-keeper
+///    members of duplicate/near groups. An undecided group keeps exactly one
+///    representative — the stored keeper, else the lowest id (mirrors the
+///    review UI's keeperMember) — because re-deciding keepers is the review
+///    flow's job, not curation's.
+/// 2. Buckets of (UTC day × event): day coverage and stop coverage fall out
+///    of the same quota.
+/// 3. Composite score: favorite +50, capped named-face count ×15, sharpness
+///    percentile ×25 (unscored photos take the median), resolution capped
+///    at 10. Videos compete on favorite/faces/resolution (no sharpness).
+/// 4. Diversity veto: a photo is skipped when its dHash sits within
+///    NEAR_DUPE_THRESHOLD of an already-picked photo.
+/// 5. Video quota: ~20% of slots go to top videos across distinct stops, so
+///    clips are interleaved with stills instead of crowded out.
+pub fn curate_picks(
+    conn: &Connection,
+    event_ids: &[i64],
+    limit: i64,
+) -> Result<Vec<CuratePick>, String> {
+    if event_ids.is_empty() {
+        return Err("curate_picks needs event_ids".into());
+    }
+    let limit = limit.clamp(1, 200) as usize;
+    let ids_json = serde_json::to_string(event_ids).map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.kind, COALESCE(a.captured_at, a.modified),
+                    ea.event_id, COALESCE(a.favorite, 0), a.quality_score,
+                    a.width, a.height, a.dhash
+             FROM assets a JOIN event_assets ea ON ea.asset_id = a.id
+             WHERE ea.event_id IN (SELECT value FROM json_each(?1))
+               AND a.missing = 0 AND COALESCE(a.blurred, 0) = 0
+               AND NOT (
+                 a.duplicate_group_id IS NOT NULL AND a.id != COALESCE(
+                   (SELECT dg.kept_id FROM duplicate_groups dg WHERE dg.id = a.duplicate_group_id),
+                   (SELECT MIN(a2.id) FROM assets a2 WHERE a2.duplicate_group_id = a.duplicate_group_id))
+               )
+               AND NOT (
+                 a.near_group_id IS NOT NULL AND a.id != COALESCE(
+                   (SELECT ng.kept_id FROM near_groups ng WHERE ng.id = a.near_group_id),
+                   (SELECT MIN(a3.id) FROM assets a3 WHERE a3.near_group_id = a.near_group_id))
+               )",
+        )
+        .map_err(|e| format!("prepare curate candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![ids_json], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(|e| format!("query curate candidates: {e}"))?;
+    let mut cands: Vec<CurateCandidate> = Vec::new();
+    for row in rows {
+        let (id, kind, taken, event_id, fav, quality, w, h, dhash) =
+            row.map_err(|e| format!("curate candidate row: {e}"))?;
+        let mp = match (w, h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w as f64 * h as f64) / 1_000_000.0,
+            _ => 0.0,
+        };
+        cands.push(CurateCandidate {
+            id,
+            kind,
+            taken,
+            event_id,
+            favorite: fav != 0,
+            quality,
+            megapixels: mp,
+            named_faces: 0,
+            dhash,
+            day: (taken / 86400.0).floor() as i64,
+            score: 0.0,
+        });
+    }
+    if cands.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Named-face counts per candidate (distinct named clusters on its path).
+    {
+        let cand_ids: Vec<i64> = cands.iter().map(|c| c.id).collect();
+        let cand_json = serde_json::to_string(&cand_ids).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, COUNT(DISTINCT fc.id) FROM assets a
+                 JOIN faces f ON f.path = a.path
+                 JOIN face_clusters fc ON fc.id = f.cluster_id
+                 WHERE a.id IN (SELECT value FROM json_each(?1))
+                   AND fc.name IS NOT NULL AND TRIM(fc.name) <> ''
+                 GROUP BY a.id",
+            )
+            .map_err(|e| format!("prepare curate faces: {e}"))?;
+        let rows = stmt
+            .query_map(params![cand_json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("query curate faces: {e}"))?;
+        let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for row in rows {
+            let (id, n) = row.map_err(|e| format!("curate face row: {e}"))?;
+            counts.insert(id, n);
+        }
+        for c in &mut cands {
+            c.named_faces = counts.get(&c.id).copied().unwrap_or(0);
+        }
+    }
+
+    // Sharpness percentile over scored photos; unscored photos take median.
+    let mut scored: Vec<f64> = cands
+        .iter()
+        .filter(|c| c.kind == "image")
+        .filter_map(|c| c.quality)
+        .collect();
+    scored.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let quality_pts = |q: Option<f64>| -> f64 {
+        if scored.is_empty() {
+            return 12.5;
+        }
+        match q {
+            Some(v) => {
+                let rank = scored.partition_point(|&x| x < v) as f64;
+                let denom = (scored.len() - 1).max(1) as f64;
+                (rank / denom) * 25.0
+            }
+            None => 12.5,
+        }
+    };
+
+    for c in &mut cands {
+        let base = (if c.favorite { 50.0 } else { 0.0 })
+            + (c.named_faces.min(3) as f64) * 15.0
+            + c.megapixels.min(10.0);
+        c.score = base
+            + if c.kind == "image" {
+                quality_pts(c.quality)
+            } else {
+                0.0
+            };
+    }
+
+    let mut picked: Vec<usize> = Vec::new();
+    let mut picked_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Diversity veto: skip a photo within dHash threshold of a picked photo.
+    let vetoed = |cands: &[CurateCandidate], idx: usize, picked: &[usize]| -> bool {
+        let Some(ref dh) = cands[idx].dhash else {
+            return false;
+        };
+        for &p in picked {
+            if cands[p].kind != "image" {
+                continue;
+            }
+            if let Some(ref pdh) = cands[p].dhash {
+                if dhash_distance(dh, pdh).map_or(false, |d| d <= NEAR_DUPE_THRESHOLD) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    macro_rules! take {
+        ($idx:expr) => {{
+            picked_ids.insert(cands[$idx].id);
+            picked.push($idx);
+        }};
+    }
+
+    // Phase 1 — video quota (~20%, at least 1 when clips exist).
+    let videos: Vec<usize> = {
+        let mut v: Vec<usize> = cands.iter().enumerate()
+            .filter(|(_, c)| c.kind == "video")
+            .map(|(i, _)| i)
+            .collect();
+        v.sort_by(|&a, &b| {
+            cands[b].score
+                .partial_cmp(&cands[a].score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        v
+    };
+    let video_quota = (limit * 20 / 100).clamp(0, videos.len()).max(if videos.is_empty() { 0 } else { 1 }).min(limit);
+    {
+        let mut used_buckets: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        for &i in &videos {
+            if picked.len() >= video_quota {
+                break;
+            }
+            let key = (cands[i].day, cands[i].event_id);
+            if used_buckets.contains(&key) {
+                continue;
+            }
+            used_buckets.insert(key);
+            take!(i);
+        }
+    }
+
+    // Phase 2 — photo quotas per (day × stop) cell, largest remainder.
+    let mut buckets: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    for (i, c) in cands.iter().enumerate() {
+        if c.kind != "image" || picked_ids.contains(&c.id) {
+            continue;
+        }
+        buckets.entry((c.day, c.event_id)).or_default().push(i);
+    }
+    for members in buckets.values_mut() {
+        members.sort_by(|&a, &b| {
+            cands[b].score
+                .partial_cmp(&cands[a].score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+    }
+    let photo_slots = limit.saturating_sub(picked.len());
+    let nb = buckets.len();
+    if nb > 0 && photo_slots > 0 {
+        let base = photo_slots / nb;
+        let mut rem = photo_slots % nb;
+        for members in buckets.values() {
+            let mut n = 0usize;
+            for &i in members {
+                if n >= base || picked.len() >= limit {
+                    break;
+                }
+                if picked_ids.contains(&cands[i].id) || vetoed(&cands, i, &picked) {
+                    continue;
+                }
+                take!(i);
+                n += 1;
+            }
+        }
+        // Remainder to the richest cells first.
+        let mut order: Vec<(i64, i64)> = buckets.keys().copied().collect();
+        order.sort_by(|a, b| {
+            let (ca, cb) = (buckets[a].len(), buckets[b].len());
+            cb.cmp(&ca).then(
+                buckets[b].first().map(|&i| cands[i].score.to_bits()).unwrap_or(0)
+                    .cmp(&buckets[a].first().map(|&i| cands[i].score.to_bits()).unwrap_or(0)),
+            )
+        });
+        for key in order {
+            if rem == 0 || picked.len() >= limit {
+                break;
+            }
+            let mut gave = false;
+            for &i in &buckets[&key] {
+                if picked.len() >= limit {
+                    break;
+                }
+                if picked_ids.contains(&cands[i].id) || vetoed(&cands, i, &picked) {
+                    continue;
+                }
+                take!(i);
+                gave = true;
+                break;
+            }
+            if gave {
+                rem -= 1;
+            }
+        }
+    }
+
+    // Phase 3 — fill leftovers globally (vetoed quota cells): remaining
+    // photos by score, then remaining videos.
+    if picked.len() < limit {
+        let mut rest: Vec<usize> = (0..cands.len())
+            .filter(|&i| !picked_ids.contains(&cands[i].id))
+            .collect();
+        rest.sort_by(|&a, &b| {
+            let ka = if cands[a].kind == "video" { 1 } else { 0 };
+            let kb = if cands[b].kind == "video" { 1 } else { 0 };
+            ka.cmp(&kb).then(
+                cands[b].score
+                    .partial_cmp(&cands[a].score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        for i in rest {
+            if picked.len() >= limit {
+                break;
+            }
+            if cands[i].kind == "image" && vetoed(&cands, i, &picked) {
+                continue;
+            }
+            take!(i);
+        }
+    }
+
+    let mut out: Vec<CuratePick> = picked
+        .into_iter()
+        .map(|i| CuratePick {
+            id: cands[i].id,
+            score: cands[i].score,
+            kind: cands[i].kind.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    out.truncate(limit);
     Ok(out)
 }
 
@@ -4733,6 +5172,158 @@ mod tests {
         let one = event_top_picks(&conn, eid, 1).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].path, "/b.jpg", "limit honored");
+    }
+
+    #[test]
+    fn trips_group_contiguous_stops_and_split_far_gaps() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let day = 1_700_000_000.0;
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // Trip A: two stops 6h apart, same coords.
+        upsert_asset(&conn, &asset("/a1.jpg", 1, day), scan).unwrap();
+        upsert_asset(&conn, &asset("/a2.jpg", 1, day + 21600.0), scan).unwrap();
+        // Trip B: 4 days later (past the 48h trip gap).
+        upsert_asset(&conn, &asset("/b1.jpg", 1, day + 345600.0), scan).unwrap();
+        // Side quest: 1h after a2 but 100km away (past the 50km trip radius).
+        upsert_asset(&conn, &asset("/c1.jpg", 1, day + 25200.0), scan).unwrap();
+        conn.execute("UPDATE assets SET latitude = 37.7749, longitude = -122.4194 WHERE path != '/c1.jpg'", []).unwrap();
+        conn.execute("UPDATE assets SET latitude = 38.5, longitude = -121.0 WHERE path = '/c1.jpg'", []).unwrap();
+
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 4, "each stop is its own event at 500m");
+        let trips = trips_list(&conn).unwrap();
+        assert_eq!(trips.len(), 3, "A holds, B splits on time, C splits on distance");
+        assert_eq!(trips[0].stop_count, 1, "newest trip first");
+        assert_eq!(trips[0].asset_count, 1);
+        assert_eq!(trips[2].stop_count, 2, "trip A holds both stops");
+        assert_eq!(trips[2].asset_count, 2);
+        assert_eq!(trips[2].event_ids.len(), 2);
+        let total: i64 = trips.iter().map(|t| t.asset_count).sum();
+        assert_eq!(total, 4, "every asset belongs to exactly one trip");
+    }
+
+    #[test]
+    fn curate_picks_cover_cells_skip_dup_extras_and_prefer_favorites() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let day = 1_700_000_000.0;
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // Day 1 cell: favorite (soft) + sharp keeper + its dup extra.
+        upsert_asset(&conn, &asset("/fav1.jpg", 1, day), scan).unwrap();
+        upsert_asset(&conn, &asset("/sharp1.jpg", 1, day + 1800.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/extra1.jpg", 1, day + 1900.0), scan).unwrap();
+        // Day 2 cell: same shape, next UTC day.
+        upsert_asset(&conn, &asset("/fav2.jpg", 1, day + 90000.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/sharp2.jpg", 1, day + 91800.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/extra2.jpg", 1, day + 91900.0), scan).unwrap();
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 2);
+        let id_of = |p: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", [p], |r| r.get(0)).unwrap()
+        };
+        set_favorite(&conn, id_of("/fav1.jpg"), true).unwrap();
+        set_favorite(&conn, id_of("/fav2.jpg"), true).unwrap();
+        apply_quality(&conn, id_of("/fav1.jpg"), 50.0, false).unwrap();
+        apply_quality(&conn, id_of("/sharp1.jpg"), 900.0, false).unwrap();
+        apply_quality(&conn, id_of("/extra1.jpg"), 100.0, false).unwrap();
+        apply_quality(&conn, id_of("/fav2.jpg"), 60.0, false).unwrap();
+        apply_quality(&conn, id_of("/sharp2.jpg"), 850.0, false).unwrap();
+        apply_quality(&conn, id_of("/extra2.jpg"), 120.0, false).unwrap();
+        // Dup groups keep the sharp copy; the extra must never curate.
+        for (n, (keep, extra)) in [("/sharp1.jpg", "/extra1.jpg"), ("/sharp2.jpg", "/extra2.jpg")]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO duplicate_groups (sha256, size_bytes, kept_id, waste_bytes, resolved, created_at)
+                 VALUES (?1, 1, ?2, 0, 0, 1)",
+                rusqlite::params![format!("test-sha-{n}"), id_of(keep)],
+            )
+            .unwrap();
+            let gid: i64 = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE assets SET duplicate_group_id = ?1, is_duplicate = 1 WHERE path = ?2 OR path = ?3",
+                rusqlite::params![gid, keep, extra],
+            )
+            .unwrap();
+        }
+        let rows = events_list(&conn).unwrap();
+        let eids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+
+        let four = curate_picks(&conn, &eids, 4).unwrap();
+        assert_eq!(four.len(), 4, "two cells × quota two");
+        let paths: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT path FROM assets WHERE id IN (SELECT value FROM json_each(?1))")
+                .unwrap();
+            let json = serde_json::to_string(&four.iter().map(|p| p.id).collect::<Vec<_>>()).unwrap();
+            stmt.query_map([json], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        for keep in ["/fav1.jpg", "/sharp1.jpg", "/fav2.jpg", "/sharp2.jpg"] {
+            assert!(paths.contains(&keep.to_string()), "keeps {keep}");
+        }
+        assert!(!paths.contains(&"/extra1.jpg".to_string()), "dup extras never curate");
+        assert!(!paths.contains(&"/extra2.jpg".to_string()), "dup extras never curate");
+
+        // Limit 2: one slot per cell, and the favorite wins its cell despite
+        // middling sharpness (explicit signal beats the quality percentile).
+        let two = curate_picks(&conn, &eids, 2).unwrap();
+        assert_eq!(two.len(), 2);
+        let ids: Vec<i64> = two.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&id_of("/fav1.jpg")), "favorite wins day 1");
+        assert!(ids.contains(&id_of("/fav2.jpg")), "favorite wins day 2");
+    }
+
+    #[test]
+    fn curate_picks_reserve_video_slots_and_boost_named_faces() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let day = 1_700_000_000.0;
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let mut video = asset("/clip.mp4", 1, day + 300.0);
+        video.kind = "video".into();
+        video.ext = "mp4".into();
+        upsert_asset(&conn, &video, scan).unwrap();
+        // Ten photos around it: quality spread so the mid-pack named face can win.
+        for (i, q) in [900.0, 800.0, 700.0, 500.0, 400.0, 300.0, 200.0, 150.0, 100.0, 50.0]
+            .into_iter()
+            .enumerate()
+        {
+            let p = format!("/p{i}.jpg");
+            upsert_asset(&conn, &asset(&p, 1, day + 600.0 + i as f64 * 60.0), scan).unwrap();
+            let id: i64 = conn
+                .query_row("SELECT id FROM assets WHERE path = ?1", [&p], |r| r.get(0))
+                .unwrap();
+            apply_quality(&conn, id, q, false).unwrap();
+        }
+        // The 500-sharpness photo shows a named person.
+        conn.execute(
+            "INSERT INTO face_clusters (face_count, created_at, name) VALUES (1, 1, 'Amol')",
+            [],
+        )
+        .unwrap();
+        let cid: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at)
+             VALUES ('/p3.jpg', ?1, 0.1, 0.1, 0.2, 0.2, 0.9, 1)",
+            [cid],
+        )
+        .unwrap();
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 1);
+        let eid = events_list(&conn).unwrap()[0].id;
+
+        // Limit 5 over one cell: 1 video quota + 4 photos.
+        let picks = curate_picks(&conn, &[eid], 5).unwrap();
+        assert_eq!(picks.len(), 5);
+        let kinds: Vec<String> = picks.iter().map(|p| p.kind.clone()).collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "video").count(), 1, "video quota holds one slot");
+        let ids: Vec<i64> = picks.iter().map(|p| p.id).collect();
+        let named: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/p3.jpg'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ids.contains(&named), "named face tips the mid-pack photo in");
     }
 
     #[test]

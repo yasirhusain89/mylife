@@ -966,6 +966,58 @@ export async function addEventPicksToAlbum(
   return added;
 }
 
+export type TripRow = {
+  id: string;
+  name: string;
+  place: string | null;
+  startedAt: number;
+  endedAt: number;
+  stopCount: number;
+  assetCount: number;
+  eventIds: number[];
+};
+
+/** Trip stand-in: the mock library clusters into one event, so one trip.
+ *  Named like the real builder (date span, never the event name) so event
+ *  assertions don't collide with the trip card. */
+export async function tripsList(): Promise<TripRow[]> {
+  if (events.length === 0) return [];
+  const first = events[events.length - 1];
+  const last = events[0];
+  const span = (t: number) =>
+    new Date(t * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return [
+    {
+      id: "trip-0",
+      name: `Trip ${span(first.startedAt)}`,
+      place: first.place,
+      startedAt: first.startedAt,
+      endedAt: last.endedAt,
+      stopCount: events.length,
+      assetCount: events.reduce((s, e) => s + e.assetCount, 0),
+      eventIds: events.map((e) => e.id)
+    }
+  ];
+}
+
+/** Trip curation stand-in: first members across the given events. */
+export async function curatePicksToAlbum(
+  eventIds: number[],
+  albumId: number,
+  limit = 24,
+): Promise<number> {
+  const ids: number[] = [];
+  for (const eid of eventIds) {
+    for (const m of await eventAssets(eid)) {
+      if (ids.length >= Math.max(1, limit)) break;
+      if (!ids.includes(m.id)) ids.push(m.id);
+    }
+    if (ids.length >= Math.max(1, limit)) break;
+  }
+  const { added } = await albumAdd(albumId, ids);
+  return added;
+}
+
 /** SSD ingest stand-in: everything "copies" instantly, nothing fails. */
 export async function ingestCopy(src: string, dest: string): Promise<IngestSummary> {
   void src;

@@ -209,6 +209,17 @@ async fn events(State(state): State<ApiState>) -> Response {
     }
 }
 
+async fn trips(State(state): State<ApiState>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::trips_list(&conn) {
+        Ok(rows) => (cors(), Json(rows)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn albums(State(state): State<ApiState>) -> Response {
     let conn = match lock(&state) {
         Ok(g) => g,
@@ -250,8 +261,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/root-assets", get(root_assets))
         .route("/api/clusters", get(clusters))
         .route("/api/events", get(events))
+        .route("/api/trips", get(trips))
         .route("/api/albums", get(albums).post(album_create).options(preflight))
         .route("/api/albums/:id/add", post(album_add).options(preflight))
+        .route("/api/curate", post(curate).options(preflight))
         .route("/api/tags", get(tags))
         .route("/api/tags/run", post(tags_run).options(preflight))
         .route("/api/favorites", post(favorite_set).options(preflight))
@@ -331,6 +344,32 @@ async fn album_add(
     };
     match crate::db::album_add_assets(&conn, id, &body.asset_ids) {
         Ok(added) => (cors(), Json(serde_json::json!({ "added": added }))).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurateBody {
+    event_ids: Vec<i64>,
+    album_id: i64,
+    limit: Option<i64>,
+}
+
+/// Balanced coverage picks across events into an album (HTTP twin of the
+/// curate_picks_to_album Tauri command).
+async fn curate(state: State<ApiState>, body: axum::Json<CurateBody>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let picks = match crate::db::curate_picks(&conn, &body.event_ids, body.limit.unwrap_or(24).clamp(1, 200)) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let ids: Vec<i64> = picks.into_iter().map(|p| p.id).collect();
+    match crate::db::album_add_assets(&conn, body.album_id, &ids) {
+        Ok(added) => (cors(), Json(added)).into_response(),
         Err(e) => err(e),
     }
 }

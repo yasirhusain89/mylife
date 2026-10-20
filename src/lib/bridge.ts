@@ -112,6 +112,8 @@ export const facesCount = pick("facesCount");
 export const clusterEvents = pick("clusterEvents");
 export const eventsList = pickRead("eventsList");
 export const eventAssets = pick("eventAssets");
+export const tripsList = pickRead("tripsList");
+export const curatePicksToAlbum = pick("curatePicksToAlbum");
 export const renameEvent = pick("renameEvent");
 export const resolvePlaces = pick("resolvePlaces");
 export const onGeocodeProgress = pick("onGeocodeProgress");
@@ -193,6 +195,7 @@ export type {
   PipelineSummary,
   ResolvePlacesSummary,
   TrashEntry,
+  TripRow,
   ScanRoot,
   SceneTag,
   SceneTagCount,

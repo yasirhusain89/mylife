@@ -2215,7 +2215,9 @@ fn library_list(
     )
 }
 
-/// Best-of-place pick: the event's sharpest members straight into an album.
+/// Best-of-place pick: balanced coverage curation (day × stop quotas,
+/// favorites, named faces, diversity, video mix) straight into an album.
+/// Same contract as the old sharpness-only rank, strictly better picks.
 #[tauri::command]
 fn add_event_picks_to_album(
     conn: tauri::State<'_, DbState>,
@@ -2224,9 +2226,31 @@ fn add_event_picks_to_album(
     limit: Option<i64>,
 ) -> Result<i64, String> {
     let conn = conn.lock().map_err(|_| "database lock poisoned")?;
-    let picks = db::event_top_picks(&conn, event_id, limit.unwrap_or(12).clamp(1, 100))?;
+    let picks = db::curate_picks(&conn, &[event_id], limit.unwrap_or(12).clamp(1, 200))?;
     let ids: Vec<i64> = picks.into_iter().map(|p| p.id).collect();
     db::album_add_assets(&conn, album_id, &ids)
+}
+
+/// Trip-scale curation: balanced picks across several events (a trip, a date
+/// range's stops, handpicked events) into an album.
+#[tauri::command]
+fn curate_picks_to_album(
+    conn: tauri::State<'_, DbState>,
+    event_ids: Vec<i64>,
+    album_id: i64,
+    limit: Option<i64>,
+) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let picks = db::curate_picks(&conn, &event_ids, limit.unwrap_or(24).clamp(1, 200))?;
+    let ids: Vec<i64> = picks.into_iter().map(|p| p.id).collect();
+    db::album_add_assets(&conn, album_id, &ids)
+}
+
+/// Trip → stop hierarchy over the event list (dynamic, see db::trips_list).
+#[tauri::command]
+fn trips_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::TripRow>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::trips_list(&conn)
 }
 
 #[tauri::command]
@@ -3015,6 +3039,8 @@ pub fn run() {
             cluster_events,
             events_list,
             event_assets,
+            trips_list,
+            curate_picks_to_album,
             rename_event,
             resolve_places,
             albums_list,
@@ -4086,6 +4112,7 @@ mod geocode_tests {
             "open Pacific matches no fence"
         );
     }
+
 
     #[test]
     fn nominatim_bbox_parses_and_rejects_junk() {
