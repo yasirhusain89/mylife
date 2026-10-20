@@ -106,6 +106,27 @@
   let stats = $state<LibraryStats | null>(null);
   let roots = $state<ScanRoot[]>([]);
   const RECENT_SEARCH_KEY = "fotoflow-recent-searches";
+  const FOLDERS_OPEN_KEY = "fotoflow-folders-open";
+
+  function loadFoldersOpen(): boolean {
+    try {
+      if (typeof localStorage === "undefined") return true;
+      const raw = localStorage.getItem(FOLDERS_OPEN_KEY);
+      return raw === null ? true : JSON.parse(raw) !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  function saveFoldersOpen(open: boolean) {
+    try {
+      localStorage.setItem(FOLDERS_OPEN_KEY, JSON.stringify(open));
+    } catch {
+      /* storage unavailable: preference just doesn't persist */
+    }
+  }
+
+  let foldersOpen = $state(loadFoldersOpen());
 
   function loadRecentSearches(): string[] {
     try {
@@ -1786,8 +1807,23 @@
     {/if}
 
     {#if roots.length}
-      <h3 class="sub">Indexed folders</h3>
-      <ul class="roots">
+      <div class="roots-head">
+        <h3 class="sub">Indexed folders</h3>
+        <button
+          type="button"
+          class="tiny"
+          aria-expanded={foldersOpen}
+          aria-controls="indexed-folders"
+          onclick={() => {
+            foldersOpen = !foldersOpen;
+            saveFoldersOpen(foldersOpen);
+          }}
+        >
+          {foldersOpen ? "Hide" : `Show (${roots.length})`}
+        </button>
+      </div>
+      {#if foldersOpen}
+      <ul class="roots" id="indexed-folders">
         {#each roots as r (r.root)}
           <li>
             <span class="root" title={r.root}>{r.root}</span>
@@ -1825,6 +1861,7 @@
           </li>
         {/each}
       </ul>
+      {/if}
     {/if}
 
     {#if progress}
@@ -2843,6 +2880,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .roots-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.8rem;
+  }
+  .roots-head .sub {
+    flex: 1;
   }
   .roots {
     list-style: none;

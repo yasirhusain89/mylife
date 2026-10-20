@@ -119,6 +119,20 @@ test("indexed folders list every scanned root", async ({ page }) => {
   await expect(roots.getByText("/mock/vacation", { exact: true })).toBeVisible();
 });
 
+test("indexed folders collapse, expand, and remember across reload", async ({ page }) => {
+  await expect(page.getByRole("heading", { name: "Indexed folders" })).toBeVisible();
+  await expect(page.getByText("/photos", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Hide" }).click();
+  await expect(page.getByText("/photos", { exact: true })).toHaveCount(0);
+  const show = page.getByRole("button", { name: /^Show \(\d+\)$/ });
+  await expect(show).toBeVisible();
+  await page.reload();
+  await expect(page.getByText("/photos", { exact: true })).toHaveCount(0);
+  await show.click();
+  await expect(page.getByText("/photos", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
