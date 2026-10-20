@@ -202,6 +202,140 @@ async fn import_folder(
     .map_err(|e| format!("import task join failed: {e}"))?
 }
 
+/// Media extensions mirrored from the engine's IMAGE_EXTS + VIDEO_EXTS so
+/// ingest copies exactly what a later import would index.
+const MEDIA_EXTS: &[&str] = &[
+    "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "gif", "webp", "bmp", "dng", "raw", "cr2",
+    "cr3", "nef", "arw", "orf", "rw2", "raf", "avif",
+    "mov", "mp4", "m4v", "avi", "mpg", "mpeg", "hevc", "mkv", "webm", "3gp", "mts", "m2ts",
+];
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSummary {
+    pub copied: i64,
+    pub skipped: i64,
+    pub failed: Vec<String>,
+    pub bytes: i64,
+    pub total: i64,
+    pub total_bytes: i64,
+    pub dest: String,
+}
+
+fn collect_media(root: &std::path::Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Symlinks (and everything non-regular) are skipped: no loop risk,
+        // no AppleDouble-style resource forks sneaking into the copy.
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_media(&path, out);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let is_media = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| MEDIA_EXTS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false);
+        if is_media {
+            out.push((path, meta.len()));
+        }
+    }
+}
+
+/// Copies a camera card / device folder to an SSD (or any destination),
+/// mirroring the tree. Pure filesystem work — no DB writes — so it is a
+/// plain function; the Tauri command below only adds progress events.
+pub fn ingest_copy_tree(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    mut on_progress: impl FnMut(&IngestSummary),
+) -> Result<IngestSummary, String> {
+    if !src.is_dir() {
+        return Err(format!("ingest source is not a folder: {}", src.display()));
+    }
+    if dest.starts_with(src) {
+        return Err("ingest destination cannot be inside the source folder".into());
+    }
+    let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    collect_media(src, &mut files);
+    files.sort();
+    let total_bytes: i64 = files.iter().map(|(_, s)| *s as i64).sum();
+    let mut summary = IngestSummary {
+        total: files.len() as i64,
+        total_bytes,
+        dest: dest.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    for (path, size) in &files {
+        let rel = path
+            .strip_prefix(src)
+            .map_err(|e| format!("relativize {}: {e}", path.display()))?;
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                summary.failed.push(format!("create {}: {e}", parent.display()));
+                on_progress(&summary);
+                continue;
+            }
+        }
+        // Identical file already there: skip instead of re-copying gigabytes.
+        if let Ok(m) = std::fs::metadata(&target) {
+            if m.is_file() && m.len() == *size {
+                summary.skipped += 1;
+                summary.bytes += *size as i64;
+                on_progress(&summary);
+                continue;
+            }
+        }
+        match std::fs::copy(path, &target) {
+            Ok(_) => {
+                let got = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+                if got != *size {
+                    let _ = std::fs::remove_file(&target);
+                    summary.failed.push(format!(
+                        "size mismatch after copy (want {size}, got {got}): {}",
+                        path.display()
+                    ));
+                } else {
+                    summary.copied += 1;
+                    summary.bytes += *size as i64;
+                }
+            }
+            Err(e) => summary.failed.push(format!("copy {}: {e}", path.display())),
+        }
+        on_progress(&summary);
+    }
+    Ok(summary)
+}
+
+/// Tauri entry point: copies a source folder to a destination with progress
+/// on `ingest-progress`. Desktop-only (like the folder picker): there is no
+/// HTTP equivalent, the browser cannot read arbitrary disk paths.
+#[tauri::command]
+async fn ingest_copy(app: tauri::AppHandle, src: String, dest: String) -> Result<IngestSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ingest_copy_tree(std::path::Path::new(&src), std::path::Path::new(&dest), |s| {
+            let _ = app.emit("ingest-progress", s);
+        })
+    })
+    .await
+    .map_err(|e| format!("ingest task join failed: {e}"))?
+}
+
 /// Resumable metadata enrichment: pulls batches of assets with no `stat_at` and
 /// asks the engine for EXIF/dimension data. Completed rows are never revisited,
 /// so a stopped pass can simply be run again.
@@ -1888,6 +2022,8 @@ fn slugify(name: &str) -> String {
 /// Copies an event's or album's photos and videos into `dest_dir/<name-slug>/`:
 /// - mode "drive": byte-for-byte copies (full quality, original extensions)
 /// - mode "whatsapp": recoded 1280px JPEGs + 1280x720 MP4s via the engine
+/// - mode "compact": same recode as whatsapp but keeps everything callers
+///   pass in (space-saver bundles of dupes + blurred, chosen explicitly)
 ///
 /// Blurred shots and known duplicates are excluded from WhatsApp bundles;
 /// Drive bundles keep everything except missing files.
@@ -1896,21 +2032,23 @@ async fn export_bundle(
     app: tauri::AppHandle,
     event_id: Option<i64>,
     album_id: Option<i64>,
+    asset_ids: Option<Vec<i64>>,
     event_name: String,
     mode: String,
     dest_dir: String,
 ) -> Result<ExportSummary, String> {
-    if mode != "drive" && mode != "whatsapp" {
+    if mode != "drive" && mode != "whatsapp" && mode != "compact" {
         return Err(format!("unknown export mode '{mode}'"));
     }
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
-        let assets = match (event_id, album_id) {
-            (Some(eid), _) => db::event_assets(&conn, eid)?,
-            (_, Some(aid)) => db::album_assets(&conn, aid)?,
-            (None, None) => return Err("export_bundle needs event_id or album_id".into()),
+        let assets = match (event_id, album_id, asset_ids) {
+            (Some(eid), _, _) => db::event_assets(&conn, eid)?,
+            (_, Some(aid), _) => db::album_assets(&conn, aid)?,
+            (_, _, Some(ids)) => db::assets_by_ids(&conn, &ids)?,
+            (None, None, None) => return Err("export_bundle needs event_id, album_id or asset_ids".into()),
         };
         let blurred_set: std::collections::HashSet<String> = if mode == "whatsapp" {
             conn.prepare("SELECT path FROM assets WHERE blurred = 1")
@@ -1927,7 +2065,13 @@ async fn export_bundle(
         let subdir = format!(
             "{}{}",
             slugify(&event_name),
-            if mode == "whatsapp" { "-whatsapp" } else { "" }
+            if mode == "whatsapp" {
+                "-whatsapp"
+            } else if mode == "compact" {
+                "-compact"
+            } else {
+                ""
+            }
         );
         let out_dir = std::path::Path::new(&dest_dir).join(&subdir);
         std::fs::create_dir_all(&out_dir).map_err(|e| format!("create {out_dir:?}: {e}"))?;
@@ -2047,6 +2191,20 @@ fn library_list(
             limit: limit.unwrap_or(200).clamp(1, 1000),
         },
     )
+}
+
+/// Best-of-place pick: the event's sharpest members straight into an album.
+#[tauri::command]
+fn add_event_picks_to_album(
+    conn: tauri::State<'_, DbState>,
+    event_id: i64,
+    album_id: i64,
+    limit: Option<i64>,
+) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    let picks = db::event_top_picks(&conn, event_id, limit.unwrap_or(12).clamp(1, 100))?;
+    let ids: Vec<i64> = picks.into_iter().map(|p| p.id).collect();
+    db::album_add_assets(&conn, album_id, &ids)
 }
 
 #[tauri::command]
@@ -2822,8 +2980,10 @@ pub fn run() {
             album_assets,
             album_add,
             album_remove,
+            add_event_picks_to_album,
             export_highlight,
             export_bundle,
+            ingest_copy,
             library_list,
             library_count,
             library_months,
@@ -3797,6 +3957,40 @@ mod tests {
             "embed ordering: variant={:.4} noise={:.4} dim={dim}",
             hits[0].score, hits[1].score
         );
+    }
+
+    #[test]
+    fn ingest_copy_mirrors_media_skips_identical_and_verifies() {
+        let src = std::env::temp_dir().join("ff-ingest-src");
+        let dest = std::env::temp_dir().join("ff-ingest-dest");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(src.join("DCIM")).unwrap();
+        std::fs::write(src.join("DCIM/a.jpg"), vec![b'x'; 100]).unwrap();
+        std::fs::write(src.join("DCIM/b.mp4"), vec![b'y'; 200]).unwrap();
+        std::fs::write(src.join("notes.txt"), b"ignore me").unwrap();
+
+        let mut seen = Vec::new();
+        let first = ingest_copy_tree(&src, &dest, |s| seen.push(s.copied)).unwrap();
+        assert_eq!((first.copied, first.skipped, first.total), (2, 0, 2));
+        assert_eq!(first.bytes, 300);
+        assert!(first.failed.is_empty());
+        assert_eq!(std::fs::read(dest.join("DCIM/a.jpg")).unwrap().len(), 100);
+        assert!(!dest.join("notes.txt").exists(), "non-media stays behind");
+        assert!(!seen.is_empty(), "progress reported");
+
+        // Second run: identical files skip, touched source re-copies.
+        let second = ingest_copy_tree(&src, &dest, |_| {}).unwrap();
+        assert_eq!((second.copied, second.skipped), (0, 2));
+        std::fs::write(src.join("DCIM/a.jpg"), vec![b'z'; 150]).unwrap();
+        let third = ingest_copy_tree(&src, &dest, |_| {}).unwrap();
+        assert_eq!((third.copied, third.skipped), (1, 1));
+        assert_eq!(std::fs::read(dest.join("DCIM/a.jpg")).unwrap().len(), 150);
+
+        // Destination inside the source is refused.
+        assert!(ingest_copy_tree(&src, &src.join("sub"), |_| {}).is_err());
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }
 

@@ -1575,6 +1575,37 @@ pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), 
     Ok(())
 }
 
+/// Top picks for an event: sharpest first (quality_score), blurred excluded,
+/// unscored sink below scored. Powers the "best of this place" album pick.
+pub fn event_top_picks(
+    conn: &Connection,
+    event_id: i64,
+    limit: i64,
+) -> Result<Vec<EventAssetRow>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.path, a.name, a.kind FROM assets a
+         JOIN event_assets ea ON ea.asset_id = a.id
+         WHERE ea.event_id = ?1 AND a.missing = 0 AND COALESCE(a.blurred, 0) = 0
+         ORDER BY COALESCE(a.quality_score, -1) DESC, a.id
+         LIMIT ?2",
+    ).map_err(|e| format!("prepare event top picks: {e}"))?;
+    let rows = stmt
+        .query_map(params![event_id, limit.max(1)], |r| {
+            Ok(EventAssetRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query event top picks: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("event top pick row: {e}"))?);
+    }
+    Ok(out)
+}
+
 // MARK: - Place names (reverse-geocode cache; the one network exception)
 
 /// Cache cell: 3-decimal rounding (~100m), so nearby centroids share a lookup.
@@ -1828,6 +1859,32 @@ pub fn album_remove_asset(
     )
     .map_err(|e| format!("album remove: {e}"))?;
     Ok(())
+}
+
+/// Adhoc asset list for exports (space-saver bundles). Missing rows are
+/// dropped here; unreadable files are skipped downstream like every source.
+pub fn assets_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<EventAssetRow>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, path, name, kind FROM assets WHERE id IN ({placeholders}) AND missing = 0");
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare assets by ids: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ids), |r| {
+            Ok(EventAssetRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query assets by ids: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("asset by id row: {e}"))?);
+    }
+    Ok(out)
 }
 
 pub fn album_assets(conn: &Connection, album_id: i64) -> Result<Vec<EventAssetRow>, String> {
@@ -4571,6 +4628,35 @@ mod tests {
         // Precise label: done.
         set_event_place(&conn, eid, "San Francisco, California").unwrap();
         assert!(events_missing_places(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn event_top_picks_rank_sharpest_and_skip_blurred() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let now_ts = 1_700_000_000.0;
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, now_ts), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, now_ts + 600.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/c.jpg", 1, now_ts + 1200.0), scan).unwrap();
+        let (events, _) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 1);
+        let rows = events_list(&conn).unwrap();
+        let eid = rows[0].id;
+        let id_of = |p: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", [p], |r| r.get(0)).unwrap()
+        };
+        apply_quality(&conn, id_of("/a.jpg"), 50.0, false).unwrap();
+        apply_quality(&conn, id_of("/b.jpg"), 200.0, false).unwrap();
+        apply_quality(&conn, id_of("/c.jpg"), 999.0, true).unwrap();
+
+        let picks = event_top_picks(&conn, eid, 12).unwrap();
+        assert_eq!(picks.len(), 2, "blurred excluded");
+        assert_eq!(picks[0].path, "/b.jpg", "sharpest first");
+        assert_eq!(picks[1].path, "/a.jpg");
+        let one = event_top_picks(&conn, eid, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].path, "/b.jpg", "limit honored");
     }
 }
 
