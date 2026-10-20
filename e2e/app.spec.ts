@@ -599,6 +599,54 @@ test("map tab plots located photos and jumps to the library", async ({ page }) =
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
 });
 
+test("map clusters nearby pins when zoomed out and dissolves on click", async ({ page }) => {
+  await page.getByRole("tab", { name: "Map", exact: true }).click();
+  const map = page.locator(".leaflet-container");
+  await expect(map).toBeVisible();
+  await expect.poll(() => map.locator(".leaflet-tile-pane img").count()).toBeGreaterThan(0);
+  // Fitted to the pins: every photo plots individually, no clusters.
+  await expect(map.locator(".map-cluster")).toHaveCount(0);
+  // Pull back to a city view: the 4 nearby located pins merge into one badge.
+  // animate:false: headless never settles Leaflet's zoom animation, so the
+  // test drives synchronous transitions (production keeps the animation).
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __ffMap?: { setView(a: [number, number], z: number, o?: { animate?: boolean }): void };
+    };
+    w.__ffMap!.setView([37.78, -122.42], 5, { animate: false });
+  });
+  const cluster = map.locator(".map-cluster");
+  await expect(cluster).toHaveCount(1);
+  await expect(cluster).toHaveText("4");
+  // Clicking the badge zooms toward street level.
+  const before = await page.evaluate(
+    () => (window as unknown as { __ffMap?: { getZoom(): number } }).__ffMap!.getZoom()
+  );
+  await cluster.click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as unknown as { __ffMap?: { getZoom(): number } }).__ffMap!.getZoom())
+    )
+    .toBeGreaterThan(before);
+  // Let the click's zoom animation settle: teleporting mid-flight leaves
+  // the animated zoom fighting the synchronous one.
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as unknown as { __ffMap?: { getZoom(): number } }).__ffMap!.getZoom())
+    )
+    .toBe(before + 2);
+  await page.waitForTimeout(400);
+  // Back at street level the badge is gone and pins plot individually.
+  // z17: the cluster cell (0.0007°) drops below the closest pin spacing.
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __ffMap?: { setView(a: [number, number], z: number, o?: { animate?: boolean }): void };
+    };
+    w.__ffMap!.setView([37.78, -122.42], 17, { animate: false });
+  });
+  await expect(map.locator(".map-cluster")).toHaveCount(0);
+});
+
 test("map layer toggle switches streets and terrain", async ({ page }) => {
   await page.getByRole("tab", { name: "Map", exact: true }).click();
   const map = page.locator(".leaflet-container");

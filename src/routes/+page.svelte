@@ -2211,6 +2211,34 @@
   const TILE_SOURCE_KEY = "fotoflow-map-source";
   const TILE_MAX_ZOOM = { osm: 19, topo: 17 } as const;
 
+  // Grid clustering: below this zoom nearby pins merge into count badges
+  // (one DOM marker per cluster instead of hundreds of canvas circles);
+  // at street level every pin renders individually. Cell ≈ 64 screen px.
+  const MAP_CLUSTER_BELOW = 12;
+  const CLUSTER_PX = 64;
+
+  function clusterCellDeg(zoom: number): number {
+    return ((CLUSTER_PX / 256) * 360) / Math.pow(2, zoom);
+  }
+
+  type PinCluster = { lat: number; lng: number; pins: MapPin[] };
+
+  function clusterPins(pins: MapPin[], zoom: number): PinCluster[] {
+    const cell = clusterCellDeg(zoom);
+    const groups = new Map<string, MapPin[]>();
+    for (const p of pins) {
+      const key = `${Math.floor(p.latitude / cell)}:${Math.floor(p.longitude / cell)}`;
+      const g = groups.get(key);
+      if (g) g.push(p);
+      else groups.set(key, [p]);
+    }
+    return [...groups.values()].map((group) => ({
+      lat: group.reduce((s, p) => s + p.latitude, 0) / group.length,
+      lng: group.reduce((s, p) => s + p.longitude, 0) / group.length,
+      pins: group
+    }));
+  }
+
   function loadTileSource(): "osm" | "topo" {
     try {
       if (typeof localStorage === "undefined") return "osm";
@@ -2278,27 +2306,55 @@
         keepBuffer: 2, // prefetch margin; larger values over-request whole worlds at low z
         updateInterval: 200 // fewer mid-pan bursts contending for the 2 download slots
       }).addTo(mapObj);
+      // Re-cluster on every finished pan/zoom; renderPins never fits bounds
+      // itself, so this can't loop (fitBounds is a one-shot on load).
+      mapObj.on("moveend", () => renderPins());
     }
-    renderPins();
+    renderPins(true);
     requestAnimationFrame(() => mapObj?.invalidateSize());
   }
 
-  function renderPins() {
+  function addPinMarker(p: MapPin) {
+    const m = L.circleMarker([p.latitude, p.longitude], {
+      radius: 7,
+      color: "#2f6bff",
+      weight: 2,
+      fillColor: "#2f6bff",
+      fillOpacity: 0.65
+    });
+    m.bindPopup(() => pinPopupEl(p));
+    pinLayer?.addLayer(m);
+  }
+
+  function renderPins(fit = false) {
     if (!mapObj) return;
     pinLayer?.remove();
     pinLayer = L.layerGroup().addTo(mapObj);
-    for (const p of mapPinsRows) {
-      const m = L.circleMarker([p.latitude, p.longitude], {
-        radius: 7,
-        color: "#2f6bff",
-        weight: 2,
-        fillColor: "#2f6bff",
-        fillOpacity: 0.65
-      });
-      m.bindPopup(() => pinPopupEl(p));
-      pinLayer.addLayer(m);
+    const zoom = mapObj.getZoom();
+    if (zoom < MAP_CLUSTER_BELOW) {
+      for (const c of clusterPins(mapPinsRows, zoom)) {
+        if (c.pins.length === 1) {
+          addPinMarker(c.pins[0]);
+        } else {
+          const m = L.marker([c.lat, c.lng], {
+            title: `${c.pins.length} photos`,
+            icon: L.divIcon({
+              className: "map-cluster-wrap",
+              html: `<div class="map-cluster" data-count="${c.pins.length}">${c.pins.length}</div>`,
+              iconSize: [36, 36]
+            })
+          });
+          // One click dissolves toward street level (never past maxZoom).
+          m.on("click", () =>
+            mapObj?.setView([c.lat, c.lng], Math.min(zoom + 2, mapObj?.getMaxZoom() ?? 18))
+          );
+          pinLayer.addLayer(m);
+        }
+      }
+    } else {
+      for (const p of mapPinsRows) addPinMarker(p);
     }
-    if (mapPinsRows.length > 0) {
+    if (fit && mapPinsRows.length > 0) {
       mapObj.fitBounds(
         L.latLngBounds(mapPinsRows.map((p) => [p.latitude, p.longitude] as [number, number])),
         { padding: [30, 30] }
@@ -5414,6 +5470,24 @@
     height: 100%;
     background: #e5e3df;
     font: inherit;
+  }
+  /* Cluster badges: plain divIcon wrapper (no white square), count bubble. */
+  .map-wrap :global(.map-cluster-wrap) {
+    background: transparent;
+    border: 0;
+  }
+  .map-wrap :global(.map-cluster) {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(47, 107, 255, 0.88);
+    border: 2px solid #fff;
+    color: #fff;
+    font-size: 0.8rem;
+    font-weight: 700;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
   }
   :global(.map-popup) {
     display: flex;
