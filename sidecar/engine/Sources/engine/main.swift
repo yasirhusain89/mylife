@@ -229,6 +229,8 @@ func imageStat(path: String) throws -> [String: Any] {
     }
     if let fnum = exif[kCGImagePropertyExifFNumber] as? NSNumber { out["fNumber"] = fnum.doubleValue }
     if let exp = exif[kCGImagePropertyExifExposureTime] as? NSNumber { out["exposureTime"] = exp.doubleValue }
+    if let focal = exif[kCGImagePropertyExifFocalLength] as? NSNumber { out["focalLength"] = focal.doubleValue }
+    if let focal35 = exif[kCGImagePropertyExifFocalLenIn35mmFilm] as? NSNumber { out["focalLength35"] = focal35.intValue }
     if let lat = gps[kCGImagePropertyGPSLatitude] as? NSNumber {
         let ref = (gps[kCGImagePropertyGPSLatitudeRef] as? String) ?? "N"
         out["latitude"] = lat.doubleValue * (ref == "S" ? -1 : 1)

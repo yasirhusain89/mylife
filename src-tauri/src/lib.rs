@@ -2023,6 +2023,7 @@ fn library_list(
     scene_tag: Option<String>,
     query: Option<String>,
     has_pet: Option<bool>,
+    sort_added: Option<bool>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<db::AssetRow>, String> {
@@ -2041,6 +2042,7 @@ fn library_list(
             scene_tag: scene_tag.as_deref(),
             query: query.as_deref(),
             has_pet,
+            sort_added: sort_added.unwrap_or(false),
             offset: offset.unwrap_or(0).max(0),
             limit: limit.unwrap_or(200).clamp(1, 1000),
         },

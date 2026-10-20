@@ -21,6 +21,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (12, include_str!("../migrations/012_pets.sql")),
     (13, include_str!("../migrations/013_vectors.sql")),
     (14, include_str!("../migrations/014_face_descriptors.sql")),
+    (15, include_str!("../migrations/015_exposure.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -75,6 +76,16 @@ pub struct AssetRow {
     pub favorite: i64,
     pub missing: i64,
     pub sha256: Option<String>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub iso: Option<i64>,
+    pub f_number: Option<f64>,
+    pub exposure_time: Option<f64>,
+    pub focal_length: Option<f64>,
+    pub focal_length_35: Option<i64>,
     /// First non-null event place for this asset (for Group-by-Location).
     pub place: Option<String>,
     /// Sorted, de-duplicated named people on this photo (for Group-by-Person).
@@ -1897,6 +1908,11 @@ pub fn apply_stat(conn: &Connection, id: i64, stat: &serde_json::Value) -> Resul
             lens         = COALESCE(?8, lens),
             latitude     = COALESCE(?9, latitude),
             longitude    = COALESCE(?10, longitude),
+            iso          = COALESCE(?12, iso),
+            f_number     = COALESCE(?13, f_number),
+            exposure_time = COALESCE(?14, exposure_time),
+            focal_length = COALESCE(?15, focal_length),
+            focal_length_35 = COALESCE(?16, focal_length_35),
             stat_at      = ?11,
             stat_error   = NULL,
             stat_attempts = stat_attempts + 1
@@ -1913,6 +1929,11 @@ pub fn apply_stat(conn: &Connection, id: i64, stat: &serde_json::Value) -> Resul
             f("latitude"),
             f("longitude"),
             now(),
+            n("iso"),
+            f("fNumber"),
+            f("exposureTime"),
+            f("focalLength"),
+            n("focalLength35"),
         ],
     )
     .map_err(|e| format!("apply_stat: {e}"))?;
@@ -2664,6 +2685,8 @@ pub struct LibraryQuery<'a> {
     /// Substring match on file name or path (search box). The LIKE pattern
     /// (with `%`/`_` escaped) is built inside library()/library_count().
     pub query: Option<&'a str>,
+    /// Newest-first by first_seen_at (the Pinned "Recently Saved" shortcut).
+    pub sort_added: bool,
     pub offset: i64,
     pub limit: i64,
 }
@@ -2702,6 +2725,12 @@ const LIBRARY_RANK: &str = "CASE WHEN ?9 IS NULL THEN 0
 
 pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, String> {
     let like = q.query.map(|s| format!("%{}%", escape_like(s)));
+    // Recently Saved skips relevance ranking: pure insert-recency order.
+    let order = if q.sort_added {
+        "first_seen_at DESC, id DESC".to_string()
+    } else {
+        format!("{LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC")
+    };
     let sql = format!(
         "SELECT id, path, name, ext, kind, mime, size_bytes, modified, captured_at,
                         width, height, duration, favorite, missing, sha256,
@@ -2710,10 +2739,12 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                    ORDER BY e.id LIMIT 1),
                  (SELECT GROUP_CONCAT(fc.name, CHAR(31)) FROM faces f
                    JOIN face_clusters fc ON fc.id = f.cluster_id
-                   WHERE f.path = a.path AND fc.name IS NOT NULL AND fc.name != '')
+                   WHERE f.path = a.path AND fc.name IS NOT NULL AND fc.name != ''),
+                 camera_make, camera_model, lens, latitude, longitude,
+                 iso, f_number, exposure_time, focal_length, focal_length_35
                  FROM assets a
                  {LIBRARY_WHERE}
-                 ORDER BY {LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC
+                 ORDER BY {order}
                  LIMIT ?11 OFFSET ?12"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
@@ -2758,6 +2789,16 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 sha256: r.get(14)?,
                 place: r.get(15)?,
                 people,
+                camera_make: r.get(17)?,
+                camera_model: r.get(18)?,
+                lens: r.get(19)?,
+                latitude: r.get(20)?,
+                longitude: r.get(21)?,
+                iso: r.get(22)?,
+                f_number: r.get(23)?,
+                exposure_time: r.get(24)?,
+                focal_length: r.get(25)?,
+                focal_length_35: r.get(26)?,
             })
         })
         .map_err(|e| format!("query library: {e}"))?;
@@ -3075,10 +3116,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 14, "user_version tracks the highest applied migration");
+        assert_eq!(v, 15, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -3134,6 +3175,55 @@ mod tests {
         assert_eq!(s.photos, 2);
         assert_eq!(s.videos, 0);
         assert_eq!(s.bytes, 2);
+    }
+
+    #[test]
+    fn library_sort_added_orders_by_first_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/old.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/new.jpg", 1, 100.0), scan).unwrap();
+        // Flip insert recency: /old.jpg was (re)seen much later.
+        conn.execute("UPDATE assets SET first_seen_at = first_seen_at + 100000 WHERE path = '/old.jpg'", []).unwrap();
+
+        let rows = library(&conn, &LibraryQuery { sort_added: true, limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "/old.jpg", "recently saved first");
+        assert_eq!(rows[1].path, "/new.jpg");
+    }
+
+    #[test]
+    fn apply_stat_persists_exposure_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 100, 10.0), scan).unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0))
+            .unwrap();
+        let stat = serde_json::json!({
+            "capturedAt": 50.0, "width": 4032, "height": 3024,
+            "cameraMake": "TestCam", "cameraModel": "TC-1", "lens": "TC 26mm",
+            "latitude": 37.78, "longitude": -122.41,
+            "iso": 100, "fNumber": 2.8, "exposureTime": 0.004,
+            "focalLength": 6.8, "focalLength35": 26
+        });
+        apply_stat(&conn, id, &stat).unwrap();
+
+        let rows = library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1);
+        let a = &rows[0];
+        assert_eq!(a.iso, Some(100));
+        assert_eq!(a.camera_make.as_deref(), Some("TestCam"));
+        assert_eq!(a.camera_model.as_deref(), Some("TC-1"));
+        assert_eq!(a.lens.as_deref(), Some("TC 26mm"));
+        assert_eq!(a.latitude, Some(37.78));
+        assert_eq!(a.longitude, Some(-122.41));
+        assert!((a.f_number.unwrap() - 2.8).abs() < 1e-9);
+        assert!((a.exposure_time.unwrap() - 0.004).abs() < 1e-12);
+        assert!((a.focal_length.unwrap() - 6.8).abs() < 1e-9);
+        assert_eq!(a.focal_length_35, Some(26));
     }
 
     #[test]
