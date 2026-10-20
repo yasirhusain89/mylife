@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type AssetRow = {
@@ -259,9 +259,14 @@ export function mapPins(): Promise<MapPin[]> {
   return invoke("map_pins");
 }
 
-/** One cached OSM tile as a data URL (desktop only — see api.ts for the HTTP fallback). */
+/**
+ * One cached OSM tile as a browser-loadable URL (desktop only — see api.ts
+ * for the HTTP fallback). The backend returns an app-data file path;
+ * convertFileSrc turns it into an asset-protocol URL the browser caches
+ * natively, so tiles cost no base64/IPC per view.
+ */
 export function mapTile(z: number, x: number, y: number): Promise<string> {
-  return invoke("map_tile", { z, x, y });
+  return invoke<string>("map_tile", { z, x, y }).then((p) => convertFileSrc(p));
 }
 
 export function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {

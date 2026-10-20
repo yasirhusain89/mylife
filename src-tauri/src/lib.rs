@@ -2274,30 +2274,51 @@ fn map_pins(conn: tauri::State<'_, DbState>) -> Result<Vec<db::MapPin>, String> 
 const MAP_TILE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const MAP_TILE_CACHE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
-/// One OpenStreetMap raster tile as a data URL, cached under
-/// `app_data/maptiles/{z}/{x}/{y}.png`. Cache-first so repeat pans cost no
-/// network; upstream tile usage policy (valid User-Agent, ≤2 parallel) is
-/// honored by the app UA below and the command threadpool. Attribution
-/// "© OpenStreetMap contributors" is rendered by the map UI.
+/// OSM asks for ≤2 parallel tile downloads; cache hits never take a permit.
+static TILE_DL_SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+/// The prune walk stats the whole tile tree, so it runs at most every N misses.
+static TILE_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const TILE_PRUNE_EVERY: u64 = 32;
+
+/// One cached OSM tile as an app-data file path, served under
+/// `app_data/maptiles/{z}/{x}/{y}.png`. The UI turns it into an asset-protocol
+/// URL (browser-cached, no base64/IPC per tile); repeat pans and zooms cost no
+/// network and no re-encode. Upstream tile usage policy (valid User-Agent,
+/// ≤2 parallel) is honored by the app UA below and the download semaphore.
+/// Attribution "© OpenStreetMap contributors" is rendered by the map UI.
 #[tauri::command]
 async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<String, String> {
+    if z > 19 {
+        return Err("tile zoom out of range (0-19)".to_string());
+    }
+    let n = 1u32 << z;
+    if x >= n || y >= n {
+        return Err("tile coordinates out of range".to_string());
+    }
+    let file = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?
+        .join("maptiles")
+        .join(z.to_string())
+        .join(x.to_string())
+        .join(format!("{y}.png"));
+    // Fast path: cache hits skip the blocking pool and the permit entirely.
+    // (A concurrent downloader racing us is harmless: the bytes are identical.)
+    if file.is_file() {
+        return Ok(file.to_string_lossy().into_owned());
+    }
+    let _permit = TILE_DL_SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::const_new(2)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("tile slot: {e}"))?;
     tauri::async_runtime::spawn_blocking(move || {
-        if z > 19 {
-            return Err("tile zoom out of range (0-19)".to_string());
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create tile dir: {e}"))?;
         }
-        let n = 1u32 << z;
-        if x >= n || y >= n {
-            return Err("tile coordinates out of range".to_string());
-        }
-        let dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("app data dir: {e}"))?
-            .join("maptiles")
-            .join(z.to_string())
-            .join(x.to_string());
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create tile dir: {e}"))?;
-        let file = dir.join(format!("{y}.png"));
         if !file.is_file() {
             let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
             let bytes = ureq::get(&url)
@@ -2312,14 +2333,16 @@ async fn map_tile(app: tauri::AppHandle, z: u32, x: u32, y: u32) -> Result<Strin
                 return Err("tile download: unexpected body".to_string());
             }
             std::fs::write(&file, &bytes).map_err(|e| format!("cache tile: {e}"))?;
-            prune_dir_recursive(
-                &app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?.join("maptiles"),
-                MAP_TILE_CACHE_MAX_BYTES,
-                MAP_TILE_CACHE_TARGET_BYTES,
-            );
+            if TILE_PRUNE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % TILE_PRUNE_EVERY == 0
+            {
+                prune_dir_recursive(
+                    &app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?.join("maptiles"),
+                    MAP_TILE_CACHE_MAX_BYTES,
+                    MAP_TILE_CACHE_TARGET_BYTES,
+                );
+            }
         }
-        let bytes = std::fs::read(&file).map_err(|e| format!("read tile: {e}"))?;
-        Ok(format!("data:image/png;base64,{}", b64_encode(&bytes)))
+        Ok(file.to_string_lossy().into_owned())
     })
     .await
     .map_err(|e| format!("tile task join failed: {e}"))?

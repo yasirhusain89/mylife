@@ -1733,16 +1733,18 @@
   // Map tab: pins from the backend, tiles from the Rust disk cache
   // (mock/API: inline grid data URLs / plain OSM URLs — see mapTile). The
   // map object is rebuilt when its container remounts after a tab switch.
-  // Cache-first tiles: the Rust command serves disk-cached OSM PNGs as data
-  // URLs so repeat pans cost no network.
+  // Desktop tiles arrive as asset-protocol file URLs (browser-cached); done()
+  // fires on img load so tiles fade in instead of popping, and zoom-end-only
+  // loading keeps zoom animations free of tile storms.
   class CachedTiles extends L.GridLayer {
     createTile(coords: Coords, done: DoneCallback): HTMLImageElement {
       const img = document.createElement("img");
       img.alt = "";
+      img.onload = () => done(undefined, img);
+      img.onerror = () => done(new Error(`tile ${coords.z}/${coords.x}/${coords.y} failed to load`), img);
       mapTile(coords.z, coords.x, coords.y).then(
         (url) => {
           img.src = url;
-          done(undefined, img);
         },
         (err) => done(err instanceof Error ? err : new Error(String(err)), img)
       );
@@ -1782,7 +1784,14 @@
     if (!mapObj) {
       const opts: MapOptions = { attributionControl: true };
       mapObj = L.map(mapEl, opts).setView([20, 0], 2);
-      new CachedTiles({ attribution: "© OpenStreetMap contributors", tileSize: 256 }).addTo(mapObj);
+      new CachedTiles({
+        attribution: "© OpenStreetMap contributors",
+        tileSize: 256,
+        maxZoom: 19, // backend serves z 0–19; never request beyond it
+        updateWhenZooming: false, // load once per finished zoom, not mid-animation
+        keepBuffer: 3, // prefetch margin so zoom-out targets are often already cached
+        updateInterval: 150
+      }).addTo(mapObj);
     }
     renderPins();
     requestAnimationFrame(() => mapObj?.invalidateSize());

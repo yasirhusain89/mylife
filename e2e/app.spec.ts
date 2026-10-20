@@ -583,6 +583,7 @@ test("map tab plots located photos and jumps to the library", async ({ page }) =
   await expect(map).toBeVisible();
   await expect(map.locator("path.leaflet-interactive")).toHaveCount(4);
   await expect(map.locator(".leaflet-control-attribution")).toContainText("OpenStreetMap");
+  await expect.poll(() => map.locator(".leaflet-tile-pane img").count()).toBeGreaterThan(0);
   await map.locator("path.leaflet-interactive").first().click();
   await page.getByRole("button", { name: "Show in Library" }).click();
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
