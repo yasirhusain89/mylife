@@ -1179,8 +1179,12 @@
   }
 
   function showMediaStyle(): string {
-    return `transform: translate(${showPan.x}px, ${showPan.y}px) scale(${showZoom}); transform-origin: center;` +
-      (showZoom > 1 ? " cursor: grab; touch-action: none;" : "");
+    // translate() is outermost so pan is already in screen px: 1px of drag
+    // moves the image 1px on screen at any zoom (do NOT divide by zoom —
+    // that makes the image lag the cursor).
+    const z = showZoom;
+    return `transform: translate(${showPan.x}px, ${showPan.y}px) scale(${z}); transform-origin: center;` +
+      (z > 1 ? ` cursor: ${panDrag ? "grabbing" : "grab"}; touch-action: none;` : "");
   }
 
   // Non-passive wheel listener so pinch/scroll-to-zoom never scrolls the page.
@@ -1197,8 +1201,14 @@
 
   function panStart(e: PointerEvent) {
     if (showZoom <= 1 || e.button !== 0) return;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    // Kill native image drag (it would steal the gesture after a few px)
+    // and track on window: Svelte delegates pointer handlers, so capture on
+    // currentTarget would retarget events away from the image mid-drag.
+    e.preventDefault();
     panDrag = { startX: e.clientX, startY: e.clientY, baseX: showPan.x, baseY: showPan.y };
+    window.addEventListener("pointermove", panMove);
+    window.addEventListener("pointerup", panEnd, { once: true });
+    window.addEventListener("pointercancel", panEnd, { once: true });
   }
 
   function panMove(e: PointerEvent) {
@@ -1209,8 +1219,17 @@
     };
   }
 
-  function panEnd() {
+  function panEnd(e: PointerEvent) {
+    // Snap to the release point: a dropped/coalesced final move must not
+    // leave the image short of where the pointer lifted.
+    if (panDrag) {
+      showPan = {
+        x: panDrag.baseX + (e.clientX - panDrag.startX),
+        y: panDrag.baseY + (e.clientY - panDrag.startY)
+      };
+    }
     panDrag = null;
+    window.removeEventListener("pointermove", panMove);
   }
 
   // Slideshow is fullscreen: lock page scroll behind the theater while open
@@ -4005,9 +4024,6 @@
               playsinline
               style={showMediaStyle()}
               onpointerdown={panStart}
-              onpointermove={panMove}
-              onpointerup={panEnd}
-              onpointercancel={panEnd}
             ></video>
           {/key}
         {:else if sc.kind === "video"}
@@ -4020,11 +4036,9 @@
             <img
               src={show.src}
               alt={sc.name}
+              draggable="false"
               style={showMediaStyle()}
               onpointerdown={panStart}
-              onpointermove={panMove}
-              onpointerup={panEnd}
-              onpointercancel={panEnd}
             />
           {/key}
         {:else if show.error}

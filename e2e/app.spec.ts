@@ -562,6 +562,14 @@ test("slideshow zooms with buttons, keys and wheel, resets on advance", async ({
   await show.locator(".theater-stage").hover();
   await page.mouse.wheel(0, -120);
   await expect(reset).toHaveText("125%");
+  // Drag pans 1:1 with the cursor (matrix tx equals the drag distance).
+  const box = await show.locator(".theater-stage img").boundingBox();
+  const cx = box!.x + box!.width / 2, cy = box!.y + box!.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  await page.mouse.move(cx + 60, cy);
+  await page.mouse.up();
+  await expect(show.locator(".theater-stage img")).toHaveCSS("transform", /matrix\(1\.25, 0, 0, 1\.25, 60/);
   // Advancing to the next slide resets zoom.
   await show.getByRole("button", { name: "Next" }).click();
   await expect(reset).toHaveText("100%");
