@@ -17,6 +17,10 @@ export type AssetRow = {
   favorite: number;
   missing: number;
   sha256: string | null;
+  /** First non-null event place (null when the photo is in no placed event). */
+  place: string | null;
+  /** Sorted named people on this photo (empty when no one is tagged). */
+  people: string[];
 };
 
 export type LibraryStats = {

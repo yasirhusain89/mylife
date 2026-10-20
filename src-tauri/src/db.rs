@@ -75,6 +75,10 @@ pub struct AssetRow {
     pub favorite: i64,
     pub missing: i64,
     pub sha256: Option<String>,
+    /// First non-null event place for this asset (for Group-by-Location).
+    pub place: Option<String>,
+    /// Sorted, de-duplicated named people on this photo (for Group-by-Person).
+    pub people: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2401,11 +2405,17 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
     let like = q.query.map(|s| format!("%{}%", escape_like(s)));
     let sql = format!(
         "SELECT id, path, name, ext, kind, mime, size_bytes, modified, captured_at,
-                       width, height, duration, favorite, missing, sha256
-                FROM assets a
-                {LIBRARY_WHERE}
-                ORDER BY {LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC
-                LIMIT ?11 OFFSET ?12"
+                        width, height, duration, favorite, missing, sha256,
+                 (SELECT e.place FROM event_assets ea JOIN events e ON e.id = ea.event_id
+                   WHERE ea.asset_id = a.id AND e.place IS NOT NULL AND e.place != ''
+                   ORDER BY e.id LIMIT 1),
+                 (SELECT GROUP_CONCAT(fc.name, CHAR(31)) FROM faces f
+                   JOIN face_clusters fc ON fc.id = f.cluster_id
+                   WHERE f.path = a.path AND fc.name IS NOT NULL AND fc.name != '')
+                 FROM assets a
+                 {LIBRARY_WHERE}
+                 ORDER BY {LIBRARY_RANK}, COALESCE(captured_at, modified) DESC, id DESC
+                 LIMIT ?11 OFFSET ?12"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare library: {e}"))?;
     let rows = stmt
@@ -2425,6 +2435,12 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 q.offset
             ],
             |r| {
+            let raw_people: Option<String> = r.get(16)?;
+            let mut people: Vec<String> = raw_people
+                .map(|s| s.split('\x1f').filter(|p| !p.is_empty()).map(str::to_string).collect())
+                .unwrap_or_default();
+            people.sort();
+            people.dedup();
             Ok(AssetRow {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -2441,6 +2457,8 @@ pub fn library(conn: &Connection, q: &LibraryQuery) -> Result<Vec<AssetRow>, Str
                 favorite: r.get(12)?,
                 missing: r.get(13)?,
                 sha256: r.get(14)?,
+                place: r.get(15)?,
+                people,
             })
         })
         .map_err(|e| format!("query library: {e}"))?;
@@ -3449,6 +3467,45 @@ mod tests {
         assert_eq!(months.len(), 2);
         assert_eq!(months[0].month, "2026-11");
         assert_eq!(months[1].month, "2026-10");
+    }
+
+    #[test]
+    fn library_rows_carry_place_and_people_for_grouping() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        let aid_a: i64 =
+            conn.query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0)).unwrap();
+        // /a.jpg belongs to a placed event; /b.jpg to an unplaced one.
+        conn.execute(
+            "INSERT INTO events (name, started_at, ended_at, latitude, longitude, asset_count, face_count, created_at, place)
+             VALUES ('Trip', 1, 2, 1.0, 2.0, 1, 0, 1, 'Moab, Utah')",
+            [],
+        )
+        .unwrap();
+        let eid: i64 = conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO event_assets (event_id, asset_id) VALUES (?1, ?2)", params![eid, aid_a])
+            .unwrap();
+        // One named face on /a.jpg.
+        let face_ids = save_faces(
+            &conn,
+            "/a.jpg",
+            &[serde_json::json!({"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2, "confidence": 0.9})],
+        )
+        .unwrap();
+        let cluster = save_cluster(&conn, &face_ids).unwrap();
+        rename_cluster(&conn, cluster, "Maya").unwrap();
+
+        let rows = library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.path == "/a.jpg").unwrap();
+        assert_eq!(a.place.as_deref(), Some("Moab, Utah"));
+        assert_eq!(a.people, vec!["Maya".to_string()]);
+        let b = rows.iter().find(|r| r.path == "/b.jpg").unwrap();
+        assert_eq!(b.place, None);
+        assert!(b.people.is_empty());
     }
 
     #[test]

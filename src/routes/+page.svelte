@@ -128,6 +128,98 @@
 
   let foldersOpen = $state(loadFoldersOpen());
 
+  type GroupMode = "none" | "date" | "location" | "person" | "media";
+  const GROUP_BY_KEY = "fotoflow-group-by";
+  const GROUP_MODES: GroupMode[] = ["none", "date", "location", "person", "media"];
+
+  function loadGroupBy(): GroupMode {
+    try {
+      if (typeof localStorage === "undefined") return "none";
+      const raw = localStorage.getItem(GROUP_BY_KEY);
+      return GROUP_MODES.includes(raw as GroupMode) ? (raw as GroupMode) : "none";
+    } catch {
+      return "none";
+    }
+  }
+
+  function saveGroupBy(g: GroupMode) {
+    try {
+      localStorage.setItem(GROUP_BY_KEY, g);
+    } catch {
+      /* storage unavailable: preference just doesn't persist */
+    }
+  }
+
+  let groupBy = $state<GroupMode>(loadGroupBy());
+
+  function monthKeyOf(a: AssetRow): string {
+    const t = a.capturedAt ?? a.modified;
+    if (!t) return "";
+    const d = new Date(t * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function monthLabelOf(key: string): string {
+    if (!key) return "Unknown date";
+    const [y, m] = key.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, 1)).toLocaleString(undefined, {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC"
+    });
+  }
+
+  function groupKeyOf(a: AssetRow): string {
+    switch (groupBy) {
+      case "date": return monthKeyOf(a);
+      case "location": return a.place ?? "";
+      case "person": return a.people[0] ?? "";
+      case "media": return a.kind;
+      default: return "";
+    }
+  }
+
+  function groupLabelOf(a: AssetRow): string {
+    switch (groupBy) {
+      case "date": return monthLabelOf(monthKeyOf(a));
+      case "location": return a.place ?? "No location";
+      case "person": return a.people[0] ?? "No one tagged";
+      case "media": return a.kind === "image" ? "Photos" : "Videos";
+      default: return "";
+    }
+  }
+
+  // Display order when grouped: sections sorted (newest month first,
+  // names A–Z, unknowns last), newest photo first inside each section.
+  // Carries the flat-list index so the viewer, selection and Similar
+  // keep working on the underlying order.
+  let displayAssets = $derived.by(() => {
+    const items = assets.map((asset, index) => ({ asset, index }));
+    if (groupBy === "none") return items;
+    const dir = groupBy === "date" ? -1 : 1;
+    // Unknowns sort last in every mode ("" is already last descending).
+    const sortKey = (k: string) => (k === "" && groupBy !== "date" ? "\uffff" : k);
+    return items.sort((a, b) => {
+      const ka = sortKey(groupKeyOf(a.asset));
+      const kb = sortKey(groupKeyOf(b.asset));
+      if (ka < kb) return -dir;
+      if (ka > kb) return dir;
+      const ta = a.asset.capturedAt ?? a.asset.modified ?? 0;
+      const tb = b.asset.capturedAt ?? b.asset.modified ?? 0;
+      return tb - ta || b.asset.id - a.asset.id;
+    });
+  });
+
+  let groupCounts = $derived.by(() => {
+    const m = new Map<string, number>();
+    if (groupBy === "none") return m;
+    for (const a of assets) {
+      const k = groupKeyOf(a);
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return m;
+  });
+
   function loadRecentSearches(): string[] {
     try {
       if (typeof localStorage === "undefined") return [];
@@ -538,7 +630,8 @@
       return {
         id: -1, path, name, ext: name.split(".").pop() ?? "", kind: "image" as const,
         mime: null, sizeBytes: 0, modified: 0, capturedAt: null, width: null,
-        height: null, duration: null, favorite: 0, missing: 0, sha256: null
+        height: null, duration: null, favorite: 0, missing: 0, sha256: null,
+        place: null, people: []
       };
     });
     reviewCluster = { id: cluster.id, name: cluster.name ?? `Cluster ${cluster.id}` };
@@ -1968,6 +2061,19 @@
             {/each}
           </select>
         {/if}
+        <select
+          aria-label="Group by"
+          onchange={(e) => {
+            groupBy = e.currentTarget.value as GroupMode;
+            saveGroupBy(groupBy);
+          }}
+        >
+          <option value="none" selected={groupBy === "none"}>No grouping</option>
+          <option value="date" selected={groupBy === "date"}>Date</option>
+          <option value="location" selected={groupBy === "location"}>Location</option>
+          <option value="person" selected={groupBy === "person"}>Person</option>
+          <option value="media" selected={groupBy === "media"}>Media type</option>
+        </select>
       </div>
 
       {#if stats.missing > 0}
@@ -2052,7 +2158,10 @@
 
     {#if assets.length}
       <div class="grid">
-        {#each assets as asset, i (asset.id)}
+        {#each displayAssets as { asset, index }, di (asset.id)}
+          {#if groupBy !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
+            <h4 class="group-head">{groupLabelOf(asset)} ({groupCounts.get(groupKeyOf(asset)) ?? 0})</h4>
+          {/if}
           <figure class:selected={selected.has(asset.id)}>
             {#if selectMode}
               <input
@@ -2068,7 +2177,7 @@
               class="thumb clickable"
               use:observeThumb={asset.path}
               title={selectMode ? `Select ${asset.name}` : `Open ${asset.name}`}
-              onclick={() => { if (selectMode) toggleSelect(asset.id); else openViewer(i); }}
+              onclick={() => { if (selectMode) toggleSelect(asset.id); else openViewer(index); }}
             >
               {#if thumbs[asset.path]}
                 <img src={thumbs[asset.path]} alt={asset.name} loading="lazy" />
@@ -3314,6 +3423,16 @@
   .grid > figure.selected {
     outline: 2px solid #2f6bff;
     border-radius: 8px;
+  }
+  .group-head {
+    grid-column: 1 / -1;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #cfd5e1;
+    margin: 0.8rem 0 0.1rem;
+  }
+  .group-head:first-child {
+    margin-top: 0;
   }
   .grid > figure {
     position: relative;

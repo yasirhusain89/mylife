@@ -82,6 +82,8 @@ function asset(
     favorite: 0,
     missing: 0,
     sha256: null,
+    place: null,
+    people: [],
     ...opts
   };
 }
@@ -242,7 +244,18 @@ export async function libraryList(opts: LibraryFilters = {}): Promise<AssetRow[]
   const rows = applyFilters(assets, opts);
   const offset = opts.offset ?? 0;
   const limit = opts.limit ?? 60;
-  return rows.slice(offset, offset + limit);
+  // The real backend annotates each row with its first event place and its
+  // named people; the mock derives the same shape from its located set and
+  // named clusters so grouping behaves identically.
+  return rows.slice(offset, offset + limit).map((a) => ({
+    ...a,
+    place: located.has(a.id) ? "San Francisco, California" : null,
+    people: [...clusterMembers.entries()]
+      .filter(([, ids]) => ids.has(a.id))
+      .map(([cid]) => clusterNames.get(cid))
+      .filter((n): n is string => !!n)
+      .sort()
+  }));
 }
 
 export async function libraryCount(

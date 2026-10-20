@@ -133,6 +133,35 @@ test("indexed folders collapse, expand, and remember across reload", async ({ pa
   await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
 });
 
+test("group by sections the grid and clears back to flat", async ({ page }) => {
+  const group = page.getByLabel("Group by");
+  await group.selectOption("media");
+  await expect(page.getByRole("heading", { name: "Photos (6)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Videos (2)" })).toBeVisible();
+  await group.selectOption("date");
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await group.selectOption("location");
+  await expect(page.getByRole("heading", { name: "San Francisco, California (4)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "No location (4)" })).toBeVisible();
+  await group.selectOption("none");
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  await expect(page.locator(".grid figure")).toHaveCount(8);
+});
+
+test("group by person sections named clusters from untagged", async ({ page }) => {
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Person name" });
+  await dialog.getByLabel("Person name").fill("Ada");
+  await dialog.getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByText("Ada").first()).toBeVisible();
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByLabel("Group by").selectOption("person");
+  await expect(page.getByRole("heading", { name: "Ada (4)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "No one tagged (4)" })).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
