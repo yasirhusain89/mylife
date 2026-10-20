@@ -77,7 +77,7 @@ test("favorite persists and the favorites filter shows it", async ({ page }) => 
 
 test("album create+add via UI then Albums tab shows the count", async ({ page }) => {
   const name = `e2e-album-${Date.now()}`;
-  await page.getByRole("button", { name: /^Albums/ }).click();
+  await page.getByRole("tab", { name: /^Albums/ }).click();
   await page.getByRole("button", { name: "New album", exact: true }).click();
   await page.getByRole("textbox", { name: "New album" }).fill(name);
   await page.getByRole("button", { name: "Create" }).click();

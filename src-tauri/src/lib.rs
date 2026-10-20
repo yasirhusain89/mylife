@@ -347,6 +347,15 @@ pub fn run_enrich(
 ) -> Result<db::EnrichSummary, String> {
     let started = std::time::Instant::now();
     let (mut processed, mut enriched, mut failed) = (0i64, 0i64, 0i64);
+    // Self-heal for the videoStat upgrade: videos enriched before capture
+    // dates were extracted (stat_at set, captured_at NULL) go back in the
+    // queue once. After a successful re-stat they carry dates and never
+    // match again; genuinely dateless files exhaust stat_attempts and rest.
+    conn.execute(
+        "UPDATE assets SET stat_at = NULL WHERE kind = 'video' AND captured_at IS NULL AND stat_at IS NOT NULL AND missing = 0",
+        [],
+    )
+    .map_err(|e| format!("requeue dateless videos: {e}"))?;
     // One attempt per asset per invocation. A failure leaves stat_at NULL so the
     // row stays eligible later, but retrying it in this same loop would burn the
     // whole attempt budget instantly (an iCloud placeholder fails every time).
@@ -880,6 +889,7 @@ pub struct PipelineSummary {
     pub enriched: i64,
     pub hashed: i64,
     pub scored: i64,
+    pub near: i64,
     pub events: i64,
     pub tagged: i64,
     pub embedded: i64,
@@ -917,10 +927,11 @@ pub fn run_fill_cached_places(conn: &rusqlite::Connection) -> Result<i64, String
 }
 
 /// Runs every offline organization pass in dependency order: metadata,
-/// hashes, blur scores, event clusters, scene tags, cached-only places.
-/// Faces stay manual (slow); network geocoding stays on its button.
-/// A stage-level error counts once and the chain continues — one bad
-/// stage never strands the rest.
+/// hashes, blur scores, near-duplicates, scene tags, faces, event clusters,
+/// cached-only places. Faces run before events so counts are fresh; events
+/// run after dedup signals so later curation can exclude non-keepers.
+/// Network geocoding stays on its button. A stage-level error counts once
+/// and the chain continues — one bad stage never strands the rest.
 pub fn run_post_import(
     conn: &rusqlite::Connection,
     engine_state: &engine::EngineState,
@@ -965,11 +976,10 @@ pub fn run_post_import(
         }
     };
 
-    let events = match db::cluster_events(conn, 4.0, 500.0) {
-        Ok((e, _)) => {
-            emit("events", e, e);
-            e
-        }
+    let near = match run_near_dupes(conn, engine_state, |h, f, _| {
+        emit("near", h + f, 0);
+    }) {
+        Ok((_, _, groups, _)) => groups,
         Err(_) => {
             failed += 1;
             0
@@ -1005,11 +1015,23 @@ pub fn run_post_import(
     // Faces stay incremental: images that already have descriptors skip
     // engine calls, then every stored descriptor regroups globally so new
     // imports join their people (names + person tags follow in
-    // run_cluster_faces). Runs after tag_scenes so scene stamps land first.
+    // run_cluster_faces). Runs after tag_scenes so scene stamps land first,
+    // and before cluster_events so event face counts are fresh.
     let faces = match run_cluster_faces(conn, engine_state, None, 0.55, |p, t, _| {
         emit("faces", p, t);
     }) {
         Ok(s) => s.faces,
+        Err(_) => {
+            failed += 1;
+            0
+        }
+    };
+
+    let events = match db::cluster_events(conn, 4.0, 500.0) {
+        Ok((e, _)) => {
+            emit("events", e, e);
+            e
+        }
         Err(_) => {
             failed += 1;
             0
@@ -1028,7 +1050,7 @@ pub fn run_post_import(
     };
 
     emit("done", 0, 0);
-    Ok(PipelineSummary { enriched, hashed, scored, events, tagged, embedded, faces, places, failed })
+    Ok(PipelineSummary { enriched, hashed, scored, near, events, tagged, embedded, faces, places, failed })
 }
 
 #[tauri::command]
@@ -3266,6 +3288,7 @@ mod tests {
         let first = run_post_import(&conn, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
         assert_eq!(first.enriched, 2, "both real PNGs decode");
         assert_eq!(first.hashed, 3, "hashing reads bytes, even corrupt ones");
+        assert_eq!(first.near, 1, "identical icons form one near-dupe group; corrupt bows out after retries");
         assert_eq!(first.events, 1, "one import session clusters together");
         // The 16px icon classifies nothing above the 0.2 floor and the
         // corrupt file fails outright: every image still leaves the
@@ -3274,7 +3297,7 @@ mod tests {
         assert_eq!(first.tagged, 0);
         assert_eq!(first.places, 0, "no coordinates, nothing to fill");
         assert_eq!(first.faces, 0, "the icon shows no detectable face");
-        for want in ["enrich", "hash", "quality", "events", "tag", "faces", "places", "done"] {
+        for want in ["enrich", "hash", "quality", "near", "events", "tag", "faces", "places", "done"] {
             assert!(stages.contains(&want.to_string()), "stage {want} reports progress");
         }
 

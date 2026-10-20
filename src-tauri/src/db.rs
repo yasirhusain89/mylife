@@ -1622,7 +1622,7 @@ pub fn event_assets(conn: &Connection, event_id: i64) -> Result<Vec<EventAssetRo
     let mut stmt = conn.prepare(
         "SELECT a.id, a.path, a.name, a.kind FROM assets a
          JOIN event_assets ea ON ea.asset_id = a.id
-         WHERE ea.event_id = ?1 ORDER BY a.path",
+         WHERE ea.event_id = ?1 ORDER BY COALESCE(a.captured_at, a.modified), a.id",
     ).map_err(|e| format!("prepare event assets: {e}"))?;
     let rows = stmt
         .query_map(params![event_id], |r| {
@@ -1969,7 +1969,7 @@ pub fn album_assets(conn: &Connection, album_id: i64) -> Result<Vec<EventAssetRo
             "SELECT a.id, a.path, a.name, a.kind FROM assets a
              JOIN album_assets aa ON aa.asset_id = a.id
              WHERE aa.album_id = ?1
-             ORDER BY aa.added_at DESC, a.name",
+             ORDER BY COALESCE(a.captured_at, a.modified), a.id",
         )
         .map_err(|e| format!("prepare album assets: {e}"))?;
     let rows = stmt
@@ -2418,7 +2418,7 @@ pub fn dhash_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, Strin
     let mut stmt = conn
         .prepare(
             "SELECT id, path FROM assets
-             WHERE kind = 'image' AND missing = 0 AND dhash IS NULL
+             WHERE kind = 'image' AND missing = 0 AND dhash IS NULL AND dhash_attempts < 3
              ORDER BY id LIMIT ?1",
         )
         .map_err(|e| format!("prepare dhash candidates: {e}"))?;

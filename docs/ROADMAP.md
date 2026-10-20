@@ -17,7 +17,7 @@
 - Events: time + GPS clustering with kept manual names, gap control, offline state/country fences plus cached OpenStreetMap place names (the only network call) — shipped.
 - Albums: user-curated lists as export sources with add / remove / rename / delete — shipped.
 - Distribution: per-event/per-album Drive (full quality) and WhatsApp (1280px recode, video included) bundles — shipped.
-- Highlight videos: per-event mixed photo/video montage with original camera audio, capped at 60s — shipped (partial).
+- Highlight videos: per-event mixed photo/video montage, capped at 60s — shipped (partial; silent — camera audio deferred per README P5).
 - Engine health check (ping + OS/arch/memory readout) in Settings — shipped.
 
 ## Next — queued, ordered by user value per effort

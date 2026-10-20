@@ -254,8 +254,45 @@ func videoStat(path: String) -> [String: Any] {
         let fps = track.nominalFrameRate
         if fps.isFinite, fps > 0 { out["fps"] = fps }
     }
-    if let item = asset.creationDate, let s = item.stringValue, let t = parseISO8601(s) {
-        out["capturedAt"] = t
+    // Capture date, strongest signal first: the native date value, then a
+    // scan of the QuickTime/common metadata items (creationdate strings need
+    // both ISO-8601 and EXIF-colon parses), then the camera filename stamp.
+    // Videos previously enriched with none of these stay dateless and keep
+    // sorting by file mtime — the filename fallback recovers those.
+    if let d = asset.creationDate?.dateValue {
+        out["capturedAt"] = d.timeIntervalSince1970
+    } else {
+        for item in asset.metadata {
+            if out["capturedAt"] == nil {
+                // commonKeyCreationDate's raw value ("creationDate"); the
+                // QuickTime/mdta identifiers are matched as raw strings so no
+                // SDK-version-sensitive static members are referenced.
+                let isDateKey = item.commonKey?.rawValue == "creationDate"
+                    || item.identifier?.rawValue == "com.apple.quicktime.creationdate"
+                    || item.identifier?.rawValue == "mdta/com.apple.quicktime.creationdate"
+                if isDateKey {
+                    if let d = item.dateValue {
+                        out["capturedAt"] = d.timeIntervalSince1970
+                    } else if let s = item.stringValue,
+                              let t = parseISO8601(s) ?? parseExifDate(s) {
+                        out["capturedAt"] = t
+                    }
+                }
+            }
+            if out["latitude"] == nil {
+                let isLocKey = item.identifier?.rawValue == "com.apple.quicktime.location.ISO6709"
+                    || item.identifier?.rawValue == "mdta/com.apple.quicktime.location.ISO6709"
+                if isLocKey, let s = item.stringValue, let (la, lo) = parseISO6709(s) {
+                    out["latitude"] = la
+                    out["longitude"] = lo
+                }
+            }
+            if out["capturedAt"] != nil && out["latitude"] != nil { break }
+        }
+        if out["capturedAt"] == nil,
+           let t = parseFilenameDate(URL(fileURLWithPath: path).lastPathComponent) {
+            out["capturedAt"] = t
+        }
     }
     return out
 }
@@ -270,6 +307,69 @@ func parseISO8601(_ s: String) -> Double? {
     local.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
     local.locale = Locale(identifier: "en_US_POSIX")
     return local.date(from: s)?.timeIntervalSince1970
+}
+
+/// QuickTime location strings (`com.apple.quicktime.location.ISO6709`):
+/// decimal degrees like "+38.5724-109.5509/" with an optional altitude
+/// segment ("+38.5724-109.5509+1234.0/"). Returns (latitude, longitude).
+func parseISO6709(_ s: String) -> (Double, Double)? {
+    var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.hasSuffix("/") { t = String(t.dropLast()) }
+    // Split into signed number segments: [+38.5724, -109.5509, +1234.0].
+    var nums: [Double] = []
+    var cur = ""
+    for c in t {
+        if c == "+" || c == "-" {
+            if let v = Double(cur) { nums.append(v) }
+            cur = String(c)
+        } else {
+            cur.append(c)
+        }
+    }
+    if let v = Double(cur) { nums.append(v) }
+    guard nums.count >= 2 else { return nil }
+    let (la, lo) = (nums[0], nums[1])
+    guard la >= -90, la <= 90, lo >= -180, lo <= 180 else { return nil }
+    return (la, lo)
+}
+
+/// Camera/phone filename timestamps (IMG_20260419_142159, VID_20261007_192001,
+/// video_20260418_144808, PXL_20260419_142159000): YYYYMMDD + HHMMSS, local
+/// wall-clock like EXIF. Last resort when the container carries no timestamp
+/// (shared/pooled files whose EXIF was stripped).
+func parseFilenameDate(_ name: String) -> Double? {
+    let stem = (name as NSString).deletingPathExtension
+    let chars = Array(stem)
+    var i = 0
+    while i < chars.count {
+        guard chars[i].isNumber else { i += 1; continue }
+        var j = i
+        while j < chars.count && chars[j].isNumber { j += 1 }
+        if j - i == 8 {
+            var k = j
+            if k < chars.count && (chars[k] == "_" || chars[k] == "-" || chars[k] == " ") { k += 1 }
+            if k + 6 <= chars.count && chars[k..<(k + 6)].allSatisfy({ $0.isNumber }) {
+                let datePart = String(chars[i..<j])
+                let timePart = String(chars[k..<(k + 6)])
+                let y = Int(datePart.prefix(4)) ?? 0
+                let mo = Int(datePart.dropFirst(4).prefix(2)) ?? 0
+                let d = Int(datePart.dropFirst(6).prefix(2)) ?? 0
+                let hh = Int(timePart.prefix(2)) ?? 0
+                let mm = Int(timePart.dropFirst(2).prefix(2)) ?? 0
+                let ss = Int(timePart.dropFirst(4).prefix(2)) ?? 0
+                var comps = DateComponents()
+                comps.year = y; comps.month = mo; comps.day = d
+                comps.hour = hh; comps.minute = mm; comps.second = ss
+                if y >= 1995 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31
+                    && hh <= 23 && mm <= 59 && ss <= 59,
+                   let date = Calendar.current.date(from: comps) {
+                    return date.timeIntervalSince1970
+                }
+            }
+        }
+        i = j
+    }
+    return nil
 }
 
 func stat(path: String) throws -> [String: Any] {
@@ -551,11 +651,21 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
 /// composition-based export cannot include them; photo frames are synthesized
 /// directly instead (3s per photo at 30fps, H.264). Video clips are decoded
 /// with AVAssetReader and their frames drawn onto the same 1920x1080 canvas
-/// (up to 3s per clip); a clip's camera audio rides along on an AAC track —
-/// original audio only, never added music. The whole timeline is capped at
-/// maxSeconds. Files that decode as neither photo nor video count as skipped.
+/// (up to 3s per clip). Video-only: no audio track (camera-audio mixing is
+/// deferred — any audio-track interaction poisons video decoding of the same
+/// file in-process on macOS 26). The timeline is capped at maxSeconds. Files
+/// that decode as neither photo nor video count as skipped.
 func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -> [String: Any] {
-    enum Clip { case photo(CGImage); case video(String) }
+    // The video track is queried EXACTLY once per file, here: tracks()
+    // races on background threads on macOS 26 (same file answers
+    // differently across calls), and a reader rejects tracks from a foreign
+    // asset — so the asset and its video track travel together from
+    // classification onward. No audio-track interaction anywhere on this
+    // path (see the video-only note below).
+    enum Clip {
+        case photo(CGImage)
+        case video(path: String, asset: AVURLAsset, vTrack: AVAssetTrack)
+    }
     var clips: [Clip] = []
     var skipped = 0
     for path in paths {
@@ -566,8 +676,8 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
             continue
         }
         let asset = AVURLAsset(url: url)
-        if asset.tracks(withMediaType: .video).first != nil {
-            clips.append(.video(path))
+        if let vTrack = asset.tracks(withMediaType: .video).first {
+            clips.append(.video(path: path, asset: asset, vTrack: vTrack))
         } else {
             skipped += 1
         }
@@ -602,29 +712,34 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     guard writer.canAdd(vInput) else { throw EngineError(message: "cannot add video input") }
     writer.add(vInput)
 
-    // Audio rides along only when at least one clip actually has an audio track.
-    var aInput: AVAssetWriterInput?
-    for clip in clips {
-        if case .video(let path) = clip,
-           AVURLAsset(url: URL(fileURLWithPath: path)).tracks(withMediaType: .audio).first != nil {
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 44100,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 128_000,
-            ])
-            ai.expectsMediaDataInRealTime = false
-            guard writer.canAdd(ai) else { throw EngineError(message: "cannot add audio input") }
-            writer.add(ai)
-            aInput = ai
-            break
-        }
-    }
+    // Video-only by design (for now): any audio-track interaction — even a
+    // bare tracks(.audio) query with no reader — poisons later video decoding
+    // of the same file in-process on macOS 26 (observed across 5 probes: 0
+    // audio calls → 90/90 frames; ≥1 audio call → stall at 42–43 frames).
+    // Camera-audio mixing is deferred until audio can be extracted off the
+    // AVAssetReader path (e.g. ExtAudioFile) or on the main thread.
 
     guard writer.startWriting() else {
         throw EngineError(message: "writer start failed: \(writer.error.map(String.init(describing:)) ?? "unknown")")
     }
     writer.startSession(atSourceTime: .zero)
+
+    // A failed writer never flips isReadyForMoreMediaData, so a bare sleep
+    // loop would spin forever (the observed >60s hang on real MP4s). Cap the
+    // wait and surface the writer error instead. `what` locates the stall.
+    func waitReady(_ input: AVAssetWriterInput, what: String) throws {
+        var spins = 0
+        while !input.isReadyForMoreMediaData {
+            if writer.status == .failed || writer.status == .cancelled {
+                throw EngineError(message: "highlight writer failed at \(what): \(writer.error.map(String.init(describing:)) ?? "unknown")")
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+            spins += 1
+            if spins > 3000 {
+                throw EngineError(message: "highlight writer stalled at \(what) (30s without accepting data, status \(writer.status.rawValue))")
+            }
+        }
+    }
 
     func makePixelBuffer(_ image: CGImage, index: Int64) throws -> CVPixelBuffer {
         var pixelBuffer: CVPixelBuffer?
@@ -662,6 +777,8 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     var frame: Int64 = 0
     var photos = 0
     var videosIncluded = 0
+    var videoFrames = 0
+    var clipErrors: [String] = []
     var cursor = CMTime.zero
     let ciCtx = CIContext()
 
@@ -678,45 +795,27 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     }
 
     // Streams one video clip (up to `take` seconds) onto the timeline:
-    // decoded frames drawn on the canvas, camera audio re-stamped after.
-    // Returns false when the clip contributed no frames.
-    func appendClip(path: String, take: Double) throws -> Bool {
-        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
-        guard let vTrack = asset.tracks(withMediaType: .video).first else { return false }
-
-        // Audio first: a few seconds buffer cheaply; a failed audio read
-        // degrades to silent video instead of failing the clip.
-        var audioSamples: [CMSampleBuffer] = []
-        if let aInput, let aTrack = asset.tracks(withMediaType: .audio).first,
-           let aReader = try? AVAssetReader(asset: asset) {
-            let aOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
-            aReader.add(aOut)
-            if aReader.startReading() {
-                while let sb = aOut.copyNextSampleBuffer() {
-                    let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-                    if pts.seconds < 0 { continue } // encoder priming, not content
-                    if pts.seconds >= take { break }
-                    var timing = CMSampleTimingInfo(
-                        duration: CMSampleBufferGetDuration(sb),
-                        presentationTimeStamp: CMTimeAdd(cursor, pts),
-                        decodeTimeStamp: .invalid)
-                    var fresh: CMSampleBuffer?
-                    if CMSampleBufferCreateCopyWithNewTiming(
-                        allocator: kCFAllocatorDefault, sampleBuffer: sb,
-                        sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-                        sampleBufferOut: &fresh) == noErr, let f = fresh {
-                        audioSamples.append(f)
-                    }
-                }
-            }
+    // decoded frames drawn on the canvas. Returns false when the clip
+    // contributed no frames.
+    func appendClip(asset: AVURLAsset, vTrack: AVAssetTrack, take: Double) throws -> Bool {
+        // The asset and video track arrive from classification: no tracks()
+        // calls in here (see the Clip comment — re-querying races on macOS
+        // 26, and any audio-track interaction poisons video decoding).
+        // Exactly one reader per clip, video output only.
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            return false
         }
-
-        let vReader = try AVAssetReader(asset: asset)
         let vOut = AVAssetReaderTrackOutput(track: vTrack, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        vReader.add(vOut)
-        guard vReader.startReading() else { return false }
+        reader.add(vOut)
+        guard reader.startReading() else {
+            return false
+        }
+
         var wroteAny = false
             while let sb = vOut.copyNextSampleBuffer() {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
@@ -727,19 +826,14 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
                 // framerates would otherwise collapse onto identical stamps
                 // and every append would fail.
                 let t = CMTimeAdd(cursor, pts)
-            while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+            try waitReady(vInput, what: "clip video frame")
                 let out = try makePixelBuffer(cg, index: frame)
                 adaptor.append(out, withPresentationTime: t)
                 frame += 1
+                videoFrames += 1
                 wroteAny = true
         }
-        // Video then audio per clip; the writer multiplexes by PTS at finish.
-        if let aInput {
-            for sb in audioSamples {
-                while !aInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
-                aInput.append(sb)
-            }
-        }
+        reader.cancelReading()
         return wroteAny
     }
 
@@ -749,29 +843,31 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         case .photo(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
             for _ in 0..<min(framesPerPhoto, budget) {
-                while !vInput.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+                try waitReady(vInput, what: "photo frame")
                 let pb = try makePixelBuffer(image, index: frame)
                 adaptor.append(pb, withPresentationTime: cursor)
                 frame += 1
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             photos += 1
-        case .video(let path):
+        case .video(let path, let asset, let vTrack):
             let take = min(secondsPerClip, cap - cursor.seconds)
             do {
-                if try appendClip(path: path, take: take) {
+                if try appendClip(asset: asset, vTrack: vTrack, take: take) {
                     videosIncluded += 1
                 } else {
                     skipped += 1
                 }
             } catch {
                 skipped += 1
+                // Surfaced (not just counted) so callers can tell a corrupt
+                // file from a pipeline stall without guessing.
+                clipErrors.append("\((path as NSString).lastPathComponent): \(error)")
             }
             cursor = CMTimeAdd(cursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
         }
     }
     vInput.markAsFinished()
-    aInput?.markAsFinished()
     let sem = DispatchSemaphore(value: 0)
     writer.finishWriting { sem.signal() }
     sem.wait()
@@ -786,6 +882,8 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         "photos": photos,
         "videosIncluded": videosIncluded,
         "videosSkipped": skipped,
+        "videoFrames": videoFrames,
+        "clipErrors": clipErrors,
     ]
 }
 
@@ -1151,7 +1249,13 @@ func background<T>(_ work: @escaping () throws -> T) throws -> T {
         boxed = Result(catching: work)
         done.signal()
     }
-    done.wait()
+    // The engine's read loop runs on the main thread, so a plain wait()
+    // would freeze it — and AVFoundation posts callbacks that need the main
+    // queue/run loop to drain (the sampled macOS 26 `tracks(withMediaType:)`
+    // wedge). Pump the current (main) run loop while waiting instead.
+    while done.wait(timeout: .now() + 0.05) == .timedOut {
+        _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02))
+    }
     return try boxed.get()
 }
 

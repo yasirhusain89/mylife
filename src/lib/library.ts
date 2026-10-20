@@ -232,6 +232,7 @@ export type PipelineSummary = {
   enriched: number;
   hashed: number;
   scored: number;
+  near: number;
   events: number;
   tagged: number;
   embedded: number;

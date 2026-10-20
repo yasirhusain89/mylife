@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FotoFlow — End-to-End Audit, Comparative Analysis &amp; Collective Trip-Sharing Gap Report</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#f8fafc, #0f1218);
+  --surface: light-dark(#ffffff, #171c26);
+  --surface-2: light-dark(#f1f5f9, #1f2633);
+  --border: light-dark(#cbd5e1, #2e3748);
+  --text: light-dark(#0f172a, #e8edf5);
+  --muted: light-dark(#475569, #94a3b8);
+  --accent: light-dark(#1d4ed8, #60a5fa);
+  --accent-bg: light-dark(#eff6ff, #172554);
+  --good-bg: light-dark(#dcfce7, #143622);
+  --good-fg: light-dark(#14532d, #86efac);
+  --warn-bg: light-dark(#fef3c7, #3f2e12);
+  --warn-fg: light-dark(#78350f, #fde68a);
+  --bad-bg: light-dark(#fee2e2, #451a1a);
+  --bad-fg: light-dark(#7f1d1d, #fca5a5);
+  --info-bg: light-dark(#e0f2fe, #16304b);
+  --info-fg: light-dark(#0c4a6e, #93c5fd);
+}
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 5rem;
+  background: var(--bg);
+  color: var(--text);
+}
+header.hero {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 1.75rem;
+}
+h1 { font-size: 1.75rem; line-height: 1.25; margin: 0 0 0.5rem; }
+h2 { font-size: 1.35rem; line-height: 1.3; margin: 2.25rem 0 0.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+h3 { font-size: 1.08rem; margin: 1.25rem 0 0.4rem; }
+p { margin: 0.5rem 0; max-width: 75ch; }
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}
+code {
+  background: var(--surface-2);
+  padding: 0.12rem 0.35rem;
+  border-radius: 4px;
+}
+pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+.takeaway {
+  border-left: 4px solid var(--accent);
+  padding: 0.75rem 1rem;
+  background: var(--accent-bg);
+  border-radius: 0 8px 8px 0;
+  margin-top: 0.75rem;
+  max-width: none;
+}
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.85rem;
+  margin: 1rem 0 1.5rem;
+}
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+.kpi .num {
+  font-size: 1.45rem;
+  font-weight: 700;
+  display: block;
+}
+.kpi .lbl {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.pill {
+  display: inline-block;
+  font-size: 0.74rem;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 0.12rem 0.58rem;
+  white-space: nowrap;
+}
+.pill.ahead, .pill.pass { background: var(--good-bg); color: var(--good-fg); }
+.pill.parity, .pill.info { background: var(--info-bg); color: var(--info-fg); }
+.pill.near, .pill.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.pill.behind, .pill.fail { background: var(--bad-bg); color: var(--bad-fg); }
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.15rem;
+}
+.card h3 { margin-top: 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  margin: 1rem 0;
+  background: var(--surface);
+}
+caption {
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 0.45rem;
+  color: var(--muted);
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.55rem 0.65rem;
+  vertical-align: top;
+  text-align: left;
+}
+th { background: var(--surface-2); font-weight: 600; }
+.ev {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+figure.diagram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin: 1.25rem 0;
+  overflow-x: auto;
+}
+figure.diagram figcaption {
+  font-size: 0.83rem;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+details {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.6rem 0;
+}
+summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.75rem 0;
+}
+.filter-bar button {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.83rem;
+  cursor: pointer;
+}
+.filter-bar button[aria-pressed="true"] {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+ol.steps li, ul.tight li { margin-bottom: 0.45rem; max-width: 75ch; }
+@media print {
+  body { max-width: none; padding: 0; }
+  details { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>FotoFlow — End-to-End Audit, Capability Comparison &amp; Workflow Gap Report</h1>
+  <p class="takeaway">
+    <strong>Executive Takeaway:</strong> FotoFlow’s local-first indexing, duplicate/blur cleanup, and people clustering are fast and solid (<strong>85/85</strong> Rust tests, <strong>123/123</strong> Web E2E tests, <strong>10/10</strong> HTTP API E2E tests). However, testing against the real <strong>313-asset Moab 2026 library</strong> exposed <strong>7 critical workflow breaks</strong> that prevent fulfilling our core north-star goal: <em>pooling a trip’s photos &amp; videos, auto-selecting the best shots covering every day, place, and person, and sharing a cohesive Memory Video + handpicked album with friends and family</em>.
+  </p>
+  <div class="kpi-grid" role="region" aria-label="End-to-end verification metrics">
+    <div class="kpi">
+      <span class="num">218 / 218 <span class="pill pass">PASS</span></span>
+      <span class="lbl">Automated Suite (85 Rust + 123 UI E2E + 10 API E2E; 0 TypeScript errors)</span>
+    </div>
+    <div class="kpi">
+      <span class="num">304 assets</span>
+      <span class="lbl">Live Moab 2026 Library (270 photos + 34 videos, 280 faces in 14 clusters)</span>
+    </div>
+    <div class="kpi">
+      <span class="num">0 / 34 <span class="pill fail">BROKEN</span></span>
+      <span class="lbl">Videos with EXIF capture date or GPS — all 34 stranded in fake "Apr 20" event</span>
+    </div>
+    <div class="kpi">
+      <span class="num">20 micro-events <span class="pill warn">FRAGMENTED</span></span>
+      <span class="lbl">3-day Moab trip shattered by hardcoded 500m radius (10 events have 1 photo)</span>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <section aria-labelledby="sec-e2e">
+    <h2 id="sec-e2e">1. End-to-End Test Results (Automated + Live Moab 2026 Library)</h2>
+    <p>We executed four verification layers: unit/integration tests, static type checking, Playwright browser E2E (mock + real HTTP server), and live probes against your <code>fotoflow.db</code> and Swift engine sidecar.</p>
+
+    <table>
+      <caption>End-to-End Verification Matrix (2026-10-20)</caption>
+      <thead>
+        <tr>
+          <th scope="col">Layer</th>
+          <th scope="col">Command / Target</th>
+          <th scope="col">Result</th>
+          <th scope="col">What It Proved &amp; What It Caught</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Rust Core &amp; Pipeline</th>
+          <td><code>cargo test --lib</code></td>
+          <td><span class="pill pass">85 passed, 0 failed</span></td>
+          <td>Migrations 001–016, SHA-256 size-bucket dedup, dHash near-dup grouping, keeper scoring, face union-find, static geofences + Nominatim cache, SSD ingest copy, trash/restore, and idempotent post-import pipeline.</td>
+        </tr>
+        <tr>
+          <th scope="row">Type &amp; Svelte Check</th>
+          <td><code>pnpm check</code></td>
+          <td><span class="pill pass">0 errors, 0 warnings</span></td>
+          <td>All Svelte 5 runes, IPC bridge signatures, and mock/API parity cleanly typed.</td>
+        </tr>
+        <tr>
+          <th scope="row">Web UI E2E</th>
+          <td><code>pnpm test:e2e</code></td>
+          <td><span class="pill pass">123 passed (15.1s)</span></td>
+          <td>Full UI coverage: segmented timeline zoom (All/Day/Month/Year), highlights reel + drill-down, size slider, details toggle, hideable sidebar, keyboard cleanup triage, people merge/review, map clustering, SSD ingest, Top 12 picks, space-saver, Recently Deleted.</td>
+        </tr>
+        <tr>
+          <th scope="row">Real HTTP API E2E</th>
+          <td><code>pnpm test:e2e:api</code></td>
+          <td><span class="pill pass">10 passed (5.2s)</span></td>
+          <td>Caught and fixed a stale selector in <code>e2e/api.spec.ts:80</code> (<code>role="button"</code> → <code>role="tab"</code> for <code>Albums</code>). Verified real SQLite read/write routes for library, favorites, albums, scene tags, roots, and map pins.</td>
+        </tr>
+        <tr>
+          <th scope="row">Live Moab 2026 DB &amp; Sidecar Probe</th>
+          <td><code>fotoflow.db</code> + <code>target/debug/engine</code></td>
+          <td><span class="pill fail">3 Critical Field Bugs</span></td>
+          <td>
+            1. <strong>Video metadata blind spot:</strong> 270/270 images have <code>captured_at</code> (77 with GPS), but <strong>0/34 videos</strong> have <code>captured_at</code> or GPS (<code>main.swift:245-261</code>), dumping all 34 videos into Event #20 (<code>Apr 20</code>, file mtime).<br>
+            2. <strong>Highlight video hang on real MP4:</strong> Photo-only highlight renders in &lt;1s (2.39 MB), but adding <code>video_20260418_144808.mp4</code> hangs past 60s (<code>main.swift:692, 1147-1155</code>).<br>
+            3. <strong>Event over-fragmentation:</strong> 3 days in Moab/Grand County split into 20 events (10 single-photo events) due to hardcoded <code>max_distance_m = 500.0</code> (<code>db.rs:1390</code>).
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="sec-workflow">
+    <h2 id="sec-workflow">2. Intended Purpose vs. Actual Workflow Fulfillment</h2>
+    <p>
+      <strong>Our Intended User Journey:</strong> After a trip or family event, gather photos &amp; videos (including from multiple people), classify them on-device, clean up duplicates/blur, automatically suggest the best handpicked shots that <strong>cover every day, place, and person</strong>, and generate a <strong>Memory Video + Shareable Collection</strong> for friends and family.
+    </p>
+
+    <figure class="diagram" role="img" aria-label="End-to-end workflow diagram showing 6 stages from Ingest to Family Share, highlighting where the pipeline currently breaks">
+      <svg viewBox="0 0 1040 310" width="100%" height="auto">
+        <title>Intended Collective Photo-Sharing Workflow vs. Current Breakpoints</title>
+        <desc>Six-stage pipeline: 1. Ingest &amp; Pool, 2. Classify &amp; Enrich, 3. Cleanup &amp; Triage, 4. Trip &amp; Coverage Selection, 5. Memory Video Synthesis, 6. Group Share Pack. Stages 1 and 3 are green; Stage 2 is amber; Stages 4, 5, and 6 are red with specific failure modes.</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b"/>
+          </marker>
+        </defs>
+        <!-- Stage 1 -->
+        <rect x="10" y="20" width="155" height="125" rx="8" fill="#143622" stroke="#22c55e" stroke-width="2"/>
+        <text x="22" y="44" fill="#86efac" font-size="12" font-weight="700">1. INGEST &amp; POOL</text>
+        <text x="22" y="66" fill="#e8edf5" font-size="11">• Copy card→SSD</text>
+        <text x="22" y="84" fill="#e8edf5" font-size="11">• Multi-folder index</text>
+        <text x="22" y="102" fill="#e8edf5" font-size="11">• Disk verify &amp; restore</text>
+        <text x="22" y="128" fill="#fde68a" font-size="10">Gap: No contributor tag</text>
+
+        <line x1="165" y1="82" x2="183" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 2 -->
+        <rect x="185" y="20" width="155" height="125" rx="8" fill="#3f2e12" stroke="#f59e0b" stroke-width="2"/>
+        <text x="197" y="44" fill="#fde68a" font-size="12" font-weight="700">2. CLASSIFY &amp; ENRICH</text>
+        <text x="197" y="66" fill="#e8edf5" font-size="11">• Photo EXIF + GPS ✓</text>
+        <text x="197" y="84" fill="#e8edf5" font-size="11">• Faces (14 clusters) ✓</text>
+        <text x="197" y="102" fill="#e8edf5" font-size="11">• Vision scene tags ✓</text>
+        <text x="197" y="128" fill="#fca5a5" font-size="10"> Break: Video date/GPS=0</text>
+
+        <line x1="340" y1="82" x2="358" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 3 -->
+        <rect x="360" y="20" width="155" height="125" rx="8" fill="#143622" stroke="#22c55e" stroke-width="2"/>
+        <text x="372" y="44" fill="#86efac" font-size="12" font-weight="700">3. CLEANUP TRIAGE</text>
+        <text x="372" y="66" fill="#e8edf5" font-size="11">• SHA-256 exact dupes ✓</text>
+        <text x="372" y="84" fill="#e8edf5" font-size="11">• dHash near-dupes ✓</text>
+        <text x="372" y="102" fill="#e8edf5" font-size="11">• Blur + Review queue ✓</text>
+        <text x="372" y="128" fill="#fde68a" font-size="10">Gap: dHash not auto-run</text>
+
+        <line x1="515" y1="82" x2="533" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 4 -->
+        <rect x="535" y="20" width="155" height="125" rx="8" fill="#451a1a" stroke="#ef4444" stroke-width="2"/>
+        <text x="547" y="44" fill="#fca5a5" font-size="12" font-weight="700">4. COVERAGE SELECT</text>
+        <text x="547" y="66" fill="#fca5a5" font-size="11">• 500m splits trip×20</text>
+        <text x="547" y="84" fill="#fca5a5" font-size="11">• Top-12 = sharpness only</text>
+        <text x="547" y="102" fill="#fca5a5" font-size="11">• No day/place/face quota</text>
+        <text x="547" y="128" fill="#fca5a5" font-size="10">• Videos never picked</text>
+
+        <line x1="690" y1="82" x2="708" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 5 -->
+        <rect x="710" y="20" width="155" height="125" rx="8" fill="#451a1a" stroke="#ef4444" stroke-width="2"/>
+        <text x="722" y="44" fill="#fca5a5" font-size="12" font-weight="700">5. MEMORY VIDEO</text>
+        <text x="722" y="66" fill="#fca5a5" font-size="11">• Hangs on real MP4</text>
+        <text x="722" y="84" fill="#fca5a5" font-size="11">• First 20 files by path</text>
+        <text x="722" y="102" fill="#fca5a5" font-size="11">• No day/place chapters</text>
+        <text x="722" y="128" fill="#fca5a5" font-size="10">• Static 3s slides, no pan</text>
+
+        <line x1="865" y1="82" x2="883" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 6 -->
+        <rect x="885" y="20" width="145" height="125" rx="8" fill="#3f2e12" stroke="#f59e0b" stroke-width="2"/>
+        <text x="897" y="44" fill="#fde68a" font-size="12" font-weight="700">6. GROUP SHARE</text>
+        <text x="897" y="66" fill="#e8edf5" font-size="11">• Drive + WhatsApp ✓</text>
+        <text x="897" y="84" fill="#fca5a5" font-size="11">• Flat folder only</text>
+        <text x="897" y="102" fill="#fca5a5" font-size="11">• No GPS strip option</text>
+        <text x="897" y="128" fill="#fca5a5" font-size="10">• No HTML story page</text>
+
+        <!-- Bottom Reality Box: What actually happened on Moab 2026 -->
+        <rect x="10" y="170" width="1020" height="125" rx="8" fill="#171c26" stroke="#2e3748" stroke-width="1.5"/>
+        <text x="26" y="196" fill="#93c5fd" font-size="13" font-weight="700">What Actually Happens Today on Your Moab 2026 Library (304 readable assets: Apr 17–19, 2026):</text>
+        <text x="26" y="220" fill="#e8edf5" font-size="12">1. Driving down US-191 into Moab creates 11 separate 1–4 photo events in 60 minutes because haversine &gt; 500m splits events even when Max Gap = 48h.</text>
+        <text x="26" y="242" fill="#e8edf5" font-size="12">2. All 34 MP4 videos lose their capture timestamps/GPS in videoStat() and get exiled into Event #20 ("Apr 20 · no location").</text>
+        <text x="26" y="264" fill="#e8edf5" font-size="12">3. Clicking "＋ Top 12" on an event picks the 12 highest-Laplacian-variance JPEGs — potentially 12 near-identical shots of one rock arch, with 0 videos and 0 people quota.</text>
+        <text x="26" y="284" fill="#e8edf5" font-size="12">4. Clicking "Highlight video" on Event #15 (160 assets) takes the first 20 files alphabetically by filename (first 15 mins of the day) and deadlocks if a video is reached.</text>
+      </svg>
+      <figcaption>Figure 1 — End-to-End Collective Trip Workflow vs. Observed Moab 2026 Behavior.</figcaption>
+    </figure>
+
+    <details>
+      <summary>View Mermaid Source (Workflow &amp; Architecture Pipeline)</summary>
+      <pre class="mermaid">flowchart LR
+  subgraph S1["1. Ingest &amp; Pool"]
+    A1["Copy to SSD (ingest_copy_tree)"] --&gt; A2["Scan &amp; Index (scan_roots)"]
+  end
+  subgraph S2["2. Classify &amp; Enrich"]
+    B1["Photo EXIF/GPS (imageStat)"]
+    B2["Video Stat (videoStat — MISSING QuickTime Date/GPS)"]
+    B3["Vision Tags + FeaturePrint + Faces"]
+  end
+  subgraph S3["3. Cleanup &amp; Triage"]
+    C1["Exact Dupes (SHA-256)"]
+    C2["Near Dupes (64-bit dHash)"]
+    C3["Blur (Laplacian &lt; 25)"]
+    C4["Keyboard Review Queue (D/S/K/A)"]
+  end
+  subgraph S4["4. Coverage Curation (GAP)"]
+    D1["cluster_events (500m radius shatters trips)"]
+    D2["event_top_picks (Sharpness only, no day/place/person coverage)"]
+  end
+  subgraph S5["5. Memory Video &amp; Share (GAP)"]
+    E1["make_highlight (Path-ordered first 20, hangs on MP4)"]
+    E2["export_bundle (Flat Drive/WhatsApp folder)"]
+  end
+  S1 --&gt; S2 --&gt; S3 --&gt; S4 --&gt; S5</pre>
+    </details>
+  </section>
+
+  <section aria-labelledby="sec-matrix">
+    <h2 id="sec-matrix">3. Capability-by-Capability Comparative Analysis</h2>
+    <p>Filter by status to inspect how FotoFlow’s technical approach compares against Apple Photos (macOS/iOS 26), Google Photos, and Samsung Galaxy AI, and where our specific workflow gaps lie.</p>
+
+    <div class="filter-bar" role="group" aria-label="Filter capabilities by status">
+      <button type="button" data-filter="all" aria-pressed="true">All (12)</button>
+      <button type="button" data-filter="ahead" aria-pressed="false">Ahead (2)</button>
+      <button type="button" data-filter="near" aria-pressed="false">Near Parity (4)</button>
+      <button type="button" data-filter="behind" aria-pressed="false">Behind / Critical Gap (6)</button>
+    </div>
+
+    <table>
+      <caption>Capability Comparison: Approach Differences, Repo Evidence &amp; Workflow Gaps</caption>
+      <thead>
+        <tr>
+          <th scope="col">Capability</th>
+          <th scope="col">FotoFlow Approach &amp; Evidence</th>
+          <th scope="col">Apple / Google / Samsung Approach</th>
+          <th scope="col">Difference in Approach &amp; Gap in Our Workflow</th>
+          <th scope="col">Status</th>
+        </tr>
+      </thead>
+      <tbody id="cap-tbody"></tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="sec-gaps">
+    <h2 id="sec-gaps">4. Deep Dive: The 7 Critical Gaps Blocking Our Intended Workflow</h2>
+
+    <div class="card-grid">
+      <article class="card">
+        <h3>Gap 1 — Video Metadata Blindness &amp; Highlight Deadlock <span class="pill fail">P0 BLOCKER</span></h3>
+        <p><strong>Evidence:</strong> <code>sidecar/engine/Sources/engine/main.swift:245-261</code>, <code>568-745</code>, <code>1147-1155</code></p>
+        <ul class="tight">
+          <li><strong>Why 0/34 Moab videos have dates or GPS:</strong> <code>videoStat()</code> only checks <code>asset.creationDate?.stringValue</code> with a strict ISO-8601 parser and never reads <code>asset.creationDate?.dateValue</code>, QuickTime keys (<code>com.apple.quicktime.creationdate</code>, <code>com.apple.quicktime.location.ISO6709</code>), or Android/MP4 filename timestamps (<code>video_YYYYMMDD_HHMMSS.mp4</code>).</li>
+          <li><strong>Why <code>make_highlight</code> hangs on real MP4s:</strong>
+            <ol>
+              <li><code>background()</code> blocks the main thread in <code>done.wait()</code> while AVFoundation’s Fig inspector dispatches callbacks to the main queue.</li>
+              <li><code>aOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)</code> reads compressed AAC packets, then feeds them into <code>AVAssetWriterInput</code> configured with <code>kAudioFormatMPEG4AAC</code> output settings (which requires uncompressed Linear PCM input).</li>
+            </ol>
+          </li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h3>Gap 2 — Trip vs. Micro-Event Fragmentation <span class="pill fail">P0 BLOCKER</span></h3>
+        <p><strong>Evidence:</strong> <code>src-tauri/src/db.rs:1388-1394</code>, <code>src-tauri/src/lib.rs:968,1600</code>, <code>src/routes/+page.svelte:2914</code></p>
+        <ul class="tight">
+          <li><strong>Our approach:</strong> Consecutive assets stay in one event only if <code>(taken_at - last_time) &lt;= gap_seconds &amp;&amp; haversine_m &lt;= 500.0</code>.</li>
+          <li><strong>Why it fails on trips:</strong> On a road trip or hike, moving 600 meters splits the event even if taken 60 seconds later and even if the user sets <code>Max gap = 48h</code> in the UI! In <code>fotoflow.db</code>, Apr 18 in Moab is fractured into <strong>15 separate events</strong> (10 of them single-photo events along US-191).</li>
+          <li><strong>Competitor approach:</strong> Two-tier hierarchy: <strong>Trip</strong> (multi-day, 30–50 km radius or away-from-home span: "Moab Trip · Apr 17–20") containing <strong>Moments / Stops</strong> (500m–2km stops within each day).</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h3>Gap 3 — Auto-Best Selection Lacks Day / Place / Person Coverage <span class="pill fail">P0 WORKFLOW GAP</span></h3>
+        <p><strong>Evidence:</strong> <code>src-tauri/src/db.rs:1656-1667</code>, <code>src/routes/+page.svelte:589-623, 1951</code></p>
+        <ul class="tight">
+          <li><strong>Current <code>event_top_picks</code>:</strong> Pure SQL <code>ORDER BY COALESCE(a.quality_score, -1) DESC LIMIT 12</code>.</li>
+          <li><strong>What goes wrong:</strong>
+            <ul>
+              <li>Laplacian variance rewards high-frequency textures (rocks, foliage) over portraits with shallow depth-of-field (bokeh).</li>
+              <li>Can pick 10 burst/near-duplicate shots from the same 2-minute stop while leaving 4 other stops and entire days with <strong>zero</strong> photos.</li>
+              <li>Ignores <code>favorite = 1</code>, ignores named faces (<code>face_clusters</code>), and never picks videos (<code>quality_score IS NULL</code> → <code>-1</code>).</li>
+            </ul>
+          </li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h3>Gap 4 — Memory Video Is a Blind 60s Slice, Not a Story <span class="pill fail">P1 WORKFLOW GAP</span></h3>
+        <p><strong>Evidence:</strong> <code>src-tauri/src/lib.rs:1915-1961</code>, <code>src-tauri/src/db.rs:1621-1626</code>, <code>main.swift:557-790</code></p>
+        <ul class="tight">
+          <li><strong>Current behavior:</strong> <code>export_highlight</code> passes all event assets ordered by <code>a.path</code> to <code>makeHighlight</code>, which takes 3s per item until <code>cursor.seconds &gt;= 60</code> (~20 items) and drops the remaining 140 items!</li>
+          <li><strong>What goes wrong:</strong>
+            <ul>
+              <li>Includes blurred and duplicate photos in the montage.</li>
+              <li>Only covers the first ~20 filenames of an event — never reaches afternoon/evening or later days.</li>
+              <li>No Ken Burns subtle zoom/pan on stills, no crossfade transitions, and no Day/Place title card overlays.</li>
+            </ul>
+          </li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h3>Gap 5 — Collective Multi-Contributor Pooling <span class="pill warn">P1 WORKFLOW GAP</span></h3>
+        <p><strong>Evidence:</strong> <code>src-tauri/src/db.rs:343-393</code>, <code>src-tauri/src/lib.rs:2545-2690</code></p>
+        <ul class="tight">
+          <li>When friends &amp; family pool photos from 3–5 phones/cameras into a shared trip:
+            <ul>
+              <li><strong>No contributor / source-folder tag:</strong> You can’t see or filter whose phone a photo came from or ensure every contributor’s shots are represented.</li>
+              <li><strong>Clock-skew &amp; filename fallback:</strong> WhatsApp/shared files or cameras with wrong timezones lack EXIF or shift by hours; we don’t parse <code>IMG_YYYYMMDD_HHMMSS</code> / <code>video_YYYYMMDD_HHMMSS</code> when EXIF is missing.</li>
+              <li><strong>Group representation:</strong> No "Make sure everyone in our travel group appears at least N times" quota in curation.</li>
+            </ul>
+          </li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h3>Gap 6 — Classification &amp; Post-Import Pipeline Gaps <span class="pill warn">P1 USABILITY GAP</span></h3>
+        <p><strong>Evidence:</strong> <code>src-tauri/src/lib.rs:924-1032</code></p>
+        <ul class="tight">
+          <li><code>run_post_import</code> runs <code>cluster_events</code> at line 968 <strong>before</strong> <code>run_cluster_faces</code> at line 1009, so initial event face counts are stale until re-clustered.</li>
+          <li><code>run_near_duplicates</code> (dHash) and <code>detect_pets</code> are not run in <code>run_post_import</code> — the user has to know to click "Find similar photos" in Cleanup manually.</li>
+          <li>Videos get zero scene tags and zero visual embeddings (<code>embed_batch</code> and <code>classify</code> skip videos instead of sampling a keyframe).</li>
+        </ul>
+      </article>
+    </div>
+
+    <figure class="diagram" role="img" aria-label="Diagram comparing current top-12 sharpness sort against proposed coverage-guaranteed curation algorithm">
+      <svg viewBox="0 0 1040 245" width="100%" height="auto">
+        <title>Current Sharpness-Only Pick vs. Proposed Coverage-Guaranteed Trip Curation</title>
+        <desc>Left side shows current SQL query picking 12 rock shots from Day 1 Stop A and 0 from Stop B, Day 2, or Videos. Right side shows proposed greedy coverage algorithm allocating quotas across every Day and Place stop, deduplicating by dHash/FeaturePrint, boosting Favorites and Named Faces, and interleaving top video clips.</desc>
+        <!-- Left: Current -->
+        <rect x="10" y="15" width="490" height="215" rx="8" fill="#451a1a" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="26" y="42" fill="#fca5a5" font-size="13" font-weight="700">Today: event_top_picks (db.rs:1656)</text>
+        <text x="26" y="66" fill="#e8edf5" font-size="11" font-family="monospace">ORDER BY COALESCE(quality_score, -1) DESC LIMIT 12</text>
+        <rect x="26" y="84" width="455" height="58" rx="6" fill="#171c26" stroke="#2e3748"/>
+        <text x="38" y="106" fill="#fca5a5" font-size="11">Result on 300-photo Trip:</text>
+        <text x="38" y="126" fill="#e8edf5" font-size="11">• 9 near-identical sunlit landscape shots from 10:15 AM (highest Laplacian)</text>
+        <text x="26" y="164" fill="#fca5a5" font-size="11">✗ 0 evening/indoor dinners   ✗ 0 videos   ✗ 0 portraits w/ bokeh   ✗ 3 places missed</text>
+        <text x="26" y="190" fill="#fca5a5" font-size="11">✗ Can include 3 members of the same near-duplicate group</text>
+
+        <!-- Right: Proposed -->
+        <rect x="535" y="15" width="495" height="215" rx="8" fill="#143622" stroke="#22c55e" stroke-width="1.5"/>
+        <text x="551" y="42" fill="#86efac" font-size="13" font-weight="700">Target: Coverage-Guaranteed Smart Curation + Story Planner</text>
+        <text x="551" y="66" fill="#e8edf5" font-size="11">1. Filter out: missing, blurred, non-keeper duplicates &amp; near-duplicates</text>
+        <text x="551" y="86" fill="#e8edf5" font-size="11">2. Bucket by (Day × Place / Stop) so EVERY day &amp; visited place gets ≥1 slot</text>
+        <text x="551" y="106" fill="#e8edf5" font-size="11">3. Composite Score = Favorite(+50) + NamedFaces(+15) + norm(Sharpness) + Resolution</text>
+        <text x="551" y="126" fill="#e8edf5" font-size="11">4. Enforce Diversity: skip candidate if FeaturePrint cosine &gt; 0.88 to already-picked</text>
+        <text x="551" y="146" fill="#e8edf5" font-size="11">5. Media Mix: reserve 15–25% of slots for top video clips across days</text>
+        <text x="551" y="172" fill="#86efac" font-size="11">✓ Every day covered  ✓ Every place covered  ✓ Every named person included  ✓ Videos mixed</text>
+        <text x="551" y="196" fill="#86efac" font-size="11">✓ Directly feeds both the Handpicked Album AND the 60–90s Memory Video</text>
+      </svg>
+      <figcaption>Figure 2 — How to close the Curation &amp; Memory Video gap using signals FotoFlow already computes on-device.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="sec-ux">
+    <h2 id="sec-ux">5. UX &amp; Usability Gaps Across the User Journey</h2>
+    <table>
+      <caption>UX &amp; Usability Friction Points Found During E2E Review</caption>
+      <thead>
+        <tr>
+          <th scope="col">Surface</th>
+          <th scope="col">Current UX Behavior (<code>file:line</code>)</th>
+          <th scope="col">Usability Problem for the User</th>
+          <th scope="col">Recommended UX Fix</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Events Tab: Adding to Album</th>
+          <td><code>+page.svelte:4697,4704</code> — <code>＋ Album</code> and <code>＋ Top 12</code> buttons are <strong>disabled</strong> until <code>eventMembers[event.id]</code> is loaded by clicking <code>Show photos</code> first!</td>
+          <td>A user looking at the Events list sees greyed-out <code>＋ Album</code> and <code>＋ Top 12</code> buttons on every collapsed event card with no explanation why.</td>
+          <td>Enable <code>＋ Album</code> and <code>＋ Top 12</code> whenever <code>event.assetCount &gt; 0</code>; fetch <code>eventAssets(event.id)</code> on demand if not yet expanded.</td>
+        </tr>
+        <tr>
+          <th scope="row">Events Tab: Trip vs. Stop Control</th>
+          <td><code>+page.svelte:4619-4632</code> — exposes <code>Max gap (h)</code> input (1–168h), but <code>runClusterEvents()</code> at <code>+page.svelte:2914</code> always passes <code>maxDistanceM = 500</code>.</td>
+          <td>The tooltip says <em>"raise it to group multi-day trips"</em>, but raising <code>Max gap</code> to 72h still leaves Moab shattered into 20 events because of the hidden 500m distance cap.</td>
+          <td>Add a <strong>Trip radius (km)</strong> control (or "Group as: Stops (0.5 km) | Day outings (10 km) | Multi-day Trip (50 km)") alongside Max gap.</td>
+        </tr>
+        <tr>
+          <th scope="row">Highlight Video Preview &amp; Progress</th>
+          <td><code>+page.svelte:4675-4718</code> — button says <code>Exporting…</code> with no progress bar and writes MP4 to hidden <code>~/Library/Application Support/.../exports/</code>, showing only a text path.</td>
+          <td>User cannot watch the generated Memory Video inside FotoFlow’s viewer, cannot see render progress, and cannot choose where to save/share it.</td>
+          <td>Stream frame progress from engine, add a <strong>"▶ Watch highlight"</strong> button + <strong>"Reveal in Finder / Save to…"</strong> right on the result banner.</td>
+        </tr>
+        <tr>
+          <th scope="row">Multi-Event / Whole-Trip Curation</th>
+          <td>Curation (<code>＋ Top 12</code>, <code>Highlight video</code>, <code>For Google Drive</code>, <code>For WhatsApp</code>) only exists per single Event or per single Album.</td>
+          <td>To share a 4-day trip that has 6 events, the user must manually click into each event, add top picks to an album one by one, and still gets no cross-day balance.</td>
+          <td>Add a <strong>"Curate Trip / Build Share Pack"</strong> flow (select date range or multiple events → auto-pick N best covering all days, places, and people → preview &amp; tweak → export album + memory video).</td>
+        </tr>
+        <tr>
+          <th scope="row">Album Ordering &amp; Story Review</th>
+          <td><code>db.rs:1985</code> — <code>album_assets</code> orders by <code>aa.added_at, a.id</code> instead of chronological capture time (<code>COALESCE(a.captured_at, a.modified)</code>).</td>
+          <td>When you handpick photos out of order into an album and click <code>Highlight video</code>, the memory video jumps backward and forward in time randomly.</td>
+          <td>Order album assets chronologically by capture timestamp (with optional manual reorder) so slideshows and highlight videos follow the trip’s real timeline.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="sec-roadmap">
+    <h2 id="sec-roadmap">6. Actionable Next Steps to Close the Gap (Ordered P0 → P2)</h2>
+
+    <ol class="steps">
+      <li>
+        <strong>P0.1 — Fix Video Metadata Extraction &amp; Filename Timestamp Fallback (<code>main.swift:245</code>, <code>db.rs:2028</code>):</strong>
+        Read QuickTime creation date via <code>asset.creationDate?.dateValue</code> + metadata items (<code>com.apple.quicktime.creationdate</code>), parse ISO-6709 GPS (<code>com.apple.quicktime.location.ISO6709</code>, e.g. <code>+38.5724-109.5509/</code>), and fall back to parsing <code>IMG_YYYYMMDD_HHMMSS</code> / <code>video_YYYYMMDD_HHMMSS</code> filenames when EXIF/QuickTime timestamps are absent. Re-enrich videos so all 34 Moab videos join their real Apr 17–19 events.
+      </li>
+      <li>
+        <strong>P0.2 — Fix <code>make_highlight</code> Video Hang &amp; Chronological Ordering (<code>main.swift:605-745, 1147</code>, <code>db.rs:1621, 1985</code>):</strong>
+        Decode audio as Linear PCM (<code>kAudioFormatLinearPCM</code>) in <code>AVAssetReaderTrackOutput</code> before feeding the AAC <code>AVAssetWriterInput</code>, call <code>cancelReading()</code> after taking the 3s clip slice, avoid main-queue deadlock in <code>background()</code>, and order <code>event_assets</code> / <code>album_assets</code> chronologically by <code>COALESCE(a.captured_at, a.modified)</code> while excluding missing/blurred files.
+      </li>
+      <li>
+        <strong>P0.3 — Trip-Scale Event Clustering &amp; Enabled Top-Picks UX (<code>db.rs:1388</code>, <code>+page.svelte:4619, 4697</code>):</strong>
+        Scale distance tolerance with <code>gap_hours</code> (or expose a <em>Stops vs. Trip</em> distance preset, e.g. 50 km when grouping a multi-day trip), run <code>cluster_events</code> <em>after</em> <code>run_cluster_faces</code> + <code>run_near_duplicates</code> in <code>run_post_import</code>, and enable <code>＋ Album</code> / <code>＋ Top 12</code> without requiring <code>Show photos</code> first.
+      </li>
+      <li>
+        <strong>P1.1 — Coverage-Guaranteed Auto-Best Curation Engine (<code>db.rs:1656</code>):</strong>
+        Upgrade <code>event_top_picks</code> (and add multi-event / date-range <code>curate_trip_picks</code>) so it:
+        (a) excludes blurred and non-keeper duplicates/near-duplicates,
+        (b) allocates slots across every <strong>Day × Place cell</strong> first (guaranteeing 100% day &amp; place coverage),
+        (c) scores candidates by <code>Favorite + Named Face presence + normalized Sharpness + Resolution</code>,
+        (d) enforces visual diversity via <code>asset_vectors</code> cosine / <code>dhash</code> distance, and
+        (e) includes top video clips alongside photos.
+      </li>
+      <li>
+        <strong>P1.2 — Story-Driven Memory Video (Chapters + Ken Burns + In-App Playback):</strong>
+        Feed the coverage-guaranteed picks into <code>make_highlight</code> so a 60–90s video spans the entire trip from Day 1 to the finale, render subtle Ken Burns pan/zoom + crossfades on still photos, stamp optional Day/Place chapter lower-thirds ("Apr 18 · Grand County, Utah"), and let the user watch/save the MP4 directly in FotoFlow.
+      </li>
+      <li>
+        <strong>P2 — One-Click "Share Pack" for Friends &amp; Family:</strong>
+        Export a curated album or trip as a ready-to-share folder containing: (1) the Memory Video MP4, (2) the handpicked photos/videos organized by Day &amp; Place (Drive full-res or WhatsApp compact, with an optional "Strip GPS before sharing" toggle), and (3) a self-contained offline <code>index.html</code> trip story gallery that friends/family can open in any browser.
+      </li>
+    </ol>
+  </section>
+
+</main>
+
+<script type="application/json" id="report-data">
+[
+  {
+    "cap": "1. Ingest & Multi-Contributor Pooling",
+    "status": "near",
+    "label": "Near Parity",
+    "ff": "Folder scan + Copy-to-SSD mirror with byte verification (lib.rs:2545) + disk-health probe (verify_library). Multiple roots supported.",
+    "comp": "Apple/Google: Cloud Shared Library / Partner Sharing pools family photos automatically. Immich: multi-user upload + external libraries.",
+    "gap": "Strong for local SSD offload. Gap for group trips: no 'Contributor / Source' tag per imported folder, and no filename timestamp parser (IMG_YYYYMMDD_HHMMSS) when friends' shared files lack EXIF."
+  },
+  {
+    "cap": "2. Metadata & Video Enrichment",
+    "status": "behind",
+    "label": "Critical Bug",
+    "ff": "ImageIO EXIF for photos (camera, lens, ISO, f-number, exposure, focalLength35, GPS). AVURLAsset for videos (main.swift:245).",
+    "comp": "Apple/Google extract QuickTime creationDate, ISO-6709 GPS (+lat-lon/), codec, and keyframes from MP4/MOV identically to photos.",
+    "gap": "videoStat() misses QuickTime dates and GPS on 34/34 Moab MP4s, causing all videos to sort by file copy date with NULL location."
+  },
+  {
+    "cap": "3. Duplicate, Near-Dupe & Blur Cleanup",
+    "status": "ahead",
+    "label": "Ahead",
+    "ff": "Size-bucketed SHA-256 exact dupes + 64-bit dHash near-dupes + Laplacian blur score + side-by-side 1600px compare + keyboard review triage (D/S/K/A) + space-saver compact export + Recently Deleted restore.",
+    "comp": "Apple Photos: exact + near duplicates in Utilities, no blur queue or keyboard staging. Google Photos: exact dupes + storage manager.",
+    "gap": "Ahead on review UX and transparency. Minor gap: run_near_duplicates (dHash) is not called automatically in run_post_import (lib.rs:924)."
+  },
+  {
+    "cap": "4. People & Pet Intelligence",
+    "status": "near",
+    "label": "Near Parity",
+    "ff": "VNDetectFaceRectangles + FeaturePrint union-find clustering (0.55) + mutual-majority name preservation + merge/undo + full-size cluster review + auto person:<name> tags. Dogs/cats via VNRecognizeAnimals.",
+    "comp": "Apple/Google: automatic background face + pet identity clustering; filter combinations (Person A + Person B).",
+    "gap": "People clustering works well (280 faces → 14 clusters in Moab DB, 'Amol' named with 183 faces). Gaps: single-person filter only (cannot filter 'Amol AND Person 2'), pets not grouped by identity, videos not face-scanned."
+  },
+  {
+    "cap": "5. Scene Classification & Search",
+    "status": "behind",
+    "label": "Behind",
+    "ff": "VNClassifyImageRequest top-3 scene tags (~1000 categories) + Vision FeaturePrint similarity ('Similar' button) + weighted keyword search over filename/tag/event/place/person.",
+    "comp": "Apple iOS 26 / Google Ask Photos: natural-language CLIP/LLM search ('red arch at sunset') including video frames + OCR text inside images.",
+    "gap": "No natural-language text→image vector search yet (blocked on license-clean MobileCLIP/SigLIP2 text tower); videos have 0 scene tags."
+  },
+  {
+    "cap": "6. Event & Trip Clustering (Days & Places)",
+    "status": "behind",
+    "label": "Critical Gap",
+    "ff": "Sequential time + haversine clustering (db.rs:1388) + 3-tier offline/OSM reverse geocode (exact 100m cell → cached bbox → 231 static geofences → Nominatim).",
+    "comp": "Apple/Google: hierarchical Trips (multi-day away from home, 30–50 km) containing Moments/Stops, keeping a whole vacation together.",
+    "gap": "Hardcoded 500m radius splits your 3-day Moab trip into 20 fragments (10 with 1 photo) + exiles all 34 videos into a separate 'Apr 20' event."
+  },
+  {
+    "cap": "7. Auto-Best Selection & Coverage Curation",
+    "status": "behind",
+    "label": "Critical Gap",
+    "ff": "event_top_picks (db.rs:1656) picks top 12 by sharpness (quality_score DESC). Month/Year view uses compareHighlights (favorites → resolution → newest).",
+    "comp": "Apple/Google Memories & bppicker: composite aesthetic + face/smile quality + temporal/spatial diversity quotas so every day and stop is represented and near-dupes are suppressed.",
+    "gap": "Our Top 12 ignores duplicates/near-dupes, ignores faces and favorites, excludes all videos, and has zero day/place coverage quotas."
+  },
+  {
+    "cap": "8. Memory Video & Highlight Generation",
+    "status": "behind",
+    "label": "Critical Blocker",
+    "ff": "AVAssetWriter 1080p MP4 mixing 3s static stills + 3s video clips with original camera audio, capped at 60s (main.swift:557).",
+    "comp": "Apple Memory Movies / Google Recap / Samsung Auto Trim: diversity-picked clips across the whole trip, Ken Burns pans, crossfades, chapter titles, and beat/audio ducking.",
+    "gap": "1) Hangs on real Moab MP4s (audio settings mismatch + main-thread wait). 2) Takes first 20 files by path instead of sampling across the trip. 3) Static frames, no transitions, no in-app player."
+  },
+  {
+    "cap": "9. Albums & Handpicked Curation",
+    "status": "near",
+    "label": "Near Parity",
+    "ff": "Create/rename/delete albums, inline creation from Library batch bar or picker, add from folder/event/top-12.",
+    "comp": "Apple/Google: Smart albums, drag-and-drop reorder, collaborative shared albums, chronological sort option.",
+    "gap": "Albums sort by insertion order (aa.added_at) instead of capture timestamp, scrambling timeline order in slideshows/exports. Event '+ Album' buttons are disabled until 'Show photos' is clicked."
+  },
+  {
+    "cap": "10. Map & Spatial Browsing",
+    "status": "near",
+    "label": "Near Parity",
+    "ff": "Full-bleed Leaflet map, disk-cached OSM Streets + OpenTopoMap Terrain tiles, grid pin clustering below z12, popup thumbnail → Show in Library.",
+    "comp": "Apple Places / Google Map view: heatmap + thumbnail pins + filter current library view by visible map bounds.",
+    "gap": "Clicking a pin searches by filename (single photo) rather than filtering the Library to all photos at that location/cluster."
+  },
+  {
+    "cap": "11. Group Sharing & Audience Distribution",
+    "status": "behind",
+    "label": "Workflow Gap",
+    "ff": "Per-event/album export bundles: Google Drive (full-res copy) and WhatsApp (1280px JPEG + 720p MP4 recode, skipping blurred).",
+    "comp": "Google/Apple: 1-click Shared Album link or Memory Movie share with optional location stripping.",
+    "gap": "Exports raw files into a local folder, but doesn't package the Memory Video + Day/Place-organized photos + offline HTML story viewer together, nor offer a 'Strip GPS on export' privacy checkbox."
+  },
+  {
+    "cap": "12. Privacy & Offline Ownership",
+    "status": "ahead",
+    "label": "Ahead",
+    "ff": "100% on-device SQLite + Vision/AVFoundation; files stay in place on your SSD; zero cloud upload; network used only for cached OSM tiles & Nominatim place labels.",
+    "comp": "Google Photos requires cloud upload for AI/Memories/Ask Photos; Apple requires iCloud for Shared Albums/cross-device sync.",
+    "gap": "Core differentiator is intact and verified."
+  }
+]
+</script>
+<script>
+const rows = JSON.parse(document.getElementById('report-data').textContent);
+const tbody = document.getElementById('cap-tbody');
+
+function renderTable(filter) {
+  tbody.innerHTML = '';
+  for (const r of rows) {
+    if (filter !== 'all' && r.status !== filter) continue;
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<th scope="row">' + r.cap + '</th>' +
+      '<td>' + r.ff + '</td>' +
+      '<td>' + r.comp + '</td>' +
+      '<td>' + r.gap + '</td>' +
+      '<td><span class="pill ' + r.status + '">' + r.label + '</span></td>';
+    tbody.appendChild(tr);
+  }
+}
+
+renderTable('all');
+
+document.querySelectorAll('.filter-bar button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-bar button').forEach((b) => b.setAttribute('aria-pressed', 'false'));
+    btn.setAttribute('aria-pressed', 'true');
+    renderTable(btn.getAttribute('data-filter'));
+  });
+});
+</script>
+</body>
+</html>

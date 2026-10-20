@@ -1948,10 +1948,24 @@
   }
 
   // Best-of-place pick: the event's sharpest dozen into the chosen album.
+  // Loads members on demand like addEventToAlbum (no expand-first needed).
   async function addEventPicks(eventId: number) {
     const albumId = eventAlbumChoice[eventId] ?? albumOptions[0]?.id;
-    const members = eventMembers[eventId] ?? [];
-    if (albumId == null || members.length === 0 || eventAlbumBusy !== null) return;
+    if (albumId == null || eventAlbumBusy !== null) return;
+    let members = eventMembers[eventId];
+    if (members === undefined) {
+      try {
+        members = await eventAssets(eventId);
+        eventMembers = { ...eventMembers, [eventId]: members };
+      } catch (e) {
+        error = String(e).replace(/^Error: /, "");
+        return;
+      }
+    }
+    if (members.length === 0) {
+      toast = "No readable photos in this event";
+      return;
+    }
     eventAlbumBusy = eventId;
     try {
       const added = await addEventPicksToAlbum(eventId, albumId, 12);
@@ -2070,6 +2084,7 @@
         `${summary.enriched} enriched`,
         `${summary.hashed} hashed`,
         `${summary.scored} scored`,
+        `${summary.near} near-dupe groups`,
         `${summary.events} events`,
         `${summary.tagged} tagged`,
         `${summary.embedded} embedded`,
@@ -2651,8 +2666,23 @@
 
   async function addEventToAlbum(eventId: number) {
     const albumId = eventAlbumChoice[eventId];
-    const members = eventMembers[eventId] ?? [];
-    if (albumId == null || members.length === 0 || eventAlbumBusy !== null) return;
+    if (albumId == null || eventAlbumBusy !== null) return;
+    // Collapsed cards haven't loaded members yet — fetch on demand so ＋
+    // Album works without expanding Show photos first.
+    let members = eventMembers[eventId];
+    if (members === undefined) {
+      try {
+        members = await eventAssets(eventId);
+        eventMembers = { ...eventMembers, [eventId]: members };
+      } catch (e) {
+        error = String(e).replace(/^Error: /, "");
+        return;
+      }
+    }
+    if (members.length === 0) {
+      toast = "No readable photos in this event";
+      return;
+    }
     eventAlbumBusy = eventId;
     try {
       const r = await albumAdd(albumId, members.map((m) => m.id));
@@ -4694,14 +4724,14 @@
                 </select>
                 <button
                   class="tiny"
-                  disabled={(eventMembers[event.id] ?? []).length === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                  disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
                   onclick={() => void addEventToAlbum(event.id)}
                 >
                   {eventAlbumBusy === event.id ? "Adding…" : "＋ Album"}
                 </button>
                 <button
                   class="tiny"
-                  disabled={(eventMembers[event.id] ?? []).length === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                  disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
                   title="Sharpest 12 photos, blurred excluded, into the selected album"
                   onclick={() => void addEventPicks(event.id)}
                 >

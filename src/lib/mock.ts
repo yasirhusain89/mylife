@@ -588,7 +588,7 @@ export async function assetTags(assetId: number): Promise<SceneTag[]> {
 }
 
 export async function runPostImport(): Promise<PipelineSummary> {
-  return { enriched: 8, hashed: 8, scored: 8, events: 1, tagged: 2, embedded: 8, faces: 8, places: 0, failed: 0 };
+  return { enriched: 8, hashed: 8, scored: 8, near: 1, events: 1, tagged: 2, embedded: 8, faces: 8, places: 0, failed: 0 };
 }
 
 export function onPipelineProgress(_cb: (p: PipelineProgress) => void): Promise<() => void> {
