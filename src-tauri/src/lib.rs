@@ -2272,13 +2272,13 @@ async fn trash_assets(
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
-        let rows: Vec<(i64, String)> = {
+        let rows: Vec<(i64, String, String)> = {
             let mut stmt = conn
-                .prepare("SELECT id, path FROM assets WHERE id IN (SELECT value FROM json_each(?1))")
+                .prepare("SELECT id, path, name FROM assets WHERE id IN (SELECT value FROM json_each(?1))")
                 .map_err(|e| format!("trash lookup: {e}"))?;
             let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
             let mapped = stmt
-                .query_map(params![json], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map(params![json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .map_err(|e| format!("trash lookup: {e}"))?;
             let mut v = Vec::new();
             for row in mapped {
@@ -2299,7 +2299,7 @@ async fn trash_assets(
 
         let mut trashed = Vec::new();
         let mut failed = Vec::new();
-        for (id, path) in &rows {
+        for (id, path, _name) in &rows {
             let ns_path = NSString::from_str(path);
             let url = NSURL::fileURLWithPath(&ns_path);
             match fm.trashItemAtURL_resultingItemURL_error(&url, None) {
@@ -2314,6 +2314,11 @@ async fn trash_assets(
                 params![serde_json::to_string(&trashed).map_err(|e| e.to_string())?],
             )
             .map_err(|e| format!("flag missing: {e}"))?;
+            let logged: Vec<(i64, String, String)> = rows
+                .into_iter()
+                .filter(|(id, _, _)| trashed.contains(id))
+                .collect();
+            db::log_trash(&conn, &logged)?;
         }
 
         Ok(TrashSummary { trashed: trashed.len(), failed })
@@ -2378,6 +2383,7 @@ async fn restore_assets(
 
         if !restored.is_empty() {
             db::clear_missing(&conn, &restored)?;
+            db::unlog_trash(&conn, &restored)?;
         }
 
         Ok(RestoreSummary { restored: restored.len(), failed })
@@ -2391,6 +2397,20 @@ async fn restore_assets(
 struct RestoreSummary {
     restored: usize,
     failed: Vec<String>,
+}
+
+/// Recently Deleted list, newest first.
+#[tauri::command]
+fn trash_list(conn: tauri::State<'_, DbState>) -> Result<Vec<db::TrashEntry>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::trash_list(&conn)
+}
+
+/// Forgets the Recently Deleted history (macOS Trash contents untouched).
+#[tauri::command]
+fn clear_trash_log(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::clear_trash_log(&conn)
 }
 
 #[tauri::command]
@@ -2956,6 +2976,8 @@ pub fn run() {
             cleanup_stats_cmd,
             trash_assets,
             restore_assets,
+            trash_list,
+            clear_trash_log,
             cluster_faces,
             verify_library,
             clusters_list,

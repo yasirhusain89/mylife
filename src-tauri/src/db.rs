@@ -22,6 +22,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (13, include_str!("../migrations/013_vectors.sql")),
     (14, include_str!("../migrations/014_face_descriptors.sql")),
     (15, include_str!("../migrations/015_exposure.sql")),
+    (16, include_str!("../migrations/016_trash_log.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -882,6 +883,81 @@ pub fn clear_missing(conn: &Connection, ids: &[i64]) -> Result<usize, String> {
         )
         .map_err(|e| format!("restore flag: {e}"))?;
     Ok(changed)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashEntry {
+    pub asset_id: i64,
+    pub path: String,
+    pub name: String,
+    pub trashed_at: i64,
+}
+
+/// Remembers trashed assets for Recently Deleted. Re-trash refreshes the
+/// stamp (INSERT OR REPLACE by asset).
+pub fn log_trash(conn: &Connection, rows: &[(i64, String, String)]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO trash_log (asset_id, path, name, trashed_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (asset_id) DO UPDATE SET path = excluded.path, name = excluded.name,
+             trashed_at = excluded.trashed_at",
+        )
+        .map_err(|e| format!("prepare log trash: {e}"))?;
+    let ts = now();
+    for (id, path, name) in rows {
+        stmt.execute(params![id, path, name, ts])
+            .map_err(|e| format!("log trash: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Forgets restored assets from Recently Deleted.
+pub fn unlog_trash(conn: &Connection, ids: &[i64]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM trash_log WHERE asset_id IN (SELECT value FROM json_each(?1))",
+        params![json],
+    )
+    .map_err(|e| format!("unlog trash: {e}"))?;
+    Ok(())
+}
+
+/// Recently Deleted, newest first.
+pub fn trash_list(conn: &Connection) -> Result<Vec<TrashEntry>, String> {
+    let mut stmt = conn
+        .prepare("SELECT asset_id, path, name, trashed_at FROM trash_log ORDER BY trashed_at DESC, asset_id DESC")
+        .map_err(|e| format!("prepare trash list: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TrashEntry {
+                asset_id: r.get(0)?,
+                path: r.get(1)?,
+                name: r.get(2)?,
+                trashed_at: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query trash list: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("trash row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Forgets the whole Recently Deleted history (files already in the macOS
+/// Trash stay there; library rows are untouched).
+pub fn clear_trash_log(conn: &Connection) -> Result<i64, String> {
+    let n = conn
+        .execute("DELETE FROM trash_log", [])
+        .map_err(|e| format!("clear trash log: {e}"))?;
+    Ok(n as i64)
 }
 
 /// Reattaches one face to a cluster (undo for unassign_face). Recounts the
@@ -3173,10 +3249,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 15, "user_version tracks the highest applied migration");
+        assert_eq!(v, 16, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -4657,6 +4733,31 @@ mod tests {
         let one = event_top_picks(&conn, eid, 1).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].path, "/b.jpg", "limit honored");
+    }
+
+    #[test]
+    fn trash_log_remembers_restore_forgets_and_clears() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(trash_list(&conn).unwrap().is_empty());
+        log_trash(&conn, &[(7, "/t/a.jpg".into(), "a.jpg".into())]).unwrap();
+        log_trash(&conn, &[(9, "/t/b.jpg".into(), "b.jpg".into())]).unwrap();
+        // Re-trash refreshes instead of duplicating.
+        log_trash(&conn, &[(7, "/t/a.jpg".into(), "a.jpg".into())]).unwrap();
+        let mut rows = trash_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        rows.sort_by_key(|r| r.asset_id);
+        assert_eq!([rows[0].asset_id, rows[1].asset_id], [7, 9]);
+        // Newest first (timestamps are second-granularity, so force the gap).
+        conn.execute("UPDATE trash_log SET trashed_at = trashed_at + 100 WHERE asset_id = 7", []).unwrap();
+        let rows = trash_list(&conn).unwrap();
+        assert_eq!(rows[0].asset_id, 7, "newest first");
+        unlog_trash(&conn, &[7]).unwrap();
+        let rows = trash_list(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, 9);
+        assert_eq!(clear_trash_log(&conn).unwrap(), 1);
+        assert!(trash_list(&conn).unwrap().is_empty());
     }
 }
 
