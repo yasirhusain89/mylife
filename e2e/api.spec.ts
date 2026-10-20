@@ -141,6 +141,23 @@ test("path import via Scan adds a second root and grows counts", async ({ page }
     return (await r.json()) as { root: string }[];
   }, API!);
   expect(roots.some((r) => r.root === tmpRoot)).toBe(true);
+
+  // Removing the root returns the library to its seeded counts, so the
+  // shared DB file stays clean for the next suite run.
+  const removed = await page.evaluate(async ({ base, root }) => {
+    const r = await fetch(`${base}/api/roots`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root })
+    });
+    return (await r.json()) as { removedAssets: number; removedScans: number };
+  }, { base: API!, root: tmpRoot });
+  expect(removed.removedAssets).toBeGreaterThanOrEqual(2);
+  const restored = await page.evaluate(async (base) => {
+    const r = await fetch(`${base}/api/library/count`);
+    return ((await r.json()) as { count: number }).count;
+  }, API!);
+  expect(restored).toBe(before);
 });
 
 test("map pins endpoint serves an array", async ({ page }) => {

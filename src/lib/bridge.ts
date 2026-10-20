@@ -64,6 +64,7 @@ export const libraryMonths = pickRead("libraryMonths");
 export const libraryStats = pickRead("libraryStats");
 export const scanRoots = pickRead("scanRoots");
 export const assetsInRoot = pickRead("assetsInRoot");
+export const removeRoot = pickWrite("removeRoot");
 export const mapPins = pickRead("mapPins");
 export const mapTile = pickRead("mapTile");
 export const setFavorite = pickWrite("setFavorite");
@@ -184,6 +185,7 @@ export type {
   ScanRoot,
   SceneTag,
   SceneTagCount,
+  RemoveRootSummary,
   SimilarHit,
   TagProgress,
   TagScenesSummary

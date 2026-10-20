@@ -233,6 +233,20 @@ export function assetsInRoot(root: string): Promise<number[]> {
   return invoke("assets_in_root", { root });
 }
 
+export type RemoveRootSummary = {
+  root: string;
+  removedAssets: number;
+  removedFaces: number;
+  removedSightings: number;
+  prunedClusters: number;
+  removedScans: number;
+};
+
+/** Forgets one indexed root (index rows only — files on disk are untouched). */
+export function removeRoot(root: string): Promise<RemoveRootSummary> {
+  return invoke("remove_root", { root });
+}
+
 export type MapPin = {
   id: number;
   path: string;

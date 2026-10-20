@@ -92,6 +92,8 @@
     mapPins,
     mapTile,
     type MapPin,
+    removeRoot,
+    type RemoveRootSummary
   } from "$lib/bridge";
   import { engineCall, engineSysInfo, type SysInfo } from "$lib/bridge";
   import "leaflet/dist/leaflet.css";
@@ -1444,6 +1446,31 @@
     }
   }
 
+  // Indexed-folder removal: forgets the root's index rows (files on disk
+  // are untouched). Confirm dialog mirrors the album delete below.
+  let removeRootTarget = $state<ScanRoot | null>(null);
+  let removingRoot = $state(false);
+
+  function askRemoveRoot(root: ScanRoot) {
+    removeRootTarget = root;
+  }
+
+  async function confirmRemoveRoot() {
+    const target = removeRootTarget;
+    removeRootTarget = null;
+    if (!target || removingRoot) return;
+    removingRoot = true;
+    try {
+      const s = await removeRoot(target.root);
+      await refresh();
+      toast = `Removed ${target.root} — ${s.removedAssets} asset${s.removedAssets === 1 ? "" : "s"} forgotten`;
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      removingRoot = false;
+    }
+  }
+
   function openPicker(album: AlbumRow) {
     picker = { albumId: album.id, name: album.name };
     pickerSelected = new Set();
@@ -2178,6 +2205,18 @@
                 </button>
               </span>
             {/if}
+            <span class="row-actions">
+              <button
+                type="button"
+                class="tiny danger"
+                title={`Forget ${r.root} (files on disk are untouched)`}
+                aria-label={`Remove ${r.root} from the index`}
+                disabled={removingRoot}
+                onclick={() => askRemoveRoot(r)}
+              >
+                Remove
+              </button>
+            </span>
           </li>
         {/each}
       </ul>
@@ -3202,6 +3241,22 @@
         <div class="dialog-actions">
           <button class="ghost" onclick={() => (deleteAlbumTarget = null)}>Cancel</button>
           <button class="danger-solid" onclick={() => void confirmDeleteAlbum()}>Delete</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if removeRootTarget}
+    <div class="scrim" role="dialog" aria-modal="true" aria-label="Remove indexed folder" tabindex={-1}>
+      <div class="dialog">
+        <h3>Forget “{removeRootTarget.root}”?</h3>
+        <p class="hint">
+          {removeRootTarget.assets} asset{removeRootTarget.assets === 1 ? "" : "s"} leave the index.
+          Files on disk are untouched — rescan to bring them back.
+        </p>
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (removeRootTarget = null)}>Cancel</button>
+          <button class="danger-solid" onclick={() => void confirmRemoveRoot()}>Remove</button>
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@ import type {
   LibraryMonth,
   LibraryStats,
   MapPin,
+  RemoveRootSummary,
   ScanRoot,
   SceneTagCount,
   TagScenesSummary
@@ -191,4 +192,23 @@ export function tagScenes(): Promise<TagScenesSummary> {
 
 export function importFolder(root: string, recursive = true): Promise<ImportSummary> {
   return postJson<ImportSummary>("/api/imports", { root, recursive });
+}
+
+export async function removeRoot(root: string): Promise<RemoveRootSummary> {
+  const res = await fetch(`${base()}/api/roots`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root })
+  });
+  if (!res.ok) {
+    let detail: string | null = null;
+    try {
+      const parsed = (await res.json()) as { error?: unknown };
+      if (typeof parsed?.error === "string" && parsed.error.trim() !== "") detail = parsed.error;
+    } catch {
+      /* non-JSON error body — fall back to status text */
+    }
+    throw new Error(detail ?? `DELETE /api/roots failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as RemoveRootSummary;
 }

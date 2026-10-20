@@ -10,7 +10,9 @@
 //! the Vite dev server (another loopback port) call it from a browser.
 //!
 //! Write slice (POST, additive over the GET routes): favorites, album
-//! create/add, a synchronous tag-run summary, and path-based imports.
+//! create/add, a synchronous tag-run summary, path-based imports, and root
+//! removal (DELETE /api/roots with a JSON body — browsers can send bodies on
+//! DELETE; the preflight covers it).
 //! POST /api/imports runs the same db/engine import flow as the Tauri
 //! `import_folder` command (`crate::run_import`) and returns the
 //! ImportSummary shape. Paths must be visible to the server host (the
@@ -23,7 +25,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::Deserialize;
@@ -167,6 +169,22 @@ async fn map_pins(State(state): State<ApiState>) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct RemoveRootBody {
+    root: String,
+}
+
+async fn remove_root(State(state): State<ApiState>, body: axum::Json<RemoveRootBody>) -> Response {
+    let conn = match lock(&state) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match crate::db::remove_root(&conn, &body.root) {
+        Ok(summary) => (cors(), Json(summary)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn clusters(State(state): State<ApiState>) -> Response {
     let conn = match lock(&state) {
         Ok(g) => g,
@@ -226,7 +244,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/library/count", get(library_count))
         .route("/api/library/months", get(library_months))
         .route("/api/stats", get(stats))
-        .route("/api/roots", get(roots))
+        .route("/api/roots", get(roots).delete(remove_root).options(preflight))
         .route("/api/root-assets", get(root_assets))
         .route("/api/clusters", get(clusters))
         .route("/api/events", get(events))
@@ -250,7 +268,7 @@ async fn preflight() -> Response {
             (HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*")),
             (
                 HeaderName::from_static("access-control-allow-methods"),
-                HeaderValue::from_static("GET, POST, OPTIONS"),
+                HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
             ),
             (
                 HeaderName::from_static("access-control-allow-headers"),

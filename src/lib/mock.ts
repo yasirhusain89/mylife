@@ -30,6 +30,7 @@ import type {
   DetectPetsSummary,
   PipelineProgress,
   PipelineSummary,
+  RemoveRootSummary,
   ResolvePlacesSummary,
   ScanRoot,
   SceneTag,
@@ -306,6 +307,46 @@ export async function assetsInRoot(root: string): Promise<number[]> {
   return assets
     .filter((a) => a.path === root || a.path === base || a.path.startsWith(`${base}/`))
     .map((a) => a.id);
+}
+
+export async function removeRoot(root: string): Promise<RemoveRootSummary> {
+  const base = root.endsWith("/") ? root.slice(0, -1) : root;
+  const under = (p: string) => p === root || p === base || p.startsWith(`${base}/`);
+  const gone = new Set(assets.filter((a) => under(a.path)).map((a) => a.id));
+  const gonePaths = new Set(assets.filter((a) => under(a.path)).map((a) => a.path));
+  assets = assets.filter((a) => !gone.has(a.id));
+  scanHistory = scanHistory.filter((r) => r !== root);
+  const goneSightings = sightings.filter((s) => under(s.path)).length;
+  sightings = sightings.filter((s) => !under(s.path));
+  let goneFaces = 0;
+  let pruned = 0;
+  // Drop cluster memberships that lost every member; names survive on the
+  // remaining clusters exactly like the backend's empty-cluster prune.
+  for (const [cid, ids] of [...clusterMembers]) {
+    const rest = new Set([...ids].filter((id) => !gone.has(id)));
+    if (rest.size === 0) {
+      clusterMembers.delete(cid);
+      clusterNames.delete(cid);
+      goneFaces += facesByCluster.get(cid)?.length ?? 0;
+      facesByCluster.delete(cid);
+      clusters = clusters.filter((c) => c.id !== cid);
+      pruned++;
+    } else {
+      clusterMembers.set(cid, rest);
+      const kept = (facesByCluster.get(cid) ?? []).filter((f) => !gonePaths.has(f.path));
+      goneFaces += (facesByCluster.get(cid)?.length ?? 0) - kept.length;
+      facesByCluster.set(cid, kept);
+      clusters = clusters.map((c) => (c.id === cid ? { ...c, faceCount: rest.size } : c));
+    }
+  }
+  return {
+    root,
+    removedAssets: gone.size,
+    removedFaces: goneFaces,
+    removedSightings: goneSightings,
+    prunedClusters: pruned,
+    removedScans: 1
+  };
 }
 
 // Web-mock pins: the "located" assets get deterministic coords around San

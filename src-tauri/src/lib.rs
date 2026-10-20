@@ -2165,6 +2165,15 @@ fn assets_in_root(conn: tauri::State<'_, DbState>, root: String) -> Result<Vec<i
     db::asset_ids_in_root(&conn, &root)
 }
 
+/// Forgets one indexed root (scan records, assets, derived face/sighting
+/// rows). Files on disk are untouched; albums and events keep their other
+/// members via cascades.
+#[tauri::command]
+fn remove_root(conn: tauri::State<'_, DbState>, root: String) -> Result<db::RemoveRootSummary, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::remove_root(&conn, &root)
+}
+
 /// Geotagged pins for the map view (whole library, capped — see
 /// `db::MAP_PINS_LIMIT`).
 #[tauri::command]
@@ -2689,6 +2698,7 @@ pub fn run() {
             library_stats,
             scan_roots,
             assets_in_root,
+            remove_root,
             map_pins,
             map_tile,
             set_favorite

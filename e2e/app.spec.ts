@@ -221,6 +221,25 @@ test("map tab plots located photos and jumps to the library", async ({ page }) =
   await expect(page.getByText("Showing 1 of 1")).toBeVisible();
 });
 
+test("indexed folder removal forgets the root and can be cancelled", async ({ page }) => {
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/vacation");
+  await page.getByRole("button", { name: "Scan" }).click();
+  const folders = page.locator("#indexed-folders");
+  await expect(folders.getByText("/mock/vacation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Showing 12 of 12")).toBeVisible();
+  // Cancel leaves everything alone.
+  await page.getByRole("button", { name: "Remove /mock/vacation from the index" }).click();
+  const dialog = page.getByRole("dialog", { name: "Remove indexed folder" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(folders.getByText("/mock/vacation", { exact: true })).toBeVisible();
+  // Confirm forgets the root's assets and drops the row.
+  await page.getByRole("button", { name: "Remove /mock/vacation from the index" }).click();
+  await dialog.getByRole("button", { name: "Remove" }).click();
+  await expect(folders.getByText("/mock/vacation", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();

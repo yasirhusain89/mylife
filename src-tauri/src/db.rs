@@ -171,6 +171,102 @@ pub fn map_pins(conn: &Connection) -> Result<Vec<MapPin>, String> {
     Ok(out)
 }
 
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRootSummary {
+    pub root: String,
+    pub removed_assets: i64,
+    pub removed_faces: i64,
+    pub removed_sightings: i64,
+    pub pruned_clusters: i64,
+    pub removed_scans: i64,
+}
+
+/// Forgets one indexed root: its scan records, every asset under it (files on
+/// disk are untouched), plus the path-keyed derived rows (faces, animal
+/// sightings) those assets owned. Clusters left with no faces are pruned;
+/// everything else (albums, events, tags, vectors) follows the assets via
+/// ON DELETE CASCADE. Same match rule as `scan_roots` counts.
+///
+/// Symlinked roots (macOS /tmp → /private/tmp) match twice: the import walk
+/// stores canonicalized asset paths while the scan record keeps the literal
+/// root, so both spellings are matched. Unresolvable roots (deleted or
+/// ejected volumes) fall back to the literal spelling.
+pub fn remove_root(conn: &Connection, root: &str) -> Result<RemoveRootSummary, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("remove root tx: {e}"))?;
+    let mut spellings = vec![root.to_string()];
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        let cs = canonical.to_string_lossy().into_owned();
+        if cs != root {
+            spellings.push(cs);
+        }
+    }
+    // One (path = ? OR path = ? OR path LIKE ? ESCAPE '\') arm per spelling.
+    let mut asset_where = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    for spelling in &spellings {
+        let base = spelling.trim_end_matches('/');
+        asset_where.push("(path = ? OR path = ? OR path LIKE ? ESCAPE '\\')".to_string());
+        params.push(spelling.clone());
+        params.push(base.to_string());
+        params.push(format!("{}/%", escape_like(base)));
+    }
+    let asset_where = asset_where.join(" OR ");
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let removed_assets: i64 = tx
+        .query_row(&format!("SELECT COUNT(*) FROM assets WHERE {asset_where}"), param_refs.as_slice(), |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("count root assets: {e}"))?;
+    let removed_faces: i64 = tx
+        .query_row(&format!("SELECT COUNT(*) FROM faces WHERE {asset_where}"), param_refs.as_slice(), |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("count root faces: {e}"))?;
+    let removed_sightings: i64 = tx
+        .query_row(
+            &format!("SELECT COUNT(*) FROM animal_sightings WHERE {asset_where}"),
+            param_refs.as_slice(),
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("count root sightings: {e}"))?;
+
+    tx.execute(&format!("DELETE FROM faces WHERE {asset_where}"), param_refs.as_slice())
+        .map_err(|e| format!("delete root faces: {e}"))?;
+    tx.execute(&format!("DELETE FROM animal_sightings WHERE {asset_where}"), param_refs.as_slice())
+        .map_err(|e| format!("delete root sightings: {e}"))?;
+    tx.execute(&format!("DELETE FROM assets WHERE {asset_where}"), param_refs.as_slice())
+        .map_err(|e| format!("delete root assets: {e}"))?;
+    let scan_where = spellings.iter().map(|_| "root = ?").collect::<Vec<_>>().join(" OR ");
+    let scan_refs: Vec<&dyn rusqlite::ToSql> =
+        spellings.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let removed_scans = tx
+        .execute(&format!("DELETE FROM scans WHERE {scan_where}"), scan_refs.as_slice())
+        .map_err(|e| format!("delete root scans: {e}"))? as i64;
+
+    // Face counts go stale with the face deletes; refresh, then drop empties.
+    tx.execute(
+        "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM faces WHERE cluster_id = face_clusters.id)",
+        [],
+    )
+    .map_err(|e| format!("refresh cluster counts: {e}"))?;
+    let pruned_clusters = tx
+        .execute("DELETE FROM face_clusters WHERE face_count = 0", [])
+        .map_err(|e| format!("prune empty clusters: {e}"))? as i64;
+
+    tx.commit().map_err(|e| format!("remove root commit: {e}"))?;
+    Ok(RemoveRootSummary {
+        root: root.to_string(),
+        removed_assets,
+        removed_faces,
+        removed_sightings,
+        pruned_clusters,
+        removed_scans,
+    })
+}
+
 /// Escape for LIKE patterns: roots containing `%`/`_` must match literally.
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
@@ -3916,6 +4012,82 @@ mod tests {
         assert_eq!(ids.len(), 1, "% in root matches literally");
         let ids = asset_ids_in_root(&conn, "/nowhere").unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn remove_root_forgets_scans_assets_faces_and_prunes_clusters() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let s1 = begin_scan(&conn, "/photos", true).unwrap();
+        upsert_asset(&conn, &asset("/photos/a.jpg", 1, 1.0), s1).unwrap();
+        upsert_asset(&conn, &asset("/photos/sub/b.jpg", 1, 2.0), s1).unwrap();
+        let s2 = begin_scan(&conn, "/photos2", true).unwrap();
+        upsert_asset(&conn, &asset("/photos2/d.jpg", 1, 3.0), s2).unwrap();
+        let face = || serde_json::json!({"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.2, "confidence": 0.9});
+        let fa = save_faces(&conn, "/photos/a.jpg", &[face()]).unwrap();
+        let fd = save_faces(&conn, "/photos2/d.jpg", &[face()]).unwrap();
+        let ca = save_cluster(&conn, &fa).unwrap();
+        rename_cluster(&conn, ca, "Maya").unwrap();
+        let _cd = save_cluster(&conn, &fd).unwrap();
+        conn.execute(
+            "INSERT INTO animal_sightings (path, label, x, y, width, height, confidence, detected_at)
+             VALUES ('/photos/a.jpg', 'dog', 0, 0, 1, 1, 0.9, 1)",
+            [],
+        )
+        .unwrap();
+
+        let summary = remove_root(&conn, "/photos").unwrap();
+        assert_eq!(
+            summary,
+            RemoveRootSummary {
+                root: "/photos".to_string(),
+                removed_assets: 2,
+                removed_faces: 1,
+                removed_sightings: 1,
+                pruned_clusters: 1,
+                removed_scans: 1,
+            }
+        );
+        // The sibling root is untouched: scans, assets, and its cluster.
+        let roots = scan_roots(&conn).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, "/photos2");
+        assert_eq!(roots[0].assets, 1);
+        let rows = library(&conn, &LibraryQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/photos2/d.jpg");
+        let clusters = clusters_list(&conn).unwrap();
+        assert_eq!(clusters.len(), 1, "only Maya's emptied cluster is pruned");
+        // Removing again is a no-op zero summary, not an error.
+        let again = remove_root(&conn, "/photos").unwrap();
+        assert_eq!(again.removed_assets, 0);
+        assert_eq!(again.removed_scans, 0);
+        assert_eq!(scan_roots(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remove_root_matches_canonicalized_symlink_spellings() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Symlinked root: the scan record keeps the literal spelling while
+        // the import walk stores canonicalized asset paths (macOS /tmp).
+        let dir = std::env::temp_dir().join("ff-remove-root-canonical");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let link = dir.join("link").to_string_lossy().into_owned();
+        let canonical =
+            std::fs::canonicalize(&link).unwrap().to_string_lossy().into_owned();
+        assert_ne!(link, canonical, "test needs a resolving symlink");
+        let scan = begin_scan(&conn, &link, true).unwrap();
+        upsert_asset(&conn, &asset(&format!("{canonical}/a.jpg"), 1, 1.0), scan).unwrap();
+
+        let summary = remove_root(&conn, &link).unwrap();
+        assert_eq!(summary.removed_assets, 1);
+        assert_eq!(summary.removed_scans, 1);
+        assert!(scan_roots(&conn).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
