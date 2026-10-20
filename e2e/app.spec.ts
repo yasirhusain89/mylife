@@ -787,6 +787,16 @@ test("similar button opens results that exclude the query photo", async ({ page 
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
 
+test("videos offer no Similar button (similarity is photos-only)", async ({ page }) => {
+  await expect(page.getByRole("button", { name: "Similar to VID_20261007_192001.mp4" })).toHaveCount(0);
+  await page.getByTitle("Open VID_20261007_192001.mp4").click();
+  const viewer = page.getByRole("dialog", { name: "VID_20261007_192001.mp4" });
+  await expect(viewer).toBeVisible();
+  await expect(viewer.getByRole("button", { name: /^Similar to / })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(viewer).toBeHidden();
+});
+
 test("viewer similar button opens results and closing returns", async ({ page }) => {
   await page.getByTitle("Open IMG_20261007_185817.jpg").click();
   const viewer = page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" });

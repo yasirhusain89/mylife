@@ -602,6 +602,12 @@
   }
 
   async function openSimilar(a: AssetRow) {
+    // Videos never get vectors (embed backfill is images-only by design),
+    // so fail fast with a friendly message instead of the raw error.
+    if (a.kind !== "image") {
+      error = "Similarity search works on photos — videos are not supported.";
+      return;
+    }
     similarLoading = true;
     embedState = null;
     similar = { assetId: a.id, name: a.name, rows: [] };
@@ -2052,6 +2058,7 @@
                 · {fmtBytes(asset.sizeBytes)}
               </span>
               <span class="row-actions">
+                {#if asset.kind === "image"}
                 <button
                   type="button"
                   class="tiny"
@@ -2059,6 +2066,7 @@
                   title="More like this photo"
                   onclick={() => void openSimilar(asset)}
                 >Similar</button>
+                {/if}
               </span>
             </figcaption>
           </figure>
@@ -2597,6 +2605,7 @@
               onclick={() => void toggleFavorite(current)}
             >★</button>
             {#if !reviewCluster}
+              {#if current.kind === "image"}
               <button
                 type="button"
                 class="tiny"
@@ -2604,6 +2613,7 @@
                 title="More like this photo"
                 onclick={() => void openSimilar(current)}
               >Similar</button>
+              {/if}
             {:else}
               <button
                 type="button"
