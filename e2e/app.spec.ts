@@ -545,6 +545,30 @@ test("slideshow locks page scroll with no theater scrollbar", async ({ page }) =
   await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("");
 });
 
+test("slideshow zooms with buttons, keys and wheel, resets on advance", async ({ page }) => {
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  const viewer = page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" });
+  await viewer.getByRole("button", { name: "Play slideshow" }).click();
+  const show = page.getByRole("dialog", { name: "Slideshow" });
+  await expect(show).toBeVisible();
+  await show.getByRole("button", { name: "Pause" }).click();
+  const reset = show.getByRole("button", { name: "Reset zoom" });
+  await expect(reset).toHaveText("100%");
+  await show.getByRole("button", { name: "Zoom in" }).click();
+  await expect(reset).toHaveText("125%");
+  await expect(show.locator(".theater-stage img")).toHaveCSS("transform", /1\.25/);
+  await page.keyboard.press("-");
+  await expect(reset).toHaveText("100%");
+  await show.locator(".theater-stage").hover();
+  await page.mouse.wheel(0, -120);
+  await expect(reset).toHaveText("125%");
+  // Advancing to the next slide resets zoom.
+  await show.getByRole("button", { name: "Next" }).click();
+  await expect(reset).toHaveText("100%");
+  await show.getByRole("button", { name: "Close slideshow" }).click();
+  await expect(show).toBeHidden();
+});
+
 test("map tab plots located photos and jumps to the library", async ({ page }) => {
   await page.getByRole("tab", { name: "Map", exact: true }).click();
   const map = page.locator(".leaflet-container");

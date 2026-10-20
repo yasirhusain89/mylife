@@ -1131,6 +1131,7 @@
     if (items.length === 0) return;
     closeViewer();
     stopShowTimer();
+    resetShowZoom();
     const at = Math.min(Math.max(index, 0), items.length - 1);
     show = { items, index: at, playing: true, src: null, error: null };
     void loadShow(items[at]);
@@ -1141,6 +1142,7 @@
     if (!show || show.items.length === 0) return;
     const next = (show.index + delta + show.items.length) % show.items.length;
     show.index = next;
+    resetShowZoom();
     void loadShow(show.items[next]);
     // Manual steps restart the countdown so the new slide gets full time.
     if (show.playing) restartShowTimer();
@@ -1157,6 +1159,58 @@
   function closeShow() {
     stopShowTimer();
     show = null;
+  }
+
+  // Slideshow zoom: per-slide scale + pan (reset on every slide change).
+  // Buttons, +/−/0 keys and wheel zoom; drag pans once zoomed past 1x.
+  let showZoom = $state(1);
+  let showPan = $state({ x: 0, y: 0 });
+
+  function resetShowZoom() {
+    showZoom = 1;
+    showPan = { x: 0, y: 0 };
+  }
+
+  function zoomShow(dir: 1 | -1) {
+    if (!show) return;
+    const next = dir > 0 ? showZoom * 1.25 : showZoom / 1.25;
+    showZoom = Math.min(5, Math.max(1, Math.abs(next - 1) < 0.01 ? 1 : next));
+    if (showZoom === 1) showPan = { x: 0, y: 0 };
+  }
+
+  function showMediaStyle(): string {
+    return `transform: translate(${showPan.x}px, ${showPan.y}px) scale(${showZoom}); transform-origin: center;` +
+      (showZoom > 1 ? " cursor: grab; touch-action: none;" : "");
+  }
+
+  // Non-passive wheel listener so pinch/scroll-to-zoom never scrolls the page.
+  function zoomWheel(node: HTMLElement) {
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      zoomShow(e.deltaY > 0 ? -1 : 1);
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return { destroy() { node.removeEventListener("wheel", onWheel); } };
+  }
+
+  let panDrag = $state<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+
+  function panStart(e: PointerEvent) {
+    if (showZoom <= 1 || e.button !== 0) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    panDrag = { startX: e.clientX, startY: e.clientY, baseX: showPan.x, baseY: showPan.y };
+  }
+
+  function panMove(e: PointerEvent) {
+    if (!panDrag) return;
+    showPan = {
+      x: panDrag.baseX + (e.clientX - panDrag.startX),
+      y: panDrag.baseY + (e.clientY - panDrag.startY)
+    };
+  }
+
+  function panEnd() {
+    panDrag = null;
   }
 
   // Slideshow is fullscreen: lock page scroll behind the theater while open
@@ -1207,6 +1261,9 @@
       else if (e.key === "ArrowRight") { e.preventDefault(); stepShow(1); }
       else if (e.key === "ArrowLeft") { e.preventDefault(); stepShow(-1); }
       else if (e.key === " ") { e.preventDefault(); toggleShowPlay(); }
+      else if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomShow(1); }
+      else if (e.key === "-" || e.key === "_") { e.preventDefault(); zoomShow(-1); }
+      else if (e.key === "0") { e.preventDefault(); resetShowZoom(); }
       return;
     }
     if (!viewer) {
@@ -3931,14 +3988,27 @@
             {show.playing ? "❚❚" : "▶"}
           </button>
           <button class="tiny" onclick={() => stepShow(1)} aria-label="Next">›</button>
+          <button class="tiny" onclick={() => zoomShow(-1)} disabled={showZoom <= 1} aria-label="Zoom out">−</button>
+          <button class="tiny" onclick={resetShowZoom} disabled={showZoom === 1} aria-label="Reset zoom">{Math.round(showZoom * 100)}%</button>
+          <button class="tiny" onclick={() => zoomShow(1)} disabled={showZoom >= 5} aria-label="Zoom in">+</button>
           <button class="tiny" onclick={closeShow} aria-label="Close slideshow">✕</button>
         </div>
       </div>
-      <div class="theater-stage">
+      <div class="theater-stage" use:zoomWheel>
         {#if sc.kind === "video" && show.src}
           {#key show.src}
             <!-- svelte-ignore a11y_media_has_caption: library files ship no caption tracks -->
-            <video src={show.src} controls autoplay playsinline></video>
+            <video
+              src={show.src}
+              controls
+              autoplay
+              playsinline
+              style={showMediaStyle()}
+              onpointerdown={panStart}
+              onpointermove={panMove}
+              onpointerup={panEnd}
+              onpointercancel={panEnd}
+            ></video>
           {/key}
         {:else if sc.kind === "video"}
           {#if thumbs[sc.path]}
@@ -3947,7 +4017,15 @@
           <p class="hint">Video playback needs the desktop app — the web preview has no file to play.</p>
         {:else if show.src}
           {#key show.src}
-            <img src={show.src} alt={sc.name} />
+            <img
+              src={show.src}
+              alt={sc.name}
+              style={showMediaStyle()}
+              onpointerdown={panStart}
+              onpointermove={panMove}
+              onpointerup={panEnd}
+              onpointercancel={panEnd}
+            />
           {/key}
         {:else if show.error}
           <p class="error">{show.error}</p>
@@ -3955,7 +4033,7 @@
           <p class="hint">Loading full size…</p>
         {/if}
       </div>
-      <p class="hint theater-hint">‹ › move · space plays/pauses · esc closes</p>
+      <p class="hint theater-hint">‹ › move · +/− zoom · 0 reset · space plays/pauses · esc closes</p>
     </div>
   {/if}
 
