@@ -557,6 +557,27 @@
     selected = next;
   }
 
+  function groupIds(key: string): number[] {
+    const out: number[] = [];
+    for (const { asset } of displayAssets) {
+      if (groupKeyOf(asset) === key) out.push(asset.id);
+    }
+    return out;
+  }
+
+  // One-go group selection: selects every loaded photo in the section
+  // (or clears just the section when all of it is already selected).
+  // Additive across groups; entering select mode so the batch bar appears.
+  function toggleGroup(key: string) {
+    const ids = groupIds(key);
+    const next = new Set(selected);
+    const all = ids.length > 0 && ids.every((id) => next.has(id));
+    if (all) for (const id of ids) next.delete(id);
+    else for (const id of ids) next.add(id);
+    selected = next;
+    selectMode = true;
+  }
+
   async function enterSelectMode() {
     selectMode = true;
     selected = new Set();
@@ -2160,7 +2181,18 @@
       <div class="grid">
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if groupBy !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
-            <h4 class="group-head">{groupLabelOf(asset)} ({groupCounts.get(groupKeyOf(asset)) ?? 0})</h4>
+            {@const gkey = groupKeyOf(asset)}
+            {@const gids = groupIds(gkey)}
+            <h4 class="group-head">
+              <input
+                type="checkbox"
+                class="selbox-inline"
+                aria-label={`Select ${groupLabelOf(asset)}`}
+                checked={gids.length > 0 && gids.every((id) => selected.has(id))}
+                onchange={() => toggleGroup(gkey)}
+              />
+              {groupLabelOf(asset)} ({groupCounts.get(gkey) ?? 0})
+            </h4>
           {/if}
           <figure class:selected={selected.has(asset.id)}>
             {#if selectMode}
@@ -3426,6 +3458,9 @@
   }
   .group-head {
     grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     font-size: 0.85rem;
     font-weight: 600;
     color: #cfd5e1;

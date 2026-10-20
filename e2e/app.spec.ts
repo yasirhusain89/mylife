@@ -162,6 +162,19 @@ test("group by person sections named clusters from untagged", async ({ page }) =
   await expect(page.getByRole("heading", { name: "No one tagged (4)" })).toBeVisible();
 });
 
+test("group headers select and clear the whole section in one go", async ({ page }) => {
+  await page.getByLabel("Group by").selectOption("media");
+  const photos = page.getByRole("checkbox", { name: "Select Photos" });
+  await photos.check();
+  await expect(page.getByText("6 selected")).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Select Videos" })).not.toBeChecked();
+  // Clearing the section leaves the other section's selection alone.
+  await page.getByRole("checkbox", { name: "Select Videos" }).check();
+  await expect(page.getByText("8 selected")).toBeVisible();
+  await photos.uncheck();
+  await expect(page.getByText("2 selected")).toBeVisible();
+});
+
 test("month filter narrows the grid", async ({ page }) => {
   await page.getByLabel("Filter by month").selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
