@@ -113,6 +113,19 @@
 
   const PAGE = 60;
 
+  // Test affordance (?pageSize=N): additive like the __ffMap pattern —
+  // production stays at PAGE unless a valid positive integer is given.
+  function pageSize(): number {
+    try {
+      if (typeof window === "undefined") return PAGE;
+      const n = Number(new URLSearchParams(window.location.search).get("pageSize"));
+      if (Number.isInteger(n) && n > 0) return n;
+    } catch {
+      /* no URL API: fall through to the default */
+    }
+    return PAGE;
+  }
+
   let status = $state<EngineStatus>({ state: "idle" });
   let assets = $state<AssetRow[]>([]);
   let stats = $state<LibraryStats | null>(null);
@@ -284,6 +297,51 @@
 
   let groupBy = $state<GroupMode>(loadGroupBy());
 
+  type LibZoom = "all" | "day" | "month" | "year";
+  const LIB_ZOOM_KEY = "fotoflow-lib-zoom";
+  const LIB_ZOOMS: LibZoom[] = ["all", "day", "month", "year"];
+
+  function loadLibZoom(): LibZoom {
+    try {
+      if (typeof localStorage === "undefined") return "all";
+      const raw = localStorage.getItem(LIB_ZOOM_KEY);
+      return (LIB_ZOOMS as string[]).includes(raw as string) ? (raw as LibZoom) : "all";
+    } catch {
+      return "all";
+    }
+  }
+
+  function saveLibZoom(z: LibZoom) {
+    try {
+      localStorage.setItem(LIB_ZOOM_KEY, z);
+    } catch {
+      /* storage unavailable: zoom just doesn't persist */
+    }
+  }
+
+  let libZoom = $state<LibZoom>(loadLibZoom());
+
+  // Apple Photos-style timeline zoom: all (flat) → day → month → year.
+  // Clamped at both ends, never wraps.
+  function zoomLib(dir: 1 | -1) {
+    const i = LIB_ZOOMS.indexOf(libZoom);
+    const next = Math.min(LIB_ZOOMS.length - 1, Math.max(0, i + dir));
+    if (LIB_ZOOMS[next] === libZoom) return;
+    libZoom = LIB_ZOOMS[next];
+    saveLibZoom(libZoom);
+  }
+
+  // Effective grouping: a zoomed timeline always sections by date at the
+  // zoom granularity; at "all" the Group-by select owns the grid (its date
+  // branch keeps the historical month granularity).
+  let effGroup = $derived<GroupMode>(libZoom === "all" ? groupBy : "date");
+
+  type DateGranularity = "day" | "month" | "year";
+
+  function dateGranularity(): DateGranularity {
+    return libZoom === "all" ? "month" : libZoom;
+  }
+
   function monthKeyOf(a: AssetRow): string {
     const t = a.capturedAt ?? a.modified;
     if (!t) return "";
@@ -301,9 +359,47 @@
     });
   }
 
+  function dayKeyOf(a: AssetRow): string {
+    const t = a.capturedAt ?? a.modified;
+    if (!t) return "";
+    const d = new Date(t * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+  }
+
+  function dayLabelOf(key: string): string {
+    if (!key) return "Unknown date";
+    const [y, m, d] = key.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString(undefined, {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+      timeZone: "UTC"
+    });
+  }
+
+  function yearKeyOf(a: AssetRow): string {
+    const t = a.capturedAt ?? a.modified;
+    if (!t) return "";
+    return String(new Date(t * 1000).getUTCFullYear());
+  }
+
+  function yearLabelOf(key: string): string {
+    return key === "" ? "Unknown date" : key;
+  }
+
+  function dateKeyOf(a: AssetRow): string {
+    const g = dateGranularity();
+    return g === "day" ? dayKeyOf(a) : g === "year" ? yearKeyOf(a) : monthKeyOf(a);
+  }
+
+  function dateLabelOf(key: string): string {
+    const g = dateGranularity();
+    return g === "day" ? dayLabelOf(key) : g === "year" ? yearLabelOf(key) : monthLabelOf(key);
+  }
+
   function groupKeyOf(a: AssetRow): string {
-    switch (groupBy) {
-      case "date": return monthKeyOf(a);
+    switch (effGroup) {
+      case "date": return dateKeyOf(a);
       case "location": return a.place ?? "";
       case "person": return a.people[0] ?? "";
       case "media": return a.kind;
@@ -312,8 +408,8 @@
   }
 
   function groupLabelOf(a: AssetRow): string {
-    switch (groupBy) {
-      case "date": return monthLabelOf(monthKeyOf(a));
+    switch (effGroup) {
+      case "date": return dateLabelOf(dateKeyOf(a));
       case "location": return a.place ?? "No location";
       case "person": return a.people[0] ?? "No one tagged";
       case "media": return a.kind === "image" ? "Photos" : "Videos";
@@ -327,10 +423,10 @@
   // keep working on the underlying order.
   let displayAssets = $derived.by(() => {
     const items = assets.map((asset, index) => ({ asset, index }));
-    if (groupBy === "none") return items;
-    const dir = groupBy === "date" ? -1 : 1;
+    if (effGroup === "none") return items;
+    const dir = effGroup === "date" ? -1 : 1;
     // Unknowns sort last in every mode ("" is already last descending).
-    const sortKey = (k: string) => (k === "" && groupBy !== "date" ? "\uffff" : k);
+    const sortKey = (k: string) => (k === "" && effGroup !== "date" ? "\uffff" : k);
     return items.sort((a, b) => {
       const ka = sortKey(groupKeyOf(a.asset));
       const kb = sortKey(groupKeyOf(b.asset));
@@ -344,7 +440,7 @@
 
   let groupCounts = $derived.by(() => {
     const m = new Map<string, number>();
-    if (groupBy === "none") return m;
+    if (effGroup === "none") return m;
     for (const a of assets) {
       const k = groupKeyOf(a);
       m.set(k, (m.get(k) ?? 0) + 1);
@@ -666,7 +762,7 @@
   async function refresh() {
     resetThumbs();
     const f = currentFilters();
-    assets = await libraryList({ ...f, limit: PAGE });
+    assets = await libraryList({ ...f, limit: pageSize() });
     filteredTotal = await libraryCount(f);
     stats = await libraryStats();
     months = await libraryMonths();
@@ -695,11 +791,16 @@
     return filteredTotal;
   }
 
+  let loadingMore = $state(false);
+
   async function loadMore() {
+    if (loadingMore) return;
+    if (assets.length >= filteredTotal) return;
+    loadingMore = true;
     try {
       const next = await libraryList({
         ...currentFilters(),
-        limit: PAGE,
+        limit: pageSize(),
         offset: assets.length
       });
       if (next.length === 0) return;
@@ -707,6 +808,8 @@
       void loadThumbs(next);
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
+    } finally {
+      loadingMore = false;
     }
   }
 
@@ -800,6 +903,37 @@
       destroy() {
         visiblePaths.delete(path);
         thumbObserver?.unobserve(node);
+      }
+    };
+  }
+
+  // Infinite scroll: the #grid-sentinel div at the grid end reuses the
+  // thumb-observer pattern — on intersect it pages in the next chunk via
+  // the existing loadMore() (which no-ops while loading or fully loaded).
+  let gridObserver: IntersectionObserver | null = null;
+
+  function ensureGridObserver(): IntersectionObserver | null {
+    if (gridObserver) return gridObserver;
+    if (typeof IntersectionObserver === "undefined") return null;
+    gridObserver = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) void loadMore();
+        }
+      },
+      // No prefetch margin: the sentinel must actually enter the viewport,
+      // so a short library never pages past its first chunk on its own.
+      { rootMargin: "0px" }
+    );
+    return gridObserver;
+  }
+
+  function observeGridEnd(node: HTMLElement) {
+    const obs = ensureGridObserver();
+    if (obs) obs.observe(node);
+    return {
+      destroy() {
+        gridObserver?.unobserve(node);
       }
     };
   }
@@ -1289,6 +1423,16 @@
       if (tab !== "library") return;
       if (confirm || picker || similar || nameDialog || deleteAlbumTarget || removeRootTarget) return;
       if (isTypingTarget(e.target)) return;
+      // Timeline zoom: Ctrl/Cmd+= in, Ctrl/Cmd+− out (library only, no
+      // dialogs/viewer/theater open, never inside text entry).
+      if (
+        (e.ctrlKey || e.metaKey) && !e.altKey &&
+        (e.key === "=" || e.key === "+" || e.key === "-" || e.key === "_")
+      ) {
+        e.preventDefault();
+        zoomLib(e.key === "=" || e.key === "+" ? 1 : -1);
+        return;
+      }
       const items = displayAssets;
       if (items.length === 0) return;
       if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A")) {
@@ -2664,6 +2808,8 @@
       for (const off of offs) void off.then((f) => f());
       thumbObserver?.disconnect();
       thumbObserver = null;
+      gridObserver?.disconnect();
+      gridObserver = null;
     };
   });
 </script>
@@ -3005,6 +3151,24 @@
   <section class="card" aria-labelledby="library-heading">
     <div class="card-head toolbar">
       <h2 id="library-heading">Library</h2>
+      <div class="zoom-toggle" role="group" aria-label="Timeline zoom">
+        <button
+          type="button"
+          class="ghost"
+          aria-label="Zoom out timeline"
+          title="Zoom out timeline"
+          disabled={libZoom === "all"}
+          onclick={() => zoomLib(-1)}
+        >−</button>
+        <button
+          type="button"
+          class="ghost"
+          aria-label="Zoom in timeline"
+          title="Zoom in timeline"
+          disabled={libZoom === "year"}
+          onclick={() => zoomLib(1)}
+        >+</button>
+      </div>
       <div class="density-toggle" role="group" aria-label="Grid density">
         <button
           type="button"
@@ -3358,7 +3522,7 @@
     {#if assets.length}
       <div class="grid" data-density={density}>
         {#each displayAssets as { asset, index }, di (asset.id)}
-          {#if groupBy !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
+          {#if effGroup !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
             {@const gkey = groupKeyOf(asset)}
             {@const gids = groupIds(gkey)}
             <h4 class="group-head">
@@ -3432,6 +3596,7 @@
         {/each}
       </div>
       <p class="hint">← → ↑ ↓ move · Enter opens · S stars{#if selectMode} · Shift+←/→ extends selection · Ctrl/⌘+A selects all · Del removes{/if}</p>
+      <div id="grid-sentinel" use:observeGridEnd aria-hidden="true"></div>
     {:else if !importing}
       <p class="hint">No assets yet — add a folder to build the index.</p>
     {/if}
@@ -3439,9 +3604,6 @@
     {#if stats && assets.length > 0}
       <div class="enrich">
         <span class="hint">Showing {assets.length} of {libraryTotal()}</span>
-        {#if assets.length < libraryTotal()}
-          <button class="ghost" onclick={() => void loadMore()}>Load more</button>
-        {/if}
       </div>
     {/if}
   </section>
@@ -5103,7 +5265,7 @@
   .card-head h2 {
     margin-right: auto;
   }
-  .density-toggle {
+  .density-toggle, .zoom-toggle {
     display: flex;
     gap: 0.3rem;
   }

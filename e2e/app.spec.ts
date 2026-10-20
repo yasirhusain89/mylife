@@ -1521,3 +1521,98 @@ test("cleanup previews share one uniform size", async ({ page }) => {
   expect(heights.every((h) => h > 0)).toBe(true);
   expect(Math.max(...heights) - Math.min(...heights)).toBeLessThanOrEqual(2);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #8: Apple Photos-style library zoom + infinite scroll
+// ---------------------------------------------------------------------------
+
+test("library zoom cycles all to year with correct headers and disabled ends", async ({ page }) => {
+  const zoomOut = page.getByRole("button", { name: "Zoom out timeline" });
+  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+  // "all" is the current ungrouped grid: no section headers.
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  await expect(zoomOut).toBeDisabled();
+  await expect(zoomIn).toBeEnabled();
+  // all → day: one section per UTC calendar day.
+  await zoomIn.click();
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(zoomOut).toBeEnabled();
+  // day → month.
+  await zoomIn.click();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  // month → year.
+  await zoomIn.click();
+  await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
+  await expect(zoomIn).toBeDisabled();
+  // Back down with no wrap: year → month → day → all.
+  await zoomOut.click();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await zoomOut.click();
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(zoomIn).toBeEnabled();
+  await zoomOut.click();
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  await expect(zoomOut).toBeDisabled();
+});
+
+test("library zoom granularity persists across reload", async ({ page }) => {
+  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+  await zoomIn.click();
+  await zoomIn.click();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out timeline" })).toBeEnabled();
+});
+
+test("library zoom keyboard shortcuts move levels and respect viewer and dialogs", async ({ page }) => {
+  // Wait for the app to be interactive so the first keypress isn't lost.
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.locator(".group-head")).toHaveCount(0);
+  // Ctrl/Cmd+= zooms in (all → day), Ctrl/Cmd+− zooms back out.
+  await page.keyboard.press("ControlOrMeta+=");
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+=");
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+-");
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  // The open viewer swallows the shortcut: the grid behind stays put.
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  await expect(page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" })).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+=");
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  // An open confirm dialog swallows it too.
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" }).check();
+  await page.locator(".batch-bar").getByRole("button", { name: "Trash", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+=");
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+});
+
+test("library infinite scroll appends past the first page", async ({ page }) => {
+  await page.goto("/?web=1&pageSize=4");
+  await expect(page.getByText("Showing 4 of 8")).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(4);
+  await page.locator("#grid-sentinel").scrollIntoViewIfNeeded();
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(8);
+});
+
+test("zoomed group headers select the whole section and filters still apply", async ({ page }) => {
+  await page.getByRole("button", { name: "Zoom in timeline" }).click();
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  // One-go group selection works at day granularity.
+  await page.getByRole("checkbox", { name: "Select October 9, 2025" }).check();
+  await expect(page.getByText("8 selected")).toBeVisible();
+  await page.getByRole("checkbox", { name: "Select October 9, 2025" }).uncheck();
+  await expect(page.getByText("0 selected")).toBeVisible();
+  // The month filter narrows the zoomed grid without breaking sections.
+  await page.getByLabel("Filter by month").selectOption("2025-10");
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+});
