@@ -160,6 +160,105 @@
 
   let foldersOpen = $state(loadFoldersOpen());
 
+  // Frozen shell: resizable sidebar (208–300px, collapsible to a 64px
+  // icon rail) + Comfortable/Compact density. Same load/save + try/catch
+  // pattern as the flagged/folders/filter keys above.
+  const SIDEBAR_WIDTH_KEY = "fotoflow-sidebar-width";
+  const SIDEBAR_COLLAPSED_KEY = "fotoflow-sidebar-collapsed";
+  const DENSITY_KEY = "fotoflow-density";
+  const SIDEBAR_MIN = 208;
+  const SIDEBAR_MAX = 300;
+  const SIDEBAR_DEFAULT = 248;
+
+  function loadSidebarWidth(): number {
+    try {
+      if (typeof localStorage === "undefined") return SIDEBAR_DEFAULT;
+      const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      const n = raw === null ? NaN : Number(raw);
+      if (!Number.isFinite(n)) return SIDEBAR_DEFAULT;
+      return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(n)));
+    } catch {
+      return SIDEBAR_DEFAULT;
+    }
+  }
+
+  function saveSidebarWidth(w: number) {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(w));
+    } catch {
+      /* storage unavailable: width just doesn't persist */
+    }
+  }
+
+  function loadSidebarCollapsed(): boolean {
+    try {
+      if (typeof localStorage === "undefined") return false;
+      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+    } catch {
+      return false;
+    }
+  }
+
+  function saveSidebarCollapsed(v: boolean) {
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(v));
+    } catch {
+      /* storage unavailable: preference just doesn't persist */
+    }
+  }
+
+  type Density = "comfortable" | "compact";
+
+  function loadDensity(): Density {
+    try {
+      if (typeof localStorage === "undefined") return "comfortable";
+      const raw = localStorage.getItem(DENSITY_KEY);
+      return raw === "compact" ? "compact" : "comfortable";
+    } catch {
+      return "comfortable";
+    }
+  }
+
+  function saveDensity(d: Density) {
+    try {
+      localStorage.setItem(DENSITY_KEY, d);
+    } catch {
+      /* storage unavailable: preference just doesn't persist */
+    }
+  }
+
+  let sidebarWidth = $state(loadSidebarWidth());
+  let sidebarCollapsed = $state(loadSidebarCollapsed());
+  let density = $state<Density>(loadDensity());
+
+  // Density never touches filters: no refresh(), no filter writes.
+  function setDensity(d: Density) {
+    density = d;
+    saveDensity(d);
+  }
+
+  function toggleSidebar() {
+    sidebarCollapsed = !sidebarCollapsed;
+    saveSidebarCollapsed(sidebarCollapsed);
+  }
+
+  function onResizeStart(e: PointerEvent) {
+    if (sidebarCollapsed) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const move = (ev: PointerEvent) => {
+      sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(startW + ev.clientX - startX)));
+    };
+    const up = () => {
+      saveSidebarWidth(sidebarWidth);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
   type GroupMode = "none" | "date" | "location" | "person" | "media";
   const GROUP_BY_KEY = "fotoflow-group-by";
   const GROUP_MODES: GroupMode[] = ["none", "date", "location", "person", "media"];
@@ -2321,14 +2420,16 @@
 </script>
 
 <svelte:window onkeydown={viewerKey} />
-<main class="container">
+<main class="container" data-density={density}>
   <header>
     <h1>fotoflow</h1>
     <p class="tagline">on-device library management for photo and video</p>
   </header>
 
-  <!-- svelte-ignore a11y_interactive_supports_focus: roving-tabindex tablist, only the active tab is a tab stop -->
-  <div class="tabs" role="tablist" aria-label="Library sections" onkeydown={tabKey}>
+  <div class="shell" style="--sidebar-width: {sidebarCollapsed ? 64 : sidebarWidth}px">
+    <aside class="sidebar" data-collapsed={sidebarCollapsed ? "true" : "false"} aria-label="Library navigation">
+      <!-- svelte-ignore a11y_interactive_supports_focus: roving-tabindex tablist, only the active tab is a tab stop -->
+      <div class="tabs" role="tablist" aria-label="Library sections" onkeydown={tabKey}>
     <button id="tab-library" class="tab" class:on={tab === "library"} role="tab" aria-selected={tab === "library"} tabindex={tab === "library" ? 0 : -1} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
     <button id="tab-cleanup" class="tab" class:on={tab === "cleanup"} role="tab" aria-selected={tab === "cleanup"} tabindex={tab === "cleanup" ? 0 : -1} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
@@ -2348,7 +2449,28 @@
     <button id="tab-settings" class="tab" class:on={tab === "settings"} role="tab" aria-selected={tab === "settings"} tabindex={tab === "settings" ? 0 : -1} onclick={() => { tab = "settings"; }}>
       Settings
     </button>
-  </div>
+      </div>
+      <div class="sidebar-footer">
+        <button
+          type="button"
+          class="tiny ghost collapse-btn"
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!sidebarCollapsed}
+          title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          onclick={toggleSidebar}
+        >{sidebarCollapsed ? "»" : "«"}</button>
+      </div>
+      <!-- svelte-ignore a11y_no_static_element_interactions: pointer drag handle, keyboard users use the collapse button -->
+      <div
+        class="resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        title="Drag to resize"
+        onpointerdown={onResizeStart}
+      ></div>
+    </aside>
+    <div class="content">
 
   {#if error}
     <div class="error global-error" role="alert">
@@ -2524,16 +2646,34 @@
     </section>
   {:else if tab === "library"}
   <section class="card" aria-labelledby="library-heading">
-    <div class="card-head">
+    <div class="card-head toolbar">
       <h2 id="library-heading">Library</h2>
-      <button onclick={chooseFolder} disabled={importing}>
-        {importing ? "Importing…" : "Add folder"}
-      </button>
+      <div class="density-toggle" role="group" aria-label="Grid density">
+        <button
+          type="button"
+          class="ghost"
+          class:on={density === "comfortable"}
+          aria-pressed={density === "comfortable"}
+          title="Comfortable grid"
+          onclick={() => setDensity("comfortable")}
+        >Comfortable</button>
+        <button
+          type="button"
+          class="ghost"
+          class:on={density === "compact"}
+          aria-pressed={density === "compact"}
+          title="Compact grid"
+          onclick={() => setDensity("compact")}
+        >Compact</button>
+      </div>
       {#if selectMode}
         <button class="ghost" onclick={() => { selectMode = false; selected = new Set(); }}>Done</button>
       {:else}
         <button class="ghost" onclick={() => void enterSelectMode()}>Select</button>
       {/if}
+      <button onclick={chooseFolder} disabled={importing}>
+        {importing ? "Importing…" : "Add folder"}
+      </button>
     </div>
 
     <div class="path-entry" role="search">
@@ -2859,7 +2999,7 @@
     {/if}
 
     {#if assets.length}
-      <div class="grid">
+      <div class="grid" data-density={density}>
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if groupBy !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
             {@const gkey = groupKeyOf(asset)}
@@ -3366,6 +3506,8 @@
     <p class="hint">Storage: library index and thumbnails stay on this device. Only reverse-geocoding lookups leave the machine.</p>
   </section>
   {/if}
+    </div><!-- /.content -->
+  </div><!-- /.shell -->
 
   {#if confirm}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -4062,6 +4204,7 @@
   .scrim {
     position: fixed;
     inset: 0;
+    z-index: 40;
     background: rgba(5, 7, 10, 0.72);
     display: grid;
     place-items: center;
@@ -4289,6 +4432,7 @@
     position: fixed;
     bottom: 1rem;
     left: 50%;
+    z-index: 60;
     transform: translateX(-50%);
     background: #1c212c;
     border: 1px solid #232733;
@@ -4496,5 +4640,118 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.8rem;
+  }
+  /* Frozen layout shell: sidebar nav rail + fluid content center. */
+  .shell {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+  .sidebar {
+    position: sticky;
+    top: 1rem;
+    width: var(--sidebar-width, 248px);
+    flex: 0 0 auto;
+    background: #151820;
+    border: 1px solid #232733;
+    border-radius: 12px;
+    padding: 0.6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-height: calc(100vh - 2rem);
+    overflow: auto;
+  }
+  .sidebar .tabs {
+    flex-direction: column;
+    align-items: stretch;
+    margin-bottom: 0;
+  }
+  .sidebar .tab {
+    width: 100%;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sidebar[data-collapsed="true"] .tab {
+    text-align: center;
+    padding-left: 0.4rem;
+    padding-right: 0.4rem;
+  }
+  .sidebar-footer {
+    display: flex;
+  }
+  .sidebar-footer .collapse-btn {
+    width: 100%;
+  }
+  .resize-handle {
+    position: absolute;
+    top: 0;
+    right: -5px;
+    width: 10px;
+    height: 100%;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  .sidebar {
+    position: sticky;
+  }
+  .content {
+    flex: 1;
+    min-width: 0;
+  }
+  /* Sticky 48–56px toolbar per tab: existing card-head blocks. */
+  .card-head {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: #151820;
+    min-height: 48px;
+    align-items: center;
+    padding-top: 0.4rem;
+    padding-bottom: 0.4rem;
+  }
+  .card-head h2 {
+    margin-right: auto;
+  }
+  .density-toggle {
+    display: flex;
+    gap: 0.3rem;
+  }
+  /* Sticky filter rail beneath the toolbar. */
+  .filters {
+    position: sticky;
+    top: 56px;
+    z-index: 4;
+    background: #151820;
+    padding-top: 0.3rem;
+    padding-bottom: 0.3rem;
+  }
+  /* Single sticky bottom batch bar: N selected left, ghost middle,
+     Trash/Flag + Clear pushed far right. */
+  .batch-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 6;
+    background: #10131a;
+    border: 1px solid #232733;
+    border-radius: 10px;
+    padding: 0.5rem 0.6rem;
+  }
+  .batch-bar .tiny.danger {
+    margin-left: auto;
+  }
+  /* Cleanup group footer spans the full card width. */
+  .group > button.tiny.danger {
+    width: 100%;
+    margin-top: 0.4rem;
+  }
+  /* Density minima: Comfortable 8.5rem (default), Compact 6.5rem. */
+  .grid[data-density="compact"] {
+    grid-template-columns: repeat(auto-fit, minmax(min(6.5rem, 100%), 1fr));
+  }
+  [data-density="compact"] .grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(6.5rem, 100%), 1fr));
   }
 </style>

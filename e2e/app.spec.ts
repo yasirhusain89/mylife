@@ -1310,3 +1310,53 @@ test("outside-app error explains the missing bridge in plain language", async ({
   await page.goto("/");
   await expect(page.getByRole("alert")).toContainText("fotoflow app window");
 });
+
+// ---------------------------------------------------------------------------
+// Frozen layout shell: sidebar rail + density
+// ---------------------------------------------------------------------------
+
+test("sidebar rail renders all 7 tabs, collapses, and persists width", async ({ page }) => {
+  const tablist = page.getByRole("tablist", { name: "Library sections" });
+  await expect(tablist).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Library", exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /^Cleanup/ })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /^People/ })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Events", exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Map", exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /^Albums/ })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Settings", exact: true })).toBeVisible();
+
+  // Width persists across reload.
+  await page.evaluate(() => localStorage.setItem("fotoflow-sidebar-width", "280"));
+  await page.reload();
+  const sidebar = page.locator(".sidebar");
+  await expect(sidebar).toBeVisible();
+  await expect(sidebar).toHaveCSS("width", "280px");
+
+  // Collapse works and persists.
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await expect(page.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
+  await expect(page.locator(".sidebar")).toHaveCSS("width", "280px");
+});
+
+test("density toggle switches grid minima without resetting filters", async ({ page }) => {
+  const grid = page.locator(".grid").first();
+  await expect(grid).toHaveAttribute("data-density", "comfortable");
+  // Narrow to photos, then switch density: the filter must survive.
+  await page.getByRole("button", { name: /6 photos/ }).click();
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+  await page.getByRole("button", { name: "Compact", exact: true }).click();
+  await expect(grid).toHaveAttribute("data-density", "compact");
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+  // Density persists across reload along with the filter.
+  await page.reload();
+  await expect(page.locator(".grid").first()).toHaveAttribute("data-density", "compact");
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+  await page.getByRole("button", { name: "Comfortable", exact: true }).click();
+  await expect(page.locator(".grid").first()).toHaveAttribute("data-density", "comfortable");
+  await expect(page.getByText("Showing 6 of 6")).toBeVisible();
+});
