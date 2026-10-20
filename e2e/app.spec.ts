@@ -1654,3 +1654,52 @@ test("zoomed group headers select the whole section and filters still apply", as
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
 });
+
+test("month zoom shows a capped highlights reel with true counts", async ({ page }) => {
+  await page.goto("/?web=1&highlights=3");
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+  await zoomIn.click(); // day: the full grid, uncapped.
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(8);
+  await zoomIn.click(); // month: curated reel, true header count.
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "Show all October 2025 (8)" })).toBeVisible();
+});
+
+test("show-all drills into the period and back restores the reel", async ({ page }) => {
+  await page.goto("/?web=1&highlights=3");
+  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+  await zoomIn.click();
+  await zoomIn.click(); // month reel.
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+  await page.getByRole("button", { name: "Show all October 2025 (8)" }).click();
+  // Drilled to the month's days: full grid plus a back banner.
+  await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(8);
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  const banner = page.locator(".drill-banner");
+  await expect(banner).toContainText("October 2025");
+  await banner.getByRole("button", { name: "Back to months" }).click();
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+});
+
+test("year drill opens that year's months with highlights", async ({ page }) => {
+  await page.goto("/?web=1&highlights=3");
+  const zoomIn = page.getByRole("button", { name: "Zoom in timeline" });
+  await zoomIn.click();
+  await zoomIn.click();
+  await zoomIn.click(); // year reel.
+  await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+  await page.getByRole("button", { name: "Show all 2025 (8)" }).click();
+  // That year's months, still highlights; back returns to years.
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+  const banner = page.locator(".drill-banner");
+  await expect(banner).toContainText("2025");
+  await banner.getByRole("button", { name: "Back to years" }).click();
+  await expect(page.getByRole("heading", { name: "2025 (8)" })).toBeVisible();
+});

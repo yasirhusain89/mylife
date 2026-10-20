@@ -113,6 +113,22 @@
 
   const PAGE = 60;
 
+  // Curated highlights per section at month/year zoom (Apple Photos-style:
+  // the reel shows key photos, the header count stays the true total).
+  // Test affordance (?highlights=N) mirrors ?pageSize=N.
+  const HIGHLIGHTS = 8;
+
+  function highlightCap(): number {
+    try {
+      if (typeof window === "undefined") return HIGHLIGHTS;
+      const n = Number(new URLSearchParams(window.location.search).get("highlights"));
+      if (Number.isInteger(n) && n > 0) return n;
+    } catch {
+      /* no URL API: fall through to the default */
+    }
+    return HIGHLIGHTS;
+  }
+
   // Test affordance (?pageSize=N): additive like the __ffMap pattern —
   // production stays at PAGE unless a valid positive integer is given.
   function pageSize(): number {
@@ -345,14 +361,57 @@
   let libZoom = $state<LibZoom>(loadLibZoom());
 
   // Apple Photos-style timeline zoom: all (flat) → day → month → year.
-  // Clamped at both ends, never wraps.
+  // Clamped at both ends, never wraps. Manual zooming always exits a
+  // drill-down (see zoomDrill): the Back button is the way back.
   function zoomLib(dir: 1 | -1) {
     const i = LIB_ZOOMS.indexOf(libZoom);
     const next = Math.min(LIB_ZOOMS.length - 1, Math.max(0, i + dir));
     if (LIB_ZOOMS[next] === libZoom) return;
     libZoom = LIB_ZOOMS[next];
+    zoomDrill = null;
     saveLibZoom(libZoom);
   }
+
+  // Drill-down from a highlights section: month → that month's days,
+  // year → that year's months. Transient (not persisted): Back restores
+  // the zoom level it came from.
+  let zoomDrill = $state<{ from: "month" | "year"; key: string } | null>(null);
+
+  function drillInto(key: string) {
+    const g = dateGranularity();
+    if (g === "month") {
+      libZoom = "day";
+      zoomDrill = { from: "month", key };
+    } else if (g === "year") {
+      libZoom = "month";
+      zoomDrill = { from: "year", key };
+    } else {
+      return;
+    }
+    saveLibZoom(libZoom);
+  }
+
+  function drillBack() {
+    if (!zoomDrill) return;
+    libZoom = zoomDrill.from;
+    zoomDrill = null;
+    saveLibZoom(libZoom);
+  }
+
+  function drillLabel(): string {
+    if (!zoomDrill) return "";
+    return zoomDrill.from === "month" ? monthLabelOf(zoomDrill.key) : yearLabelOf(zoomDrill.key);
+  }
+
+  // Assets visible under a drill: month drills match the month key,
+  // year drills the year key. Everything else sees all loaded assets.
+  let drilledAssets = $derived.by(() => {
+    const drill = zoomDrill;
+    if (!drill) return assets;
+    return drill.from === "month"
+      ? assets.filter((a) => monthKeyOf(a) === drill.key)
+      : assets.filter((a) => yearKeyOf(a) === drill.key);
+  });
 
   // Ctrl/Cmd+wheel (trackpad pinch) over the grid steps the timeline zoom;
   // plain wheel keeps scrolling. Accumulated with a cooldown so one gesture
@@ -468,9 +527,18 @@
   // Display order when grouped: sections sorted (newest month first,
   // names A–Z, unknowns last), newest photo first inside each section.
   // Carries the flat-list index so the viewer, selection and Similar
-  // keep working on the underlying order.
-  let displayAssets = $derived.by(() => {
-    const items = assets.map((asset, index) => ({ asset, index }));
+  // keep working on the underlying order. Honors an active drill-down.
+  let sectionAssets = $derived.by(() => {
+    // Index stays assets-based so the viewer, selection and Similar keep
+    // working on the underlying order even under a drill-down filter.
+    const items = assets
+      .map((asset, index) => ({ asset, index }))
+      .filter(({ asset }) =>
+        !zoomDrill ||
+        (zoomDrill.from === "month"
+          ? monthKeyOf(asset) === zoomDrill.key
+          : yearKeyOf(asset) === zoomDrill.key)
+      );
     if (effGroup === "none") return items;
     const dir = effGroup === "date" ? -1 : 1;
     // Unknowns sort last in every mode ("" is already last descending).
@@ -486,10 +554,53 @@
     });
   });
 
+  // Highlights mode: at month/year granularity the grid shows a curated
+  // reel per section (favorites → resolution → newest, capped) instead of
+  // every photo. Day zoom and the flat grid always show everything.
+  let highlightsMode = $derived(
+    effGroup === "date" && (dateGranularity() === "month" || dateGranularity() === "year")
+  );
+
+  function compareHighlights(a: AssetRow, b: AssetRow): number {
+    const fa = a.favorite !== 0 ? 1 : 0;
+    const fb = b.favorite !== 0 ? 1 : 0;
+    if (fa !== fb) return fb - fa;
+    const ra = (a.width ?? 0) * (a.height ?? 0);
+    const rb = (b.width ?? 0) * (b.height ?? 0);
+    if (ra !== rb) return rb - ra;
+    const ta = a.capturedAt ?? a.modified ?? 0;
+    const tb = b.capturedAt ?? b.modified ?? 0;
+    return tb - ta || b.id - a.id;
+  }
+
+  let displayAssets = $derived.by(() => {
+    if (!highlightsMode) return sectionAssets;
+    const cap = highlightCap();
+    const out: { asset: AssetRow; index: number }[] = [];
+    let chunk: { asset: AssetRow; index: number }[] = [];
+    let cur: string | null = null;
+    const flush = () => {
+      chunk.sort((a, b) => compareHighlights(a.asset, b.asset));
+      for (const e of chunk.slice(0, cap)) out.push(e);
+      chunk = [];
+    };
+    for (const e of sectionAssets) {
+      const k = groupKeyOf(e.asset);
+      if (cur === null) cur = k;
+      if (k !== cur) {
+        flush();
+        cur = k;
+      }
+      chunk.push(e);
+    }
+    flush();
+    return out;
+  });
+
   let groupCounts = $derived.by(() => {
     const m = new Map<string, number>();
     if (effGroup === "none") return m;
-    for (const a of assets) {
+    for (const a of drilledAssets) {
       const k = groupKeyOf(a);
       m.set(k, (m.get(k) ?? 0) + 1);
     }
@@ -1012,7 +1123,7 @@
 
   function groupIds(key: string): number[] {
     const out: number[] = [];
-    for (const { asset } of displayAssets) {
+    for (const { asset } of sectionAssets) {
       if (groupKeyOf(asset) === key) out.push(asset.id);
     }
     return out;
@@ -1020,6 +1131,7 @@
 
   // One-go group selection: selects every loaded photo in the section
   // (or clears just the section when all of it is already selected).
+  // Section = the full loaded set, not just the highlights reel.
   // Additive across groups; entering select mode so the batch bar appears.
   function toggleGroup(key: string) {
     const ids = groupIds(key);
@@ -3577,6 +3689,16 @@
     {/if}
 
     {#if assets.length}
+      {#if zoomDrill}
+        <div class="drill-banner" role="status">
+          <span>{drillLabel()} · {drilledAssets.length} {drilledAssets.length === 1 ? "photo" : "photos"}</span>
+          <button
+            type="button"
+            class="ghost"
+            onclick={drillBack}
+          >Back to {zoomDrill.from === "month" ? "months" : "years"}</button>
+        </div>
+      {/if}
       <div class="grid" data-density={density} data-details={gridDetails} use:gridZoomWheel title="Ctrl+scroll to zoom the timeline">
         {#each displayAssets as { asset, index }, di (asset.id)}
           {#if effGroup !== "none" && (di === 0 || groupKeyOf(displayAssets[di - 1].asset) !== groupKeyOf(asset))}
@@ -3591,6 +3713,15 @@
                 onchange={() => toggleGroup(gkey)}
               />
               {groupLabelOf(asset)} ({groupCounts.get(gkey) ?? 0})
+              {#if highlightsMode}
+                <button
+                  type="button"
+                  class="tiny show-all"
+                  aria-label={`Show all ${groupLabelOf(asset)} (${groupCounts.get(gkey) ?? 0})`}
+                  title="Open this period"
+                  onclick={() => drillInto(gkey)}
+                >Show all</button>
+              {/if}
             </h4>
           {/if}
           <figure class:selected={selected.has(asset.id)}>
@@ -3662,7 +3793,7 @@
 
     {#if stats && assets.length > 0}
       <div class="enrich">
-        <span class="hint">Showing {assets.length} of {libraryTotal()}</span>
+        <span class="hint">Showing {(zoomDrill ? drilledAssets.length : assets.length)} of {libraryTotal()}</span>
       </div>
     {/if}
   </section>
@@ -4481,7 +4612,7 @@
     max-width: 120rem;
     width: 100%;
     margin: 0 auto;
-    padding: 1.5rem clamp(1rem, 4vw, 3rem) 3rem;
+    padding: 1rem clamp(0.5rem, 2vw, 1.5rem) 2rem;
   }
   header h1 {
     font-size: 2rem;
@@ -4496,7 +4627,7 @@
     background: #151820;
     border: 1px solid #232733;
     border-radius: 12px;
-    padding: 1rem 1.25rem;
+    padding: 0.75rem;
     margin-bottom: 1rem;
   }
   .card-head {
@@ -4830,10 +4961,14 @@
     font-size: 0.95rem;
   }
   .map-wrap {
-    height: 60vh;
-    min-height: 24rem;
-    border: 1px solid #232733;
-    border-radius: 12px;
+    /* Viewport-filling and full-bleed inside the card: the toolbar and
+       credit keep the card frame, the tiles take everything else. */
+    height: calc(100dvh - 16rem);
+    min-height: 22rem;
+    margin: 0 -0.75rem -0.75rem;
+    border: 0;
+    border-top: 1px solid #232733;
+    border-radius: 0 0 12px 12px;
     overflow: hidden;
     background: #e5e3df;
   }
@@ -5053,8 +5188,11 @@
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(8.5rem, 100%), 1fr));
-    gap: 0.6rem;
+    gap: 3px;
     margin-top: 0.6rem;
+  }
+  .grid .thumb {
+    border-radius: 5px;
   }
   .grid > figure {
     min-width: 0;
@@ -5071,10 +5209,26 @@
     font-size: 0.85rem;
     font-weight: 600;
     color: #cfd5e1;
-    margin: 0.8rem 0 0.1rem;
+    margin: 0.6rem 0 0.25rem;
   }
   .group-head:first-child {
     margin-top: 0;
+  }
+  .group-head .show-all {
+    margin-left: auto;
+  }
+  /* Drill-down banner: period label + count left, Back pushed right. */
+  .drill-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #cfd5e1;
+    margin: 0.2rem 0 0.4rem;
+  }
+  .drill-banner button {
+    margin-left: auto;
   }
   .grid > figure {
     position: relative;
