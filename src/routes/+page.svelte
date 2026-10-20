@@ -1159,6 +1159,17 @@
     show = null;
   }
 
+  // Slideshow is fullscreen: lock page scroll behind the theater while open
+  // (otherwise the body's scrollbar stays visible at the right edge).
+  $effect(() => {
+    if (!show) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  });
+
   async function openSimilar(a: AssetRow) {
     // Videos never get vectors (embed backfill is images-only by design),
     // so fail fast with a friendly message instead of the raw error.
@@ -4479,6 +4490,7 @@
     display: flex;
     flex-direction: column;
     padding: 0.8rem 1rem;
+    overflow: hidden;
   }
   .theater-top {
     display: flex;

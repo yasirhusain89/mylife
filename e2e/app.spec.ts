@@ -528,6 +528,23 @@ test("slideshow plays just the current selection", async ({ page }) => {
   await expect(page.getByText("6 selected")).toBeVisible();
 });
 
+test("slideshow locks page scroll with no theater scrollbar", async ({ page }) => {
+  await page.getByTitle("Open IMG_20261007_185817.jpg").click();
+  const viewer = page.getByRole("dialog", { name: "IMG_20261007_185817.jpg" });
+  await viewer.getByRole("button", { name: "Play slideshow" }).click();
+  const show = page.getByRole("dialog", { name: "Slideshow" });
+  await expect(show).toBeVisible();
+  await show.getByRole("button", { name: "Pause" }).click();
+  // Body scroll is locked while the theater is open…
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("hidden");
+  // …and the theater itself never scrolls.
+  await expect(show).toHaveCSS("overflow", "hidden");
+  await show.getByRole("button", { name: "Close slideshow" }).click();
+  await expect(show).toBeHidden();
+  // …and the lock is released on close.
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("");
+});
+
 test("map tab plots located photos and jumps to the library", async ({ page }) => {
   await page.getByRole("tab", { name: "Map", exact: true }).click();
   const map = page.locator(".leaflet-container");
