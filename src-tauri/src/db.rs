@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (14, include_str!("../migrations/014_face_descriptors.sql")),
     (15, include_str!("../migrations/015_exposure.sql")),
     (16, include_str!("../migrations/016_trash_log.sql")),
+    (17, include_str!("../migrations/017_event_name_manual.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -1353,28 +1354,30 @@ pub fn cluster_events(
         v
     };
 
-    // Snapshot manual names/places before the rebuild wipes them: new
-    // events that overlap an old one by member majority inherit them.
-    let old_events: Vec<(String, Option<String>, std::collections::HashSet<i64>)> = {
+    // Snapshot names/places before the rebuild wipes them: new events that
+    // overlap an old one by member majority inherit the place, and inherit
+    // the name only when it was hand-set (flagged, or pre-flag recognised by
+    // shape). Generated names are dropped so the local-date backfill lands.
+    let old_events: Vec<(String, i64, Option<String>, f64, f64, std::collections::HashSet<i64>)> = {
         let mut stmt = conn
             .prepare(
-                "SELECT e.name, e.place, ea.asset_id FROM events e
+                "SELECT e.name, e.name_manual, e.place, e.started_at, e.ended_at, ea.asset_id FROM events e
                  LEFT JOIN event_assets ea ON ea.event_id = e.id",
             )
             .map_err(|e| format!("prepare old events: {e}"))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?)))
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?, r.get::<_, Option<i64>>(5)?)))
             .map_err(|e| format!("query old events: {e}"))?;
-        let mut by_name: std::collections::HashMap<(String, Option<String>), std::collections::HashSet<i64>> =
+        let mut by_name: std::collections::HashMap<(String, Option<String>), (i64, f64, f64, std::collections::HashSet<i64>)> =
             std::collections::HashMap::new();
         for row in rows {
-            let (name, place, asset) = row.map_err(|e| format!("old event row: {e}"))?;
-            let entry = by_name.entry((name, place)).or_default();
+            let (name, manual, place, start, end, asset) = row.map_err(|e| format!("old event row: {e}"))?;
+            let entry = by_name.entry((name, place)).or_insert((manual, start, end, std::collections::HashSet::new()));
             if let Some(id) = asset {
-                entry.insert(id);
+                entry.3.insert(id);
             }
         }
-        by_name.into_iter().map(|((name, place), members)| (name, place, members)).collect()
+        by_name.into_iter().map(|((name, place), (manual, start, end, members))| (name, manual, place, start, end, members)).collect()
     };
 
     let tx = conn.unchecked_transaction().map_err(|e| format!("events tx: {e}"))?;
@@ -1527,9 +1530,10 @@ pub fn cluster_events(
             .map_err(|e| format!("name event: {e}"))?;
     }
 
-    // Carry manual names/places across rebuilds: a new event whose members
-    // overlap an old one by majority on both sides inherits them. Each old
-    // event matches at most once; leftovers keep their fresh default names.
+    // Carry names/places across rebuilds: a new event whose members overlap
+    // an old one by majority on both sides inherits its place, and its name
+    // only when hand-set. Each old event matches at most once; leftovers keep
+    // their fresh default names.
     if !old_events.is_empty() {
         let mut new_sets: Vec<(i64, std::collections::HashSet<i64>)> = Vec::new();
         {
@@ -1555,7 +1559,7 @@ pub fn cluster_events(
             }
             let mut best: Option<usize> = None;
             let mut best_score = 0i64;
-            for (k, (_, _, old_members)) in old_events.iter().enumerate() {
+            for (k, (_, _, _, _, _, old_members)) in old_events.iter().enumerate() {
                 if used_old[k] || old_members.is_empty() {
                     continue;
                 }
@@ -1571,12 +1575,18 @@ pub fn cluster_events(
             }
             if let Some(k) = best {
                 used_old[k] = true;
-                let (name, place, _) = &old_events[k];
-                conn.execute(
-                    "UPDATE events SET name = ?2, place = ?3 WHERE id = ?1",
-                    params![eid, name, place],
-                )
-                .map_err(|e| format!("carry event name: {e}"))?;
+                let (name, manual, place, start, end, _) = &old_events[k];
+                let hand_set = *manual == 1 || !is_auto_shaped(name, *start, *end, place.as_deref());
+                if hand_set {
+                    conn.execute(
+                        "UPDATE events SET name = ?2, place = ?3, name_manual = 1 WHERE id = ?1",
+                        params![eid, name, place],
+                    )
+                    .map_err(|e| format!("carry event name: {e}"))?;
+                } else {
+                    conn.execute("UPDATE events SET place = ?2 WHERE id = ?1", params![eid, place])
+                        .map_err(|e| format!("carry event place: {e}"))?;
+                }
             }
         }
     }
@@ -1584,9 +1594,50 @@ pub fn cluster_events(
     Ok((event_count, candidates.len() as i64))
 }
 
-/// Formats a unix timestamp as "Mon DD" without any external crate.
-fn format_event_time(secs: f64) -> String {
-    let days = (secs / 86400.0).floor() as i64;
+/// System local UTC offset in seconds for the given timestamp, via the C
+/// library (no date crate in the tree). Darwin `struct tm` carries tm_gmtoff
+/// after the nine standard fields; a NULL return falls back to UTC, which is
+/// the pre-local-time behaviour.
+#[repr(C)]
+struct LocalTm {
+    tm_sec: std::os::raw::c_int,
+    tm_min: std::os::raw::c_int,
+    tm_hour: std::os::raw::c_int,
+    tm_mday: std::os::raw::c_int,
+    tm_mon: std::os::raw::c_int,
+    tm_year: std::os::raw::c_int,
+    tm_wday: std::os::raw::c_int,
+    tm_yday: std::os::raw::c_int,
+    tm_isdst: std::os::raw::c_int,
+    tm_gmtoff: std::os::raw::c_long,
+    tm_zone: *const std::os::raw::c_char,
+}
+
+unsafe extern "C" {
+    fn localtime_r(timep: *const i64, result: *mut LocalTm) -> *mut LocalTm;
+    fn tzset();
+}
+
+fn local_utc_offset(secs: f64) -> i64 {
+    let t = secs as i64;
+    // SAFETY: localtime_r writes only to our stack struct. time_t is 64-bit
+    // on every target this binary ships for; NULL means out of range.
+    unsafe {
+        let mut tm: LocalTm = std::mem::zeroed();
+        if localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+/// Whole local-calendar days since the unix epoch for a timestamp.
+fn local_day(secs: f64) -> i64 {
+    ((secs + local_utc_offset(secs) as f64) / 86400.0).floor() as i64
+}
+
+/// Civil "Mon DD" label for whole days since the unix epoch, no external crate.
+fn civil_day_label(days: i64) -> String {
     let mut d = days;
     let mut y = 1970;
     if d >= 0 {
@@ -1604,11 +1655,48 @@ fn format_event_time(secs: f64) -> String {
     format!("{} {}", mon, d + 1)
 }
 
-/// Default event name: single date ("Oct 9") or span ("Oct 9–11").
-/// Rename stays manual; this only sets the initial label.
-fn format_event_range(started_at: f64, ended_at: f64) -> String {
+/// Legacy UTC label, kept only to recognise pre-local-time auto-names during
+/// the backfill: a stored name matching this shape was generated, not typed.
+fn format_event_time_utc(secs: f64) -> String {
+    civil_day_label((secs / 86400.0).floor() as i64)
+}
+
+/// Formats a unix timestamp as "Mon DD" in the system local calendar day.
+fn format_event_time(secs: f64) -> String {
+    civil_day_label(local_day(secs))
+}
+
+/// Legacy UTC range, transition-only (see format_event_time_utc).
+fn format_event_range_utc(started_at: f64, ended_at: f64) -> String {
     let same_day = (started_at / 86400.0).floor() == (ended_at / 86400.0).floor();
     if same_day {
+        format_event_time_utc(started_at)
+    } else {
+        format!("{}–{}", format_event_time_utc(started_at), format_event_time_utc(ended_at))
+    }
+}
+
+/// Whether a stored event name is a generated default rather than a manual
+/// rename: it matches the formatter output (UTC legacy or local current) for
+/// its span, bare or with the stored place suffix. A hand-typed name that
+/// coincides with a generated one is indistinguishable and treated as auto —
+/// regeneration then just rewrites the same-shaped label.
+fn is_auto_shaped(stored: &str, started_at: f64, ended_at: f64, place: Option<&str>) -> bool {
+    let mut variants = vec![
+        format_event_range_utc(started_at, ended_at),
+        format_event_range(started_at, ended_at),
+    ];
+    if let Some(p) = place {
+        variants.push(format!("{} · {p}", variants[0]));
+        variants.push(format!("{} · {p}", variants[1]));
+    }
+    variants.iter().any(|v| v == stored)
+}
+
+/// Default event name in local calendar days: single date ("Oct 9") or span
+/// ("Oct 9–11"). Rename stays manual; this only sets the initial label.
+fn format_event_range(started_at: f64, ended_at: f64) -> String {
+    if local_day(started_at) == local_day(ended_at) {
         format_event_time(started_at)
     } else {
         format!("{}–{}", format_event_time(started_at), format_event_time(ended_at))
@@ -1680,7 +1768,7 @@ pub fn event_assets(conn: &Connection, event_id: i64) -> Result<Vec<EventAssetRo
 
 pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), String> {
     let changed = conn
-        .execute("UPDATE events SET name = ?2 WHERE id = ?1", params![event_id, name])
+        .execute("UPDATE events SET name = ?2, name_manual = 1 WHERE id = ?1", params![event_id, name])
         .map_err(|e| format!("rename event: {e}"))?;
     if changed == 0 {
         return Err(format!("event {event_id} not found"));
@@ -4223,10 +4311,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 16, "user_version tracks the highest applied migration");
+        assert_eq!(v, 17, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -5981,6 +6069,95 @@ mod tests {
         let (lat, lon) = (rows[0].latitude.unwrap(), rows[0].longitude.unwrap());
         assert!((lat - 37.7749).abs() < 1e-9 && (lon + 122.4194).abs() < 1e-9,
             "backfilled from the located member, got: {lat}, {lon}");
+    }
+
+    #[test]
+    fn event_names_use_local_calendar_day() {
+        // Pin the process timezone (this is the only test that mutates TZ).
+        unsafe {
+            std::env::set_var("TZ", "America/Denver");
+            tzset();
+        }
+        // 2026-10-10 05:30 UTC == Oct 9 23:30 MDT: UTC says Oct 10.
+        assert_eq!(format_event_time(1791610200.0), "Oct 9");
+        assert_eq!(format_event_time_utc(1791610200.0), "Oct 10");
+        // Same UTC day, split across local midnight: a real two-day span.
+        assert_eq!(format_event_range(1791610200.0, 1791613800.0), "Oct 9–Oct 10");
+        assert_eq!(format_event_range_utc(1791610200.0, 1791613800.0), "Oct 10");
+        // Straddles UTC midnight inside one local day: single label, never "X–X".
+        assert_eq!(format_event_range(1791606600.0, 1791610200.0), "Oct 9");
+        unsafe {
+            std::env::remove_var("TZ");
+            tzset();
+        }
+    }
+
+    #[test]
+    fn legacy_utc_names_recognised_as_auto() {
+        let start = 1_700_000_000.0;
+        let end = start + 7200.0;
+        let utc = format_event_range_utc(start, end);
+        assert!(is_auto_shaped(&utc, start, end, None), "bare legacy, got: {utc}");
+        assert!(
+            is_auto_shaped(&format!("{utc} · Moab"), start, end, Some("Moab")),
+            "legacy with place suffix"
+        );
+        assert!(
+            is_auto_shaped(&format_event_range(start, end), start, end, None),
+            "current local shape is auto too"
+        );
+        assert!(!is_auto_shaped("Maya's birthday", start, end, None), "custom name");
+        assert!(
+            !is_auto_shaped(&format!("{utc} · Maya's birthday"), start, end, Some("Moab")),
+            "date kept, suffix custom"
+        );
+        let other_day = format_event_time_utc(start + 86400.0 * 30.0);
+        assert!(!is_auto_shaped(&other_day, start, end, None), "wrong date, got: {other_day}");
+    }
+
+    #[test]
+    fn cluster_events_backfills_local_names_but_keeps_manual_ones() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let t = 1_700_000_000.0;
+        upsert_asset(&conn, &asset("/n1.jpg", 1, t), scan).unwrap();
+        upsert_asset(&conn, &asset("/n2.jpg", 1, t + 1800.0), scan).unwrap();
+        // Far enough for its own event, so one manual + one auto coexist.
+        upsert_asset(&conn, &asset("/n3.jpg", 1, t + 100000.0), scan).unwrap();
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let rows = events_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2, "gap splits into two events");
+        let first = rows.iter().find(|r| r.asset_count == 2).unwrap();
+        assert_eq!(first.name, format_event_range(t, t + 1800.0), "fresh names use the formatter");
+
+        // Hand-rename, then rebuild: the manual name survives with its flag,
+        // the untouched event keeps a generated name and stays unflagged.
+        rename_event(&conn, first.id, "Maya's birthday").unwrap();
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let rows = events_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        let kept = rows.iter().find(|r| r.asset_count == 2).unwrap();
+        assert_eq!(kept.name, "Maya's birthday");
+        let flags: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare("SELECT name, name_manual FROM events").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+                .map(|r| r.unwrap()).collect()
+        };
+        assert!(flags.iter().any(|(n, f)| n == "Maya's birthday" && *f == 1), "manual flagged: {flags:?}");
+        assert!(flags.iter().any(|(_, f)| *f == 0), "auto stays unflagged: {flags:?}");
+
+        // Pre-flag manual renames (flag reset, simulating a pre-017 row) are
+        // recognised by shape on the next rebuild, not clobbered.
+        conn.execute("UPDATE events SET name_manual = 0 WHERE name = 'Maya''s birthday'", []).unwrap();
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let rows = events_list(&conn).unwrap();
+        let kept = rows.iter().find(|r| r.asset_count == 2).unwrap();
+        assert_eq!(kept.name, "Maya's birthday", "shape-recognised manual survives");
+        let flag: i64 = conn
+            .query_row("SELECT name_manual FROM events WHERE name = 'Maya''s birthday'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(flag, 1, "re-flagged as manual");
     }
 
     #[test]

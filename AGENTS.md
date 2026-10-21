@@ -96,7 +96,8 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   nested Month → Trip → Day/stop hierarchy (trips expanded by default, no
   duplicate flat event list; honest Routine/Away/Collection badges), event
   coordinate backfill from located members, batched trip stats (one pass,
-  no N+1), neutral summary labels without GPS evidence. Open: LLM narratives
+  no N+1), neutral summary labels without GPS evidence, local-time event
+  names (`name_manual` provenance; backfill keeps hand-renamed labels). Open: LLM narratives
   (no on-device LLM ships; downloads banned).
 - **P5 Highlight videos — partial.** Open: camera-audio mixing (deferred,
   see quirks), diversity-picked shots, Ken Burns pans, transitions, narration,
