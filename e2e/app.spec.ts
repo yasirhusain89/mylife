@@ -495,6 +495,19 @@ test("group by sections the grid and clears back to flat", async ({ page }) => {
   await expect(page.locator(".grid figure")).toHaveCount(8);
 });
 
+test("all shows full date sections while month zoom shows the capped reel", async ({ page }) => {
+  await page.goto("/?web=1&highlights=3");
+  await page.getByLabel("Group by").selectOption("date");
+  await expect(page.getByRole("heading", { name: "October 2025 (8)" })).toBeVisible();
+  // All = everything: no capping, no drill-down affordance.
+  await expect(page.locator(".grid figure")).toHaveCount(8);
+  await expect(page.getByRole("button", { name: "Show all October 2025 (8)" })).toHaveCount(0);
+  // Month zoom = curated reel with a way into the full period.
+  await page.getByRole("button", { name: "Zoom timeline: Month" }).click();
+  await expect(page.locator(".grid figure")).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "Show all October 2025 (8)" })).toBeVisible();
+});
+
 test("group by person sections named clusters from untagged", async ({ page }) => {
   await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
@@ -509,8 +522,27 @@ test("group by person sections named clusters from untagged", async ({ page }) =
   await expect(page.getByRole("heading", { name: "No one tagged (4)" })).toBeVisible();
 });
 
+test("grouped library shows no selection UI until Select is pressed", async ({ page }) => {
+  await page.getByLabel("Group by").selectOption("media");
+  // Default: plain group headings, no checkboxes — the library is not in
+  // select mode and the Select entry button is visible.
+  await expect(page.getByRole("heading", { name: "Photos (6)" })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Select Photos" })).toHaveCount(0);
+  await expect(page.getByRole("checkbox", { name: "Select Videos" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Select", exact: true })).toBeVisible();
+  // Entering select mode reveals both the group and per-photo checkboxes.
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await expect(page.getByRole("checkbox", { name: "Select Photos" })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Select IMG_20261007_185817.jpg" })).toBeVisible();
+  // Done exits select mode and hides the selection UI again.
+  await page.getByRole("button", { name: "Done" }).click();
+  await expect(page.getByRole("checkbox", { name: "Select Photos" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Select", exact: true })).toBeVisible();
+});
+
 test("group headers select and clear the whole section in one go", async ({ page }) => {
   await page.getByLabel("Group by").selectOption("media");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
   const photos = page.getByRole("checkbox", { name: "Select Photos" });
   await photos.check();
   await expect(page.getByText("6 selected")).toBeVisible();
@@ -541,6 +573,7 @@ test("slideshow plays from the viewer with pause and step", async ({ page }) => 
 
 test("slideshow plays just the current selection", async ({ page }) => {
   await page.getByLabel("Group by").selectOption("media");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
   await page.getByRole("checkbox", { name: "Select Photos" }).check();
   await expect(page.getByText("6 selected")).toBeVisible();
   await page.getByRole("button", { name: "▶ Play" }).click();
@@ -1772,7 +1805,8 @@ test("library infinite scroll appends past the first page", async ({ page }) => 
 test("zoomed group headers select the whole section and filters still apply", async ({ page }) => {
   await page.getByRole("button", { name: "Zoom timeline: Day" }).click();
   await expect(page.getByRole("heading", { name: "October 9, 2025 (8)" })).toBeVisible();
-  // One-go group selection works at day granularity.
+  // One-go group selection works at day granularity (after entering select mode).
+  await page.getByRole("button", { name: "Select", exact: true }).click();
   await page.getByRole("checkbox", { name: "Select October 9, 2025" }).check();
   await expect(page.getByText("8 selected")).toBeVisible();
   await page.getByRole("checkbox", { name: "Select October 9, 2025" }).uncheck();

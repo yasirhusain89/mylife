@@ -588,11 +588,13 @@
     });
   });
 
-  // Highlights mode: at month/year granularity the grid shows a curated
-  // reel per section (favorites → resolution → newest, capped) instead of
-  // every photo. Day zoom and the flat grid always show everything.
+  // Highlights mode: only at the Month/Year timeline zooms does the grid
+  // show a curated reel per section (favorites → resolution → newest,
+  // capped) instead of every photo. At "all" every section shows everything
+  // — including Group-by Date month sections — so All never looks like Month.
+  // Day zoom and the flat grid always show everything.
   let highlightsMode = $derived(
-    effGroup === "date" && (dateGranularity() === "month" || dateGranularity() === "year")
+    libZoom !== "all" && effGroup === "date" && (dateGranularity() === "month" || dateGranularity() === "year")
   );
 
   function compareHighlights(a: AssetRow, b: AssetRow): number {
@@ -1269,7 +1271,9 @@
   // One-go group selection: selects every loaded photo in the section
   // (or clears just the section when all of it is already selected).
   // Section = the full loaded set, not just the highlights reel.
-  // Additive across groups; entering select mode so the batch bar appears.
+  // Additive across groups; only reachable in select mode (the header
+  // checkbox is gated on selectMode like the per-photo boxes), so no
+  // mode flip here — the library never looks selected by default.
   function toggleGroup(key: string) {
     const ids = groupIds(key);
     const next = new Set(selected);
@@ -1277,7 +1281,6 @@
     if (all) for (const id of ids) next.delete(id);
     else for (const id of ids) next.add(id);
     selected = next;
-    selectMode = true;
   }
 
   // Library grid keyboard support: roving focus over the visual grid plus
@@ -4695,13 +4698,15 @@
             {@const gkey = groupKeyOf(asset)}
             {@const gids = groupIds(gkey)}
             <h4 class="group-head">
-              <input
-                type="checkbox"
-                class="selbox-inline"
-                aria-label={`Select ${groupLabelOf(asset)}`}
-                checked={gids.length > 0 && gids.every((id) => selected.has(id))}
-                onchange={() => toggleGroup(gkey)}
-              />
+              {#if selectMode}
+                <input
+                  type="checkbox"
+                  class="selbox-inline"
+                  aria-label={`Select ${groupLabelOf(asset)}`}
+                  checked={gids.length > 0 && gids.every((id) => selected.has(id))}
+                  onchange={() => toggleGroup(gkey)}
+                />
+              {/if}
               {groupLabelOf(asset)} ({groupCounts.get(gkey) ?? 0})
               {#if highlightsMode}
                 <button
