@@ -88,8 +88,13 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   utility-shot detection, low-quality scoring, batch confirm.
 - **P3 Intelligence — partial.** Open: MobileCLIP2 embeddings + semantic search,
   VLM captions on demand.
-- **P4 Events & Summaries — partial.** Open: routine-vs-trip distinction,
-  LLM text summaries, event stats (top people, days, places).
+- **P4 Events & Summaries — partial.** Shipped: drive-aware splits
+  (`EVENT_STOP_GAP_S=1800` — distance splits only settled stops; a night
+  drive was seven 1-photo events before it), routine-vs-away trips
+  (home-base cells: 5+ days over 30+ days), deterministic trip summaries + stats
+  (top people/days/places on every trip card). Open: LLM narratives
+  (no on-device LLM ships; downloads banned), full trip→stops nesting
+  in the Events tab (stops still listed flat under months).
 - **P5 Highlight videos — partial.** Open: camera-audio mixing (deferred,
   see quirks), diversity-picked shots, Ken Burns pans, transitions, narration,
   export presets.
