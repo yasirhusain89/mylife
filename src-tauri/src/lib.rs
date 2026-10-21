@@ -907,9 +907,9 @@ fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Dev layout: <repo>/src-tauri/target/debug/fotoflow, vocab staged
-            // at <repo>/src-tauri/binaries/ by build-engine.sh.
-            tried.push(dir.join("..").join("binaries").join("clip_bpe_vocab.txt.gz"));
+            // Dev layout: <repo>/src-tauri/target/debug/fotoflow, vocab
+            // staged at <repo>/src-tauri/binaries/ by build-engine.sh.
+            tried.push(dir.join("../../binaries/clip_bpe_vocab.txt.gz"));
         }
     }
     if let Some(engine) = engine::engine_path() {
