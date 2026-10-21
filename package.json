@@ -14,7 +14,9 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "build:engine": "bash scripts/build-engine.sh"
+    "build:engine": "bash scripts/build-engine.sh",
+    "index:semantic": "uv run --with sqlite-vec python scripts/semantic_index.py index",
+    "semantic:q": "uv run --with sqlite-vec python scripts/semantic_index.py query"
   },
   "license": "MIT",
   "dependencies": {

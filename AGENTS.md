@@ -187,9 +187,10 @@ The app holds the DB open: **never file-copy `fotoflow.db`** (the `-wal`
 holds recent commits — a bare copy reads stale). Snapshot with
 `sqlite3 <live> ".backup main /tmp/x.db"` and probe the copy.
 
-### Semantic index (recurring after big structural moves)
-`pnpm index:semantic` — needs `ollama serve` + `nomic-embed-text`.
-Falls back to native Grep if ollama isn't running.
+### Code search (three tiers, in order)
+1. **Lexical** — native Grep/glob for text occurrences: exact strings, selectors, "where mentioned". Read the file before citing it.
+2. **Structural** — GitNexus graph for symbols: `context`/`cypher` (definitions, callers/callees), `trace` (A→B), `impact` before edits, `query` for flows. This repo is indexed; refresh with `gitnexus analyze --skip-agents-md` when stale or after big moves.
+3. **Semantic** — `pnpm semantic:q "concept"` for meaning queries with unknown vocabulary. Needs `ollama serve` + `nomic-embed-text`; Grep is the fallback. Covers `src/`, `src-tauri/`, `sidecar/`, `scripts/`, `e2e/`. Rebuild with `pnpm index:semantic` after big moves.
 
 ### Commit / push gate (recurring before any PR or branch handoff)
 `pnpm check` + `cargo test --lib` + `pnpm test:e2e` + `pnpm test:e2e:api`
@@ -199,10 +200,10 @@ all green → commit → push → restart `pnpm tauri dev`.
 
 - Camera-audio mixing: `ExtAudioFile` path verified — next is prototype
   `makeHighlight` with audio `AVAssetWriterInput` fed from `ExtAudioFile` PCM.
-- People review queue: 83 unassigned faces (re-run clustering), 4 cross-name
-  near pairs + 19 near-miss singletons to adjudicate. Threshold stays 0.55
-  (0.60 would chain-fuse Amol/Y1/T2 — measured 2026-10-20).
+- People review queue: 37 detached faces with descriptors (re-run re-absorbs
+  them — confirm none was a deliberate detach first), 0 AM×T2 cross-name
+  pairs under 0.60, 2 singleton near-misses at named clusters (face 97→AM
+  0.615, face 4→T2 0.644) to adjudicate by eye, 179 faceless images awaiting
+  detection. Threshold stays 0.55 (0.60 chain-fuses AM+T2+212 unnamed into
+  one 233-group — measured 2026-10-21).
 - Map pan/zoom smoothness check (needs human frame review).
-
-<!-- semantic fallback: `pnpm semantic:q "concept"` covers src/, src-tauri/, scripts/, e2e/. -->
-<!-- Needs `ollama serve` + nomic-embed-text. Rebuild with `pnpm index:semantic`. -->
