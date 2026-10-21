@@ -112,6 +112,11 @@ export const facesInCluster = pick("facesInCluster");
 export const facesCount = pick("facesCount");
 export const reviewCandidates = pick("reviewCandidates");
 export const dismissReviewCandidate = pick("dismissReviewCandidate");
+export const clipModelsPresent = pick("clipModelsPresent");
+export const downloadClipModels = pick("downloadClipModels");
+export const onClipDownloadProgress = pick("onClipDownloadProgress");
+export const embedClipBackfill = pick("embedClipBackfill");
+export const searchText = pick("searchText");
 export const clusterEvents = pick("clusterEvents");
 export const eventsList = pickRead("eventsList");
 export const eventAssets = pick("eventAssets");
@@ -225,6 +230,9 @@ export type {
   ReviewCandidate,
   ReviewClusterRef,
   ReviewFaceRef,
+  SearchHit,
+  ClipModelsStatus,
+  ClipDownloadProgress,
   SimilarHit,
   TagProgress,
   TagScenesSummary

@@ -45,6 +45,9 @@ import type {
   TrashEntry,
   ExportProgress,
   ReviewCandidate,
+  SearchHit,
+  ClipModelsStatus,
+  ClipDownloadProgress,
 } from "./library";
 
 /**
@@ -833,6 +836,46 @@ export async function reviewCandidates(): Promise<ReviewCandidate[]> {
 
 export async function dismissReviewCandidate(faceA: number, faceB: number): Promise<void> {
   reviewDismissed.add(`${Math.min(faceA, faceB)}-${Math.max(faceA, faceB)}`);
+}
+
+export async function clipModelsPresent(): Promise<ClipModelsStatus> {
+  return { ready: true, bytesTotal: 279143896 };
+}
+
+export async function downloadClipModels(): Promise<ClipModelsStatus> {
+  return clipModelsPresent();
+}
+
+export function onClipDownloadProgress(_cb: (p: ClipDownloadProgress) => void): Promise<() => void> {
+  return Promise.resolve(() => {});
+}
+
+export async function embedClipBackfill(): Promise<{ embedded: number; failed: number }> {
+  return { embedded: assets.length, failed: 0 };
+}
+
+/** Scripted semantic search: substring match on seeded file names, ranked by
+ *  match position — deterministic for e2e, no vectors involved. */
+export async function searchText(text: string, limit?: number): Promise<SearchHit[]> {
+  const q = text.trim().toLowerCase();
+  if (!q) return [];
+  const hits: SearchHit[] = [];
+  for (const a of assets) {
+    if (a.missing !== 0) continue;
+    const name = a.name.toLowerCase();
+    const at = name.indexOf(q);
+    if (at < 0) continue;
+    hits.push({
+      assetId: a.id,
+      path: a.path,
+      name: a.name,
+      kind: a.kind,
+      score: Math.max(0.05, 0.9 - at * 0.01),
+      tSeconds: a.kind === "video" ? 2.0 : null,
+    });
+  }
+  hits.sort((x, y) => y.score - x.score || x.assetId - y.assetId);
+  return hits.slice(0, Math.min(Math.max(limit ?? 50, 1), 200));
 }
 
 let sightings: PetSighting[] = [];

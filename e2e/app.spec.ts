@@ -1408,6 +1408,30 @@ test("person filter narrows to one cluster", async ({ page }) => {
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
 });
 
+test("semantic search narrows to matches and opens video moments", async ({ page }) => {
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByLabel("Describe a photo to find").fill("VID_20261007");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Search results for VID_20261007" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("▶ 0:02")).toHaveCount(2);
+  await dialog.getByRole("button", { name: /VID_20261007_192001/ }).click();
+  await expect(page.getByText("Video playback needs the desktop app")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
+test("semantic search finds a photo by name fragment", async ({ page }) => {
+  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByLabel("Describe a photo to find").fill("IMG_20261007_185817");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Search results for IMG_20261007_185817" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("% match")).toHaveCount(1);
+  await dialog.getByRole("button", { name: /IMG_20261007_185817/ }).click();
+  await expect(page.locator(".viewer-stage img").first()).toBeVisible();
+});
+
 test("scene tag filter narrows to tagged assets", async ({ page }) => {
   const scene = page.getByLabel("Filter by scene");
   await expect(scene).toBeVisible();

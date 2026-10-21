@@ -25,6 +25,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (16, include_str!("../migrations/016_trash_log.sql")),
     (17, include_str!("../migrations/017_event_name_manual.sql")),
     (18, include_str!("../migrations/018_review_decisions.sql")),
+    (19, include_str!("../migrations/019_clip_vectors.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -4102,6 +4103,185 @@ pub fn similar_to(conn: &Connection, asset_id: i64, model: &str, limit: i64) -> 
     Ok(hits)
 }
 
+// MARK: - Semantic search (CLIP)
+
+/// Dimension of the OpenCLIP ViT-B-32 text/image space. Stored vectors are
+/// L2-normalized at encode time; cosine() stays robust to the rest.
+pub const CLIP_DIM: i64 = 512;
+
+/// Inserts or replaces one asset's CLIP photo vector. Idempotent: the row is
+/// overwritten, never duplicated.
+pub fn save_clip_vector(conn: &Connection, asset_id: i64, vec: &[f32]) -> Result<(), String> {
+    if vec.len() as i64 != CLIP_DIM {
+        return Err(format!(
+            "CLIP dim mismatch for asset {asset_id}: got {}, want {CLIP_DIM}",
+            vec.len()
+        ));
+    }
+    conn.execute(
+        "INSERT INTO clip_vectors (asset_id, dim, vec) VALUES (?1, ?2, ?3)
+         ON CONFLICT (asset_id) DO UPDATE SET dim = excluded.dim, vec = excluded.vec",
+        params![asset_id, CLIP_DIM, floats_to_bytes(vec)],
+    )
+    .map_err(|e| format!("save clip vector: {e}"))?;
+    Ok(())
+}
+
+/// Readable images with no CLIP vector yet, for the embed backfill.
+/// Failures leave no row, so they are retried on the next pass.
+pub fn clip_photo_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.path FROM assets a
+              WHERE a.kind = 'image' AND a.missing = 0
+                AND NOT EXISTS (SELECT 1 FROM clip_vectors v WHERE v.asset_id = a.id)
+              ORDER BY a.id LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare clip candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query clip candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("clip candidate row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Readable videos with no keyframe rows yet, for the embed backfill.
+pub fn keyframe_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.path FROM assets a
+              WHERE a.kind = 'video' AND a.missing = 0
+                AND NOT EXISTS (SELECT 1 FROM video_keyframes k WHERE k.asset_id = a.id)
+              ORDER BY a.id LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare keyframe candidates: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("query keyframe candidates: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("keyframe candidate row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Replaces one video's keyframe rows (t, vector). Re-embedding is
+/// idempotent: old moments are cleared first, never duplicated.
+pub fn save_keyframes(conn: &Connection, asset_id: i64, frames: &[(f64, Vec<f32>)]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("keyframes tx: {e}"))?;
+    tx.execute("DELETE FROM video_keyframes WHERE asset_id = ?1", params![asset_id])
+        .map_err(|e| format!("clear keyframes: {e}"))?;
+    for (t, vec) in frames {
+        if vec.len() as i64 != CLIP_DIM {
+            return Err(format!(
+                "CLIP dim mismatch for asset {asset_id} at t={t}: got {}, want {CLIP_DIM}",
+                vec.len()
+            ));
+        }
+        tx.execute(
+            "INSERT INTO video_keyframes (asset_id, t_seconds, dim, vec) VALUES (?1, ?2, ?3, ?4)",
+            params![asset_id, t, CLIP_DIM, floats_to_bytes(vec)],
+        )
+        .map_err(|e| format!("save keyframe: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("keyframes commit: {e}"))?;
+    Ok(())
+}
+
+/// One text-query hit: a photo (`t_seconds` None) or a video moment.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub asset_id: i64,
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub score: f64,
+    pub t_seconds: Option<f64>,
+}
+
+/// Brute-force cosine of a text vector over photo vectors and keyframes,
+/// best first. Each video appears once, at its best moment. Libraries here
+/// are ≤ ~50k assets: fast enough with no index, like similar_to().
+pub fn search_clip(conn: &Connection, query: &[f32], limit: i64) -> Result<Vec<SearchHit>, String> {
+    if query.len() as i64 != CLIP_DIM {
+        return Err(format!("CLIP query dim mismatch: got {}, want {CLIP_DIM}", query.len()));
+    }
+    let mut hits: Vec<SearchHit> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.path, a.name, a.kind, v.vec FROM clip_vectors v
+                  JOIN assets a ON a.id = v.asset_id
+                  WHERE a.missing = 0",
+            )
+            .map_err(|e| format!("prepare clip search: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(|e| format!("query clip search: {e}"))?;
+        for row in rows {
+            let (id, path, name, kind, blob) = row.map_err(|e| format!("clip row: {e}"))?;
+            let Some(other) = bytes_to_floats(&blob) else { continue };
+            hits.push(SearchHit { asset_id: id, path, name, kind, score: cosine(query, &other), t_seconds: None });
+        }
+    }
+    {
+        let mut best: std::collections::HashMap<i64, (String, String, String, f64, f64)> =
+            std::collections::HashMap::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.path, a.name, a.kind, k.t_seconds, k.vec FROM video_keyframes k
+                  JOIN assets a ON a.id = k.asset_id
+                  WHERE a.missing = 0",
+            )
+            .map_err(|e| format!("prepare keyframe search: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(|e| format!("query keyframe search: {e}"))?;
+        for row in rows {
+            let (id, path, name, kind, t, blob) = row.map_err(|e| format!("keyframe row: {e}"))?;
+            let Some(other) = bytes_to_floats(&blob) else { continue };
+            let score = cosine(query, &other);
+            match best.get(&id) {
+                Some((_, _, _, s, _)) if *s >= score => {}
+                _ => {
+                    best.insert(id, (path, name, kind, score, t));
+                }
+            }
+        }
+        for (id, (path, name, kind, score, t)) in best {
+            hits.push(SearchHit { asset_id: id, path, name, kind, score, t_seconds: Some(t) });
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.asset_id.cmp(&b.asset_id))
+    });
+    hits.truncate(limit.max(0) as usize);
+    Ok(hits)
+}
+
 // MARK: - Queries
 
 #[derive(Default)]
@@ -4555,10 +4735,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 18, "user_version tracks the highest applied migration");
+        assert_eq!(v, 19, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -6465,6 +6645,56 @@ mod tests {
         assert_eq!(cands[0].kind, "assign");
         assert_eq!(cands[0].assign_to, Some(b));
         assert_eq!(cands[0].face_a.id, lone, "lone face reads left");
+    }
+
+    #[test]
+    fn clip_search_ranks_photos_and_best_video_moments() {
+        fn unit(i: usize) -> Vec<f32> {
+            let mut v = vec![0.0; CLIP_DIM as usize];
+            v[i] = 1.0;
+            v
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        upsert_asset(&conn, &asset("/a.jpg", 1, 1.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b.jpg", 1, 2.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/v.mp4", 1, 3.0), scan).unwrap();
+        conn.execute("UPDATE assets SET kind = 'video' WHERE path = '/v.mp4'", []).unwrap();
+        let aid: i64 = conn.query_row("SELECT id FROM assets WHERE path = '/a.jpg'", [], |r| r.get(0)).unwrap();
+        let bid: i64 = conn.query_row("SELECT id FROM assets WHERE path = '/b.jpg'", [], |r| r.get(0)).unwrap();
+        let vid: i64 = conn.query_row("SELECT id FROM assets WHERE path = '/v.mp4'", [], |r| r.get(0)).unwrap();
+        save_clip_vector(&conn, aid, &unit(0)).unwrap();
+        save_clip_vector(&conn, bid, &unit(1)).unwrap();
+        // Re-embed overwrites instead of duplicating.
+        save_clip_vector(&conn, aid, &unit(1)).unwrap();
+        save_keyframes(&conn, vid, &[(1.0, unit(2)), (2.0, unit(0))]).unwrap();
+
+        let hits = search_clip(&conn, &unit(0), 10).unwrap();
+        assert_eq!(hits.len(), 3, "photos + one best moment per video, got: {hits:?}");
+        assert_eq!(hits[0].asset_id, vid, "video's best moment wins");
+        assert_eq!(hits[0].t_seconds, Some(2.0));
+        assert_eq!(hits[1].asset_id, aid, "re-embedded photo follows (id tie-break)");
+        assert!(hits[1].t_seconds.is_none());
+        let hits = search_clip(&conn, &unit(2), 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].asset_id, vid);
+        assert_eq!(hits[0].t_seconds, Some(1.0), "best moment moves with the query");
+
+        assert!(save_clip_vector(&conn, aid, &[0.0; 3]).is_err(), "dim enforced");
+        assert!(search_clip(&conn, &[0.0; 3], 10).is_err(), "query dim enforced");
+        assert!(save_keyframes(&conn, vid, &[(1.0, vec![0.0; 3])]).is_err(), "frame dim enforced");
+
+        // Keyframe re-embed replaces moments; missing videos surface for backfill.
+        save_keyframes(&conn, vid, &[(5.0, unit(1))]).unwrap();
+        let hits = search_clip(&conn, &unit(0), 10).unwrap();
+        assert!(hits.iter().all(|h| h.asset_id != vid || h.t_seconds == Some(5.0)));
+        let cands = keyframe_candidates(&conn, 10).unwrap();
+        assert!(cands.is_empty(), "embedded video leaves the queue");
+        conn.execute("DELETE FROM video_keyframes WHERE asset_id = ?1", params![vid]).unwrap();
+        let cands = keyframe_candidates(&conn, 10).unwrap();
+        assert_eq!(cands.len(), 1, "moment-less video returns, got: {cands:?}");
+        assert_eq!(cands[0].0, vid);
     }
 
     #[test]

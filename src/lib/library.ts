@@ -571,6 +571,47 @@ export function facesCount(): Promise<number> {
   return invoke("faces_count");
 }
 
+export function searchText(text: string, limit?: number): Promise<SearchHit[]> {
+  return invoke("search_text", { text, limit });
+}
+
+/** One semantic-search hit: a photo (`tSeconds` null) or a video moment. */
+export type SearchHit = {
+  assetId: number;
+  path: string;
+  name: string;
+  kind: string;
+  score: number;
+  tSeconds: number | null;
+};
+
+export type ClipModelsStatus = {
+  ready: boolean;
+  bytesTotal: number;
+};
+
+export type ClipDownloadProgress = {
+  name: string;
+  received: number;
+  total: number;
+};
+
+export function clipModelsPresent(): Promise<ClipModelsStatus> {
+  return invoke("clip_models_present");
+}
+
+export function downloadClipModels(): Promise<ClipModelsStatus> {
+  return invoke("download_clip_models");
+}
+
+export function onClipDownloadProgress(cb: (p: ClipDownloadProgress) => void): Promise<() => void> {
+  return listen<ClipDownloadProgress>("clip-download-progress", (e) => cb(e.payload));
+}
+
+export function embedClipBackfill(): Promise<{ embedded: number; failed: number }> {
+  return invoke("embed_clip_backfill");
+}
+
 export type ReviewClusterRef = {
   id: number | null;
   name: string | null;

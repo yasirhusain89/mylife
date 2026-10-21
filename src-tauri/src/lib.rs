@@ -873,6 +873,254 @@ fn similar_to(
     db::similar_to(&conn, asset_id, db::VECTOR_MODEL, limit.unwrap_or(12).clamp(1, 100))
 }
 
+// MARK: - Semantic search (CLIP)
+
+/// Model release hosting the converted CoreML packages. Pinned by hash;
+/// bump the version (and both hashes) to roll the models forward.
+pub const CLIP_MODELS_VERSION: &str = "clip-models-v1";
+const CLIP_IMAGE_URL: &str = "https://github.com/yasirhusain89/mylife/releases/download/clip-models-v1/CLIPImage.mlpackage.zip";
+const CLIP_IMAGE_SHA256: &str = "0ac03dcfbdb4e4c99be33b6f4c100bb836625768576a04d5fcb756c233c6d7f4";
+const CLIP_IMAGE_ZIP_BYTES: u64 = 162408298;
+const CLIP_TEXT_URL: &str = "https://github.com/yasirhusain89/mylife/releases/download/clip-models-v1/CLIPText.mlpackage.zip";
+const CLIP_TEXT_SHA256: &str = "35a85464d94d288e59fd5e3a6649d2c63646819f4e2ece1a5cc620dc72b5aac7";
+const CLIP_TEXT_ZIP_BYTES: u64 = 116735598;
+
+fn clip_model_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?
+        .join("models")
+        .join("clip-vit-b32"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipModelsStatus {
+    pub ready: bool,
+    pub bytes_total: u64,
+}
+
+/// Whether both CoreML packages are on disk (unpacked, ready to load).
+#[tauri::command]
+fn clip_models_present(app: tauri::AppHandle) -> Result<ClipModelsStatus, String> {
+    let dir = clip_model_dir(&app)?;
+    let ready = dir.join("CLIPImage.mlpackage").is_dir() && dir.join("CLIPText.mlpackage").is_dir();
+    Ok(ClipModelsStatus { ready, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES })
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Verifies a downloaded model zip against its pinned hash and unpacks it
+/// into the models dir. Pure apart from the filesystem, so the round-trip is
+/// unit-tested with a synthetic archive.
+fn verify_and_unpack(dir: &std::path::Path, name: &str, zip_bytes: &[u8], sha: &str) -> Result<(), String> {
+    let got = sha256_hex(zip_bytes);
+    if got != sha {
+        return Err(format!("{name} hash mismatch: got {got}, want {sha}"));
+    }
+    let cursor = std::io::Cursor::new(zip_bytes);
+    zip::ZipArchive::new(cursor)
+        .map_err(|e| format!("{name} unzip open: {e}"))?
+        .extract(dir)
+        .map_err(|e| format!("{name} unzip: {e}"))?;
+    Ok(())
+}
+
+/// Downloads both CoreML packages (first use, explicit opt-in via the UI),
+/// verifies hashes, and unzips them into the models dir. Progress rides the
+/// `clip-download-progress` event ({name, received, total}).
+#[tauri::command]
+async fn download_clip_models(app: tauri::AppHandle) -> Result<ClipModelsStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = clip_model_dir(&app)?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create models dir: {e}"))?;
+        for (name, url, sha, total) in [
+            ("CLIPImage", CLIP_IMAGE_URL, CLIP_IMAGE_SHA256, CLIP_IMAGE_ZIP_BYTES),
+            ("CLIPText", CLIP_TEXT_URL, CLIP_TEXT_SHA256, CLIP_TEXT_ZIP_BYTES),
+        ] {
+            let target = dir.join(format!("{name}.mlpackage"));
+            if target.is_dir() {
+                let _ = app.emit(
+                    "clip-download-progress",
+                    json!({ "name": name, "received": total, "total": total }),
+                );
+                continue;
+            }
+            let zip_path = dir.join(format!("{name}.mlpackage.zip"));
+            let mut resp = ureq::get(url)
+                .header("User-Agent", "fotoflow/0.1.0 (local photo manager; one-time model fetch)")
+                .call()
+                .map_err(|e| format!("{name} download: {e}"))?;
+            let mut reader = resp.body_mut().as_reader();
+            let file = std::fs::File::create(&zip_path).map_err(|e| format!("{name} cache file: {e}"))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let mut buf = vec![0u8; 1 << 20];
+            let mut received: u64 = 0;
+            loop {
+                let n = std::io::Read::read(&mut reader, &mut buf)
+                    .map_err(|e| format!("{name} download read: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                std::io::Write::write_all(&mut writer, &buf[..n])
+                    .map_err(|e| format!("{name} download write: {e}"))?;
+                received += n as u64;
+                let _ = app.emit(
+                    "clip-download-progress",
+                    json!({ "name": name, "received": received, "total": total }),
+                );
+            }
+            drop(writer);
+            let zip_bytes =
+                std::fs::read(&zip_path).map_err(|e| format!("{name} re-read: {e}"))?;
+            if let Err(e) = verify_and_unpack(&dir, name, &zip_bytes, sha) {
+                let _ = std::fs::remove_file(&zip_path);
+                return Err(e);
+            }
+            let _ = std::fs::remove_file(&zip_path);
+        }
+        Ok(ClipModelsStatus { ready: true, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES })
+    })
+    .await
+    .map_err(|e| format!("clip download join failed: {e}"))?
+}
+
+/// Backfills CLIP photo vectors (images) and keyframe moments (videos) for
+/// rows missing them. One engine round-trip per file; a single bad file
+/// never aborts, and failures leave no row so the next pass retries them.
+/// Progress reuses the `embed-progress` channel ({processed, embedded,
+/// failed}) so the Library header shows one honest bar for both encoders.
+#[tauri::command]
+async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let model_dir = clip_model_dir(&app)?;
+        if !model_dir.join("CLIPImage.mlpackage").is_dir()
+            || !model_dir.join("CLIPText.mlpackage").is_dir()
+        {
+            return Err("CLIP models are not downloaded yet".into());
+        }
+        let model_dir = model_dir.to_string_lossy().into_owned();
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        let (mut embedded, mut failed) = (0i64, 0i64);
+        let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        loop {
+            let batch: Vec<(i64, String)> = db::clip_photo_candidates(&conn, 20)?
+                .into_iter()
+                .filter(|(id, _)| !attempted.contains(id))
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            for (id, path) in &batch {
+                attempted.insert(*id);
+                let reply = engine::call_blocking(
+                    &engine_state,
+                    "clip_encode_image",
+                    Some(json!({ "path": path, "modelDir": model_dir })),
+                    Duration::from_secs(300),
+                );
+                let vector: Option<Vec<f32>> = reply
+                    .ok()
+                    .as_ref()
+                    .and_then(|r| r.get("vector"))
+                    .and_then(Value::as_str)
+                    .and_then(|b| b64_decode(b).ok())
+                    .and_then(|bytes| db::bytes_to_floats(&bytes));
+                match vector {
+                    Some(vec) => match db::save_clip_vector(&conn, *id, &vec) {
+                        Ok(()) => embedded += 1,
+                        Err(_) => failed += 1,
+                    },
+                    None => failed += 1,
+                }
+            }
+            let _ = app.emit(
+                "embed-progress",
+                json!({ "processed": embedded + failed, "embedded": embedded, "failed": failed }),
+            );
+        }
+        loop {
+            let batch = db::keyframe_candidates(&conn, 5)?;
+            if batch.is_empty() {
+                break;
+            }
+            for (id, path) in &batch {
+                let reply = engine::call_with_events(
+                    &engine_state,
+                    "clip_keyframes",
+                    Some(json!({ "path": path, "modelDir": model_dir, "everySeconds": 2.0, "maxFrames": 12 })),
+                    Duration::from_secs(600),
+                    &mut |_, _| {},
+                );
+                let frames: Option<Vec<(f64, Vec<f32>)>> = reply.ok().as_ref().and_then(|r| {
+                    r.get("frames")?.as_array()?.iter().map(|f| {
+                        let t = f.get("t")?.as_f64()?;
+                        let vec = f.get("vector")?.as_str()
+                            .and_then(|b| b64_decode(b).ok())
+                            .and_then(|bytes| db::bytes_to_floats(&bytes))?;
+                        Some((t, vec))
+                    }).collect()
+                });
+                match frames {
+                    Some(frames) if !frames.is_empty() => {
+                        match db::save_keyframes(&conn, *id, &frames) {
+                            Ok(()) => embedded += 1,
+                            Err(_) => failed += 1,
+                        }
+                    }
+                    _ => failed += 1,
+                }
+            }
+            let _ = app.emit(
+                "embed-progress",
+                json!({ "processed": embedded + failed, "embedded": embedded, "failed": failed }),
+            );
+        }
+        Ok(EmbedSummary { embedded, failed })
+    })
+    .await
+    .map_err(|e| format!("clip embed join failed: {e}"))?
+}
+
+/// Text search over photos and video moments: the query is embedded by the
+/// engine (Swift BPE + CoreML, verified parity with the Python tokenizer),
+/// then cosine-ranked against stored vectors in one pass.
+#[tauri::command]
+fn search_text(
+    conn: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    engine_state: tauri::State<'_, engine::EngineState>,
+    text: String,
+    limit: Option<i64>,
+) -> Result<Vec<db::SearchHit>, String> {
+    if text.trim().is_empty() {
+        return Err("empty search text".into());
+    }
+    let model_dir = clip_model_dir(&app)?;
+    let reply = engine::call_blocking(
+        &engine_state,
+        "clip_encode_text",
+        Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy() })),
+        Duration::from_secs(120),
+    )?;
+    let query = reply
+        .get("vector")
+        .and_then(Value::as_str)
+        .and_then(|b| b64_decode(b).ok())
+        .and_then(|bytes| db::bytes_to_floats(&bytes))
+        .ok_or("text encode returned no vector")?;
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::search_clip(&conn, &query, limit.unwrap_or(50).clamp(1, 200))
+}
+
 // MARK: - Post-import pipeline
 
 #[derive(Serialize, Clone)]
@@ -3597,6 +3845,10 @@ pub fn run() {
             run_post_import_cmd,
             embed_library,
             similar_to,
+            clip_models_present,
+            download_clip_models,
+            embed_clip_backfill,
+            search_text,
             scene_tags,
             asset_tags,
             duplicates_list,
@@ -3682,6 +3934,30 @@ mod tests {
         assert!(path.exists(), "engine binary missing; run pnpm build:engine");
         unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
         engine::new_state()
+    }
+
+    /// The model-download unpack path: hash mismatch rejects, a good archive
+    /// lands its top-level dir. Uses a synthetic zip so no network is needed.
+    #[test]
+    fn clip_package_verify_and_unpack_round_trips() {
+        let dir = std::env::temp_dir().join("fotoflow-clip-unpack-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.add_directory("CLIPImage.mlpackage/", opts).unwrap();
+            w.start_file("CLIPImage.mlpackage/weights.bin", opts).unwrap();
+            std::io::Write::write_all(&mut w, b"fake-weights").unwrap();
+            w.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let sha = sha256_hex(&bytes);
+        assert!(verify_and_unpack(&dir, "CLIPImage", b"tampered", &sha).is_err(), "hash enforced");
+        verify_and_unpack(&dir, "CLIPImage", &bytes, &sha).unwrap();
+        assert!(dir.join("CLIPImage.mlpackage/weights.bin").is_file(), "archive unpacked");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression guard for the Stage-4 outage ("Command export_share_pack

@@ -34,6 +34,11 @@ echo "swiftc: $SWIFTC_BIN ($("$SWIFTC_BIN" --version 2>&1 | head -1))"
 SDK="$(xcrun --show-sdk-path)"
 mkdir -p src-tauri/binaries
 
+# The CLIP BPE vocab rides next to the binary (gitignored dir, reproducible
+# from sidecar/engine/Resources): the engine resolves it from its own
+# executable path, so dev and prod match.
+cp sidecar/engine/Resources/clip_bpe_vocab.txt.gz src-tauri/binaries/
+
 # Placeholder protocol version marker; bump when engine protocol changes.
 # -g keeps line info in crash reports (stripped only for release builds).
 "$SWIFTC_BIN" \

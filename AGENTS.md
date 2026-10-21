@@ -86,8 +86,11 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   22.7h proved pure union-find unusable), keeper score breakdown
   (`why keeper: ★ favourite · sharpest (N) · earliest`). Open:
   utility-shot detection, low-quality scoring, batch confirm.
-- **P3 Intelligence — partial.** Open: MobileCLIP2 embeddings + semantic search,
-  VLM captions on demand.
+- **P3 Intelligence — partial.** Shipped: semantic search (OpenCLIP ViT-B-32
+  laion2b MIT → CoreML fp16, `clip-models-v1` release; text BPE in Swift
+  verified 1.0 cosine parity vs Python, image ranking-verified; photos +
+  video keyframes, one-time ~280MB download, video hits jump to timestamp).
+  Open: VLM captions on demand.
 - **P4 Events & Summaries — partial.** Shipped: drive-aware splits
   (`EVENT_STOP_GAP_S=1800` — distance splits only settled stops; a night
   drive was seven 1-photo events before it), routine-vs-away trips

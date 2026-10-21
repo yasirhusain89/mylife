@@ -1,8 +1,10 @@
 import AppKit
 import AudioToolbox
 import AVFoundation
+import Compression
 import CoreGraphics
 import CoreImage
+import CoreML
 import CryptoKit
 import Foundation
 import ImageIO
@@ -1418,8 +1420,384 @@ func embedBatch(paths: [String]) -> [String: Any] {
     return ["count": paths.count, "results": results]
 }
 
-// MARK: - Image quality
+// MARK: - CLIP semantic search (OpenCLIP ViT-B-32, CoreML fp16)
+//
+// Text + image encoders for semantic search. Models download once (MIT
+// weights) into the app models dir; the BPE vocab ships in-repo and its path
+// arrives per command (the sidecar has no bundle resources). Wire format
+// matches the face descriptors (base64 f32 LE + dim) so Rust stores and
+// cosine-compares without re-decoding. Embeddings are L2-normalized here.
 
+// Loaded once per process; the sidecar is long-lived.
+var clipImageModel: MLModel? = nil
+var clipTextModel: MLModel? = nil
+var clipModelDir: String? = nil
+
+func clipModels(modelDir: String) throws -> (MLModel, MLModel) {
+    if let i = clipImageModel, let t = clipTextModel, clipModelDir == modelDir {
+        return (i, t)
+    }
+    // mlpackage → compiled mlmodelc on first use (writable models dir).
+    func load(_ name: String) throws -> MLModel {
+        let dst = URL(fileURLWithPath: modelDir + "/\(name).mlmodelc")
+        if !FileManager.default.fileExists(atPath: dst.path) {
+            let src = URL(fileURLWithPath: modelDir + "/\(name).mlpackage")
+            let compiled = try MLModel.compileModel(at: src)
+            if FileManager.default.fileExists(atPath: dst.path) {
+                try FileManager.default.removeItem(at: dst)
+            }
+            try FileManager.default.moveItem(at: compiled, to: dst)
+        }
+        return try MLModel(contentsOf: dst)
+    }
+    let i = try load("CLIPImage")
+    let t = try load("CLIPText")
+    clipImageModel = i
+    clipTextModel = t
+    clipModelDir = modelDir
+    return (i, t)
+}
+
+/// Minimal gzip member reader (header + raw deflate + ignored trailer) for
+/// the shipped BPE vocab. Compression.framework has no gunzip one-shot.
+func gunzip(_ data: Data) throws -> Data {
+    guard data.count > 18, data[0] == 0x1f, data[1] == 0x8b, data[2] == 0x08 else {
+        throw EngineError(message: "not a gzip member")
+    }
+    let flags = data[3]
+    var off = 10
+    func u16(_ o: Int) -> Int { Int(data[o]) | (Int(data[o + 1]) << 8) }
+    if flags & 0x04 != 0 {
+        let xlen = u16(off)
+        off += 2 + xlen
+    }
+    if flags & 0x08 != 0 {
+        while off < data.count && data[off] != 0 { off += 1 }
+        off += 1
+    }
+    if flags & 0x10 != 0 {
+        while off < data.count && data[off] != 0 { off += 1 }
+        off += 1
+    }
+    if flags & 0x02 != 0 { off += 2 }
+    let end = data.count - 8
+    guard end > off else { throw EngineError(message: "truncated gzip member") }
+    // One-shot zlib decode into a bounded buffer (the vocab inflates to
+    // ~3.2MB; 8MB headroom with a strict fullness check).
+    let maxOut = 8 << 20
+    var out = Data(count: maxOut)
+    let decoded = out.withUnsafeMutableBytes { dst -> Int in
+        data.withUnsafeBytes { src -> Int in
+            compression_decode_buffer(dst.baseAddress!, maxOut,
+                src.baseAddress! + off, end - off, nil, COMPRESSION_ZLIB)
+        }
+    }
+    guard decoded > 0 && decoded < maxOut else {
+        throw EngineError(message: "zlib decode failed")
+    }
+    out.count = decoded
+    return out
+}
+
+/// Byte-level BPE ported from open_clip's SimpleTokenizer (MIT, OpenAI CLIP
+/// lineage): same merges file, same regex, same SOT/EOT/pad/truncate. ASCII
+/// parity is verified against the Python tokenizer; the port skips ftfy/html
+/// unescaping (mojibake repair), which search queries don't need.
+struct ClipBPE {
+    let encoder: [String: Int]
+    let ranks: [String: Int]
+    let byteEncoder: [UInt8: String]
+    let pattern: NSRegularExpression
+    var cache: [String: [String]] = [:]
+    let sot = 49406
+    let eot = 49407
+
+    static func byteMap() -> [UInt8: String] {
+        var bs: [Int] = Array(33...126) + Array(161...172) + Array(174...255)
+        var cs = bs
+        var n = 0
+        for b in 0..<256 where !bs.contains(b) {
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+        }
+        var m: [UInt8: String] = [:]
+        for (b, c) in zip(bs, cs) {
+            m[UInt8(b)] = String(UnicodeScalar(c)!)
+        }
+        return m
+    }
+
+    static func load(vocabPath: String) throws -> ClipBPE {
+        let raw = try Data(contentsOf: URL(fileURLWithPath: vocabPath))
+        let text = try String(data: gunzip(raw), encoding: .utf8)
+            .map { $0.components(separatedBy: "\n") } ?? []
+        // Mirrors open_clip's slice: header line + 48895 merges.
+        let lines = Array(text.dropFirst().prefix(48895))
+        var merges: [(String, String)] = []
+        merges.reserveCapacity(lines.count)
+        for line in lines {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            merges.append((parts[0], parts[1]))
+        }
+        let bm = byteMap()
+        // Byte order must mirror bytes_to_unicode() insertion order (dict
+        // .values is unordered): printable ASCII, high bytes, then the rest.
+        var byteOrder: [Int] = Array(33...126) + Array(161...172) + Array(174...255)
+        var seen = Set(byteOrder)
+        for b in 0..<256 where !seen.contains(b) {
+            byteOrder.append(b)
+            seen.insert(b)
+        }
+        let bytes = byteOrder.map { bm[UInt8($0)]! }
+        var vocab = bytes + bytes.map { $0 + "</w>" }
+        vocab.reserveCapacity(49408)
+        for (a, b) in merges { vocab.append(a + b) }
+        vocab.append("<start_of_text>")
+        vocab.append("<end_of_text>")
+        var encoder: [String: Int] = [:]
+        encoder.reserveCapacity(vocab.count)
+        for (i, v) in vocab.enumerated() { encoder[v] = i }
+        var ranks: [String: Int] = [:]
+        ranks.reserveCapacity(merges.count)
+        for (i, m) in merges.enumerated() { ranks[m.0 + "\u{1F}" + m.1] = i }
+        let pattern = try NSRegularExpression(
+            pattern: "<start_of_text>|<end_of_text>|'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+",
+            options: [.caseInsensitive])
+        return ClipBPE(encoder: encoder, ranks: ranks, byteEncoder: bm, pattern: pattern)
+    }
+
+    mutating func bpe(_ token: String) -> [String] {
+        if let hit = cache[token] { return hit }
+        var word: [String] = token.dropLast().map { String($0) }
+        guard let last = token.last else {
+            cache[token] = ["</w>"]
+            return ["</w>"]
+        }
+        word.append(String(last) + "</w>")
+        while word.count > 1 {
+            var bestRank = Int.max
+            var best = ""
+            for i in 0..<(word.count - 1) {
+                let key = word[i] + "\u{1F}" + word[i + 1]
+                let r = ranks[key] ?? Int.max
+                if r < bestRank {
+                    bestRank = r
+                    best = key
+                }
+            }
+            if bestRank == Int.max { break }
+            let parts = best.components(separatedBy: "\u{1F}")
+            let first = parts[0]
+            let second = parts[1]
+            var merged: [String] = []
+            var i = 0
+            while i < word.count {
+                guard let j = word[i...].firstIndex(of: first) else {
+                    merged.append(contentsOf: word[i...])
+                    break
+                }
+                merged.append(contentsOf: word[i..<j])
+                i = j
+                if word[i] == first && i < word.count - 1 && word[i + 1] == second {
+                    merged.append(first + second)
+                    i += 2
+                } else {
+                    merged.append(word[i])
+                    i += 1
+                }
+            }
+            word = merged
+            if word.count == 1 { break }
+        }
+        cache[token] = word
+        return word
+    }
+
+    mutating func encode(_ text: String) -> [Int] {
+        // open_clip clean='lower': whitespace collapse + lowercase.
+        let cleaned = text.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }.joined(separator: " ").lowercased()
+        var ids: [Int] = []
+        let ns = cleaned as NSString
+        let matches = pattern.matches(in: cleaned, range: NSRange(location: 0, length: ns.length))
+        for m in matches {
+            let tok = ns.substring(with: m.range)
+            let mapped = tok.utf8.map { byteEncoder[$0]! }.joined()
+            for piece in bpe(mapped) {
+                if let id = encoder[piece] { ids.append(id) }
+            }
+        }
+        return ids
+    }
+
+    mutating func tokenize(_ text: String) -> [Int32] {
+        var ids = [sot] + encode(text) + [eot]
+        if ids.count > 77 {
+            ids = Array(ids.prefix(77))
+            ids[76] = eot
+        }
+        var out = [Int32](repeating: 0, count: 77)
+        for (i, v) in ids.enumerated() { out[i] = Int32(v) }
+        return out
+    }
+}
+
+/// Vocab ships next to the sidecar binary (copied there by build-engine.sh):
+/// no bundle resources, no per-call path plumbing — dev and prod identical.
+func clipVocabURL() throws -> URL {
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    let url = exe.appendingPathComponent("clip_bpe_vocab.txt.gz")
+    guard FileManager.default.isReadableFile(atPath: url.path) else {
+        throw EngineError(message: "CLIP vocab missing next to engine binary: \(url.path)")
+    }
+    return url
+}
+
+var clipBPELock = NSLock()
+var clipBPEInst: ClipBPE? = nil
+
+/// Process-wide BPE tables (vocab parse is ~0.3s; backfills must not redo it).
+func sharedBPE() throws -> ClipBPE {
+    clipBPELock.lock()
+    defer { clipBPELock.unlock() }
+    if let inst = clipBPEInst { return inst }
+    let inst = try ClipBPE.load(vocabPath: clipVocabURL().path)
+    clipBPEInst = inst
+    return inst
+}
+
+/// CLIP preprocess: resize short edge to 224 (bicubic), center-crop 224,
+/// normalize with the OpenAI mean/std. Output is CHW float32.
+func clipPreprocess(_ cg: CGImage) throws -> MLMultiArray {
+    let w = cg.width
+    let h = cg.height
+    guard w > 0, h > 0 else { throw EngineError(message: "empty image for CLIP") }
+    let scale = 224.0 / Double(min(w, h))
+    let rw = max(224, Int((Double(w) * scale).rounded()))
+    let rh = max(224, Int((Double(h) * scale).rounded()))
+    let space = CGColorSpaceCreateDeviceRGB()
+    guard let rctx = CGContext(data: nil, width: rw, height: rh, bitsPerComponent: 8,
+        bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+        throw EngineError(message: "CLIP resize context failed")
+    }
+    rctx.interpolationQuality = .high
+    rctx.draw(cg, in: CGRect(x: 0, y: 0, width: rw, height: rh))
+    guard let resized = rctx.makeImage(),
+          let crop = resized.cropping(to: CGRect(x: (rw - 224) / 2, y: (rh - 224) / 2, width: 224, height: 224)) else {
+        throw EngineError(message: "CLIP crop failed")
+    }
+    var px = [UInt8](repeating: 0, count: 224 * 224 * 4)
+    guard let cctx = CGContext(data: &px, width: 224, height: 224, bitsPerComponent: 8,
+        bytesPerRow: 224 * 4, space: space,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        throw EngineError(message: "CLIP pixel context failed")
+    }
+    cctx.draw(crop, in: CGRect(x: 0, y: 0, width: 224, height: 224))
+    let mean: [Float] = [0.48145466, 0.4578275, 0.40821073]
+    let std: [Float] = [0.26862954, 0.26130258, 0.27577711]
+    let ma = try MLMultiArray(shape: [1, 3, 224, 224] as [NSNumber], dataType: .float32)
+    for y in 0..<224 {
+        for x in 0..<224 {
+            let o = (y * 224 + x) * 4
+            let r = Float(px[o]) / 255.0
+            let g = Float(px[o + 1]) / 255.0
+            let b = Float(px[o + 2]) / 255.0
+            ma[[0, 0, y, x] as [NSNumber]] = NSNumber(value: (r - mean[0]) / std[0])
+            ma[[0, 1, y, x] as [NSNumber]] = NSNumber(value: (g - mean[1]) / std[1])
+            ma[[0, 2, y, x] as [NSNumber]] = NSNumber(value: (b - mean[2]) / std[2])
+        }
+    }
+    return ma
+}
+
+/// Runs one CLIP tower and returns the L2-normalized f32 vector as base64
+/// (same wire format as the face descriptors) plus its dimension.
+func clipPredict(_ model: MLModel, input: MLMultiArray, name: String) throws -> (String, Int) {
+    let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: [name: input]))
+    guard let outName = out.featureNames.first,
+          let mv = out.featureValue(for: outName)?.multiArrayValue else {
+        throw EngineError(message: "CLIP model returned no vector")
+    }
+    let n = mv.count
+    var v = [Float](repeating: 0, count: n)
+    if mv.dataType == .float16 {
+        let p = mv.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+        for i in 0..<n { v[i] = Float(Float16(bitPattern: p[i])) }
+    } else if mv.dataType == .float32 {
+        let p = mv.dataPointer.bindMemory(to: Float.self, capacity: n)
+        for i in 0..<n { v[i] = p[i] }
+    } else {
+        throw EngineError(message: "CLIP model returned dtype \(mv.dataType.rawValue)")
+    }
+    var norm: Double = 0
+    for x in v { norm += Double(x) * Double(x) }
+    norm = norm.squareRoot()
+    guard norm > 0 else { throw EngineError(message: "CLIP model returned zero vector") }
+    let nv = v.map { $0 / Float(norm) }
+    return (nv.withUnsafeBytes { Data($0) }.base64EncodedString(), n)
+}
+
+func clipEncodeText(_ text: String, modelDir: String) throws -> [String: Any] {
+    let (_, tm) = try clipModels(modelDir: modelDir)
+    var bpe = try sharedBPE()
+    let ids = bpe.tokenize(text)
+    let ma = try MLMultiArray(shape: [1, 77] as [NSNumber], dataType: .int32)
+    for (i, t) in ids.enumerated() { ma[i] = NSNumber(value: t) }
+    let (vec, dim) = try clipPredict(tm, input: ma, name: "tokens")
+    return ["vector": vec, "dim": dim]
+}
+
+func clipEncodeImage(path: String, modelDir: String) throws -> [String: Any] {
+    let (im, _) = try clipModels(modelDir: modelDir)
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL,
+        [kCGImageSourceShouldCache: false] as CFDictionary),
+          let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        throw EngineError(message: "cannot decode image: \(path)")
+    }
+    let (vec, dim) = try clipPredict(im, input: clipPreprocess(cg), name: "image")
+    return ["path": path, "vector": vec, "dim": dim]
+}
+
+/// Evenly spaced keyframe embeddings for video search: decode at `every`
+/// seconds (up to `maxFrames`), embed each with the image tower. Tolerated
+/// (non-exact) seeks keep this fast; timestamps come from the actual frame.
+func clipKeyframes(path: String, modelDir: String, every: Double, maxFrames: Int) throws -> [String: Any] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+    let dur = asset.duration.seconds
+    guard dur.isFinite && dur > 0 else { throw EngineError(message: "no video duration: \(path)") }
+    let (im, _) = try clipModels(modelDir: modelDir)
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+    gen.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+    var times: [CMTime] = []
+    var t = 0.0
+    while t < dur && times.count < max(1, maxFrames) {
+        times.append(CMTime(seconds: t, preferredTimescale: 600))
+        t += max(0.5, every)
+    }
+    var frames: [[String: Any]] = []
+    for (i, time) in times.enumerated() {
+        var actual = CMTime.zero
+        guard let cg = try? gen.copyCGImage(at: time, actualTime: &actual) else { continue }
+        do {
+            let (vec, dim) = try clipPredict(im, input: clipPreprocess(cg), name: "image")
+            frames.append(["t": actual.seconds, "vector": vec, "dim": dim])
+        } catch {
+            continue
+        }
+        if (i + 1) % 4 == 0 || i + 1 == times.count {
+            write(makeEvent(id: requestID, event: "progress", data: [
+                "processed": i + 1, "total": times.count,
+            ]))
+        }
+    }
+    return ["path": path, "frames": frames]
+}
+
+// MARK: - Image quality
 /// Variance of the Laplacian over a downscaled luma image: the classic focus /
 /// sharpness measure. Cheap, camera-agnostic and good enough to separate
 /// motion-blurred shots from sharp ones.
@@ -1670,6 +2048,27 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
             throw EngineError(message: "embed_batch accepts at most 500 paths, got \(paths.count)")
         }
         return embedBatch(paths: paths)
+
+    case "clip_encode_text":
+        guard let text = str("text"), let modelDir = str("modelDir") else {
+            throw EngineError(message: "clip_encode_text requires 'text' and 'modelDir'")
+        }
+        return try background { try clipEncodeText(text, modelDir: modelDir) }
+
+    case "clip_encode_image":
+        guard let path = str("path"), let modelDir = str("modelDir") else {
+            throw EngineError(message: "clip_encode_image requires 'path' and 'modelDir'")
+        }
+        return try background { try clipEncodeImage(path: path, modelDir: modelDir) }
+
+    case "clip_keyframes":
+        guard let path = str("path"), let modelDir = str("modelDir") else {
+            throw EngineError(message: "clip_keyframes requires 'path' and 'modelDir'")
+        }
+        return try background {
+            try clipKeyframes(path: path, modelDir: modelDir,
+                every: dbl("everySeconds", 2.0), maxFrames: int("maxFrames", 12))
+        }
 
     case "faces":
         guard let path = str("path") else { throw EngineError(message: "faces requires 'path'") }

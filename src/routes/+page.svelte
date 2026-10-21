@@ -89,6 +89,12 @@
     reviewCandidates,
     dismissReviewCandidate,
     type ReviewCandidate,
+    clipModelsPresent,
+    downloadClipModels,
+    onClipDownloadProgress,
+    embedClipBackfill,
+    searchText as searchClipText,
+    type SearchHit,
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
@@ -965,6 +971,9 @@
   let reviewCluster = $state<{ id: number; name: string } | null>(null);
   let viewerSrc = $state<string | null>(null);
   let viewerError = $state<string | null>(null);
+  // Timestamp jump for video moments from semantic search: consumed once
+  // the <video> element reports loaded metadata.
+  let viewerSeekTo = $state<number | null>(null);
   // Photo info panel (ⓘ): camera settings + GPS + file facts. Stays open
   // across steps like Apple's inspector; closed with the viewer/theater.
   let infoOpen = $state(false);
@@ -1130,6 +1139,7 @@
     } catch {
       tagOptions = [];
     }
+    void loadClipReady();
   }
 
   async function loadPersonOptions() {
@@ -1492,6 +1502,7 @@
     viewerSrc = null;
     viewerError = null;
     viewerTags = [];
+    viewerSeekTo = null;
     void loadViewer(assets[index]);
   }
 
@@ -1595,6 +1606,7 @@
     reviewCluster = null;
     viewerSrc = null;
     viewerError = null;
+    viewerSeekTo = null;
   }
 
   // Picasa-style slideshow: fullscreen theater overlay advancing on a timer.
@@ -1763,8 +1775,7 @@
     };
   });
 
-  async function openSimilar(a: AssetRow) {
-    // Videos never get vectors (embed backfill is images-only by design),
+  async function openSimilar(a: AssetRow) {    // Videos never get vectors (embed backfill is images-only by design),
     // so fail fast with a friendly message instead of the raw error.
     if (a.kind !== "image") {
       error = "Similarity search works on photos — videos are not supported.";
@@ -1792,6 +1803,120 @@
       similarLoading = false;
       embedState = null;
     }
+  }
+
+  // Semantic search: CLIP text query over photo vectors + video keyframes.
+  // Models download once on explicit opt-in (~280MB); the backfill embeds
+  // what is missing, then the query ranks everything in one pass.
+  let semanticQuery = $state("");
+  let semantic = $state<{ query: string; rows: SearchHit[] } | null>(null);
+  let semanticLoading = $state(false);
+  let clipReady = $state<boolean | null>(null);
+  let clipWorking = $state(false);
+  let clipDl = $state<{ name: string; received: number; total: number } | null>(null);
+
+  function fmtClock(t: number): string {
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  async function loadClipReady() {
+    if (clipReady !== null) return;
+    try {
+      clipReady = (await clipModelsPresent()).ready;
+    } catch {
+      clipReady = null;
+    }
+  }
+
+  async function enableSearch() {
+    if (clipWorking) return;
+    clipWorking = true;
+    clipDl = null;
+    try {
+      const off = await onClipDownloadProgress((p) => {
+        clipDl = p;
+      });
+      try {
+        const status = await downloadClipModels();
+        clipReady = status.ready;
+      } finally {
+        (await off)();
+      }
+      if (!clipReady) throw new Error("model download finished but models are not ready");
+      toast = "Search models ready — embedding your library…";
+      const summary = await embedClipBackfill();
+      toast = `Search ready: ${summary.embedded} embedded${summary.failed > 0 ? `, ${summary.failed} failed` : ""}`;
+      if (semanticQuery.trim() !== "") await runSemanticSearch();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      clipWorking = false;
+      clipDl = null;
+    }
+  }
+
+  async function runSemanticSearch() {
+    const q = semanticQuery.trim();
+    if (q === "" || semanticLoading) return;
+    semanticLoading = true;
+    embedState = null;
+    semantic = { query: q, rows: [] };
+    try {
+      if (clipReady === null) await loadClipReady();
+      if (!clipReady) {
+        error = "Enable semantic search first — it downloads the search models once (~280MB).";
+        semantic = null;
+        return;
+      }
+      let rows: SearchHit[];
+      try {
+        rows = await searchClipText(q, 50);
+      } catch (e) {
+        // First run on a library embedded before CLIP existed: backfill
+        // once (progress shown), then retry.
+        if (!/no '.*' vector|not downloaded|no clip/i.test(String(e))) throw e;
+        const summary = await embedClipBackfill();
+        rows = await searchClipText(q, 50);
+        toast = `Embedded ${summary.embedded} for search`;
+      }
+      semantic = { query: q, rows };
+      void loadThumbs(rows.map((m) => ({ path: m.path }) as AssetRow));
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+      semantic = null;
+    } finally {
+      semanticLoading = false;
+      embedState = null;
+    }
+  }
+
+  function openSearchHit(index: number) {
+    const s = semantic;
+    if (!s || index < 0 || index >= s.rows.length) return;
+    const rows: AssetRow[] = s.rows.map((hit) => {
+      const row = assets.find((a) => a.id === hit.assetId);
+      if (row) return row;
+      const name = hit.path.split("/").pop() ?? hit.path;
+      return {
+        id: hit.assetId, path: hit.path, name, ext: name.split(".").pop() ?? "",
+        kind: (hit.kind === "video" ? "video" : "image") as "image" | "video",
+        mime: null, sizeBytes: 0, modified: 0, capturedAt: null, width: null,
+        height: null, duration: null, favorite: 0, missing: 0, sha256: null,
+        place: null, people: [], cameraMake: null, cameraModel: null, lens: null,
+        latitude: null, longitude: null, iso: null, fNumber: null,
+        exposureTime: null, focalLength: null, focalLength35: null
+      };
+    });
+    viewerList = rows;
+    reviewCluster = null;
+    viewer = { index };
+    viewerSrc = null;
+    viewerError = null;
+    viewerTags = [];
+    viewerSeekTo = s.rows[index].kind === "video" ? (s.rows[index].tSeconds ?? 0) : null;
+    void loadViewer(rows[index]);
   }
 
   // Blurred review items need viewer-quality sources like compare panes.
@@ -4103,7 +4228,7 @@
         if (tagging) tagState = p;
       }),
       onEmbedProgress((p) => {
-        if (similarLoading) embedState = p;
+        if (similarLoading || semanticLoading) embedState = p;
       }),
       onPipelineProgress((p) => {
         if (pipelining) pipelineState = p;
@@ -4581,6 +4706,48 @@
           <button class="chip" onclick={() => void applySearch(r)}>{r}</button>
         {/each}
       </div>
+    {/if}
+
+    <form
+      class="path-entry"
+      role="search"
+      aria-label="Semantic search"
+      onsubmit={(e) => {
+        e.preventDefault();
+        void runSemanticSearch();
+      }}
+    >
+      <input
+        type="search"
+        placeholder="Describe a photo… (“a red rock desert”)"
+        aria-label="Describe a photo to find"
+        bind:value={semanticQuery}
+      />
+      {#if clipReady === false}
+        <button
+          type="button"
+          onclick={() => void enableSearch()}
+          disabled={clipWorking}
+          title="Downloads the on-device search models once (~280MB)"
+        >{clipWorking ? "Preparing search…" : "Enable search"}</button>
+      {:else}
+        <button type="submit" disabled={semanticLoading || semanticQuery.trim() === ""}>
+          {semanticLoading ? "Searching…" : "Search"}
+        </button>
+      {/if}
+      {#if semantic}
+        <button
+          type="button"
+          class="ghost"
+          onclick={() => { semantic = null; }}
+        >Clear</button>
+      {/if}
+    </form>
+    {#if clipDl}
+      <p class="hint">
+        Downloading search models ({clipDl.name}):
+        {Math.round(clipDl.received / 1048576)} of {Math.round(clipDl.total / 1048576)} MB…
+      </p>
     {/if}
 
     <form
@@ -6042,7 +6209,18 @@
             {#if current.kind === "video" && viewerSrc}
               {#key viewerSrc}
                 <!-- svelte-ignore a11y_media_has_caption: library files ship no caption tracks -->
-                <video src={viewerSrc} controls autoplay playsinline></video>
+                <video
+                  src={viewerSrc}
+                  controls
+                  autoplay
+                  playsinline
+                  onloadedmetadata={(e) => {
+                    if (viewerSeekTo != null) {
+                      e.currentTarget.currentTime = viewerSeekTo;
+                      viewerSeekTo = null;
+                    }
+                  }}
+                ></video>
               {/key}
             {:else if current.kind === "video"}
               {#if thumbs[current.path]}
@@ -6137,6 +6315,65 @@
         </div>
       {/if}
       <p class="hint theater-hint">‹ › move · +/− zoom · 0 reset · space plays/pauses · esc closes</p>
+    </div>
+  {/if}
+
+  {#if semantic}
+    {@const sem = semantic}
+    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
+    <div
+      class="scrim"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Search results for ${sem.query}`}
+      tabindex={-1}
+      onclick={(e) => { if (e.target === e.currentTarget) semantic = null; }}
+    >
+      <div class="dialog wide" use:dialogFocus={() => (semantic = null)}>
+        <h3>“{sem.query}”</h3>
+        {#if semanticLoading}
+          <p class="hint">
+            {#if embedState}
+              First run: embedding library for search… {embedState.processed} processed
+            {:else}
+              Searching photos and video moments…
+            {/if}
+          </p>
+        {:else if sem.rows.length}
+          <div class="members">
+            {#each sem.rows as m, i (m.assetId)}
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[m.path]}
+                    <img src={thumbs[m.path]} alt={m.name} loading="lazy" />
+                  {:else}
+                    <span class="placeholder">IMG</span>
+                  {/if}
+                </div>
+                <figcaption>
+                  <button
+                    type="button"
+                    class="tiny ghost"
+                    title={m.kind === "video" ? `Jump to ${fmtClock(m.tSeconds ?? 0)}` : "Open photo"}
+                    onclick={() => { openSearchHit(i); semantic = null; }}
+                  >
+                    <span class="name" title={m.path}>{m.name}</span>
+                    {#if m.kind === "video" && m.tSeconds != null}
+                      <span class="meta">▶ {fmtClock(m.tSeconds)}</span>
+                    {/if}
+                    <span class="meta">{Math.round(m.score * 100)}% match</span>
+                  </button>
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">No matches — try different words.</p>
+        {/if}
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (semantic = null)}>Back to Library</button>
+        </div>
+      </div>
     </div>
   {/if}
 
