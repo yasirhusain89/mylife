@@ -36,8 +36,13 @@ mkdir -p src-tauri/binaries
 
 # The CLIP BPE vocab rides next to the binary (gitignored dir, reproducible
 # from sidecar/engine/Resources): the engine resolves it from its own
-# executable path, so dev and prod match.
+# executable path, so dev and prod match. It is ALSO staged for the app
+# bundle (bundle.resources) and passed explicitly as `vocabPath`, because
+# Tauri copies the sidecar binary into target/debug (dev) and Contents/MacOS
+# (prod) WITHOUT its sibling files.
 cp sidecar/engine/Resources/clip_bpe_vocab.txt.gz src-tauri/binaries/
+mkdir -p src-tauri/resources
+cp sidecar/engine/Resources/clip_bpe_vocab.txt.gz src-tauri/resources/
 
 # Placeholder protocol version marker; bump when engine protocol changes.
 # -g keeps line info in crash reports (stripped only for release builds).

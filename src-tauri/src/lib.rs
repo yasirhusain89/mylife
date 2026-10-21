@@ -895,6 +895,41 @@ fn clip_model_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> 
         .join("clip-vit-b32"))
 }
 
+/// Locates the CLIP BPE vocab. Tauri copies the sidecar binary WITHOUT its
+/// sibling files, so the engine cannot rely on "next to the binary": in dev
+/// it runs from `target/debug/` and in prod from `Contents/MacOS/`, neither
+/// of which carries the vocab. Candidates, first readable file wins:
+/// bundled resource (prod), dev staging dir, engine binary dir (probes).
+fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
+    let mut tried: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        tried.push(res.join("clip_bpe_vocab.txt.gz"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Dev layout: <repo>/src-tauri/target/debug/fotoflow, vocab staged
+            // at <repo>/src-tauri/binaries/ by build-engine.sh.
+            tried.push(dir.join("..").join("binaries").join("clip_bpe_vocab.txt.gz"));
+        }
+    }
+    if let Some(engine) = engine::engine_path() {
+        if let Some(dir) = engine.parent() {
+            tried.push(dir.join("clip_bpe_vocab.txt.gz"));
+        }
+    }
+    for cand in &tried {
+        if cand.is_file() {
+            return Ok(cand.to_string_lossy().into_owned());
+        }
+    }
+    let tried = tried
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("CLIP vocab missing (tried {tried}). Run: pnpm build:engine"))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipModelsStatus {
@@ -1210,11 +1245,12 @@ async fn search_text(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let model_dir = clip_model_dir(&app)?;
+        let vocab_path = clip_vocab_path(&app)?;
         let engine_state = app.state::<engine::EngineState>();
         let reply = engine::call_blocking(
             &engine_state,
             "clip_encode_text",
-            Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy() })),
+            Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy(), "vocabPath": vocab_path })),
             Duration::from_secs(120),
         )?;
         let query = reply

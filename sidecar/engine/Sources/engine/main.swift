@@ -1644,13 +1644,22 @@ struct ClipBPE {
     }
 }
 
-/// Vocab ships next to the sidecar binary (copied there by build-engine.sh):
-/// no bundle resources, no per-call path plumbing — dev and prod identical.
-func clipVocabURL() throws -> URL {
+/// Vocab resolution: an explicit `vocabPath` param wins. The Rust side always
+/// passes one because Tauri copies the sidecar binary WITHOUT its sibling
+/// files — both `target/debug/engine` (dev) and `Contents/MacOS/engine`
+/// (prod) end up vocab-less, so "next to the binary" only holds for direct
+/// invocations of the staged build in src-tauri/binaries/ (probes).
+func clipVocabURL(override overridePath: String?) throws -> URL {
+    var tried: [String] = []
+    if let o = overridePath, !o.isEmpty {
+        tried.append(o)
+        if FileManager.default.isReadableFile(atPath: o) { return URL(fileURLWithPath: o) }
+    }
     let exe = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
     let url = exe.appendingPathComponent("clip_bpe_vocab.txt.gz")
+    tried.append(url.path)
     guard FileManager.default.isReadableFile(atPath: url.path) else {
-        throw EngineError(message: "CLIP vocab missing next to engine binary: \(url.path)")
+        throw EngineError(message: "CLIP vocab missing (tried \(tried.joined(separator: ", "))). Run: pnpm build:engine")
     }
     return url
 }
@@ -1659,11 +1668,11 @@ var clipBPELock = NSLock()
 var clipBPEInst: ClipBPE? = nil
 
 /// Process-wide BPE tables (vocab parse is ~0.3s; backfills must not redo it).
-func sharedBPE() throws -> ClipBPE {
+func sharedBPE(vocabPath: String? = nil) throws -> ClipBPE {
     clipBPELock.lock()
     defer { clipBPELock.unlock() }
     if let inst = clipBPEInst { return inst }
-    let inst = try ClipBPE.load(vocabPath: clipVocabURL().path)
+    let inst = try ClipBPE.load(vocabPath: clipVocabURL(override: vocabPath).path)
     clipBPEInst = inst
     return inst
 }
@@ -1739,9 +1748,9 @@ func clipPredict(_ model: MLModel, input: MLMultiArray, name: String) throws -> 
     return (nv.withUnsafeBytes { Data($0) }.base64EncodedString(), n)
 }
 
-func clipEncodeText(_ text: String, modelDir: String) throws -> [String: Any] {
+func clipEncodeText(_ text: String, modelDir: String, vocabPath: String? = nil) throws -> [String: Any] {
     let (_, tm) = try clipModels(modelDir: modelDir)
-    var bpe = try sharedBPE()
+    var bpe = try sharedBPE(vocabPath: vocabPath)
     let ids = bpe.tokenize(text)
     let ma = try MLMultiArray(shape: [1, 77] as [NSNumber], dataType: .int32)
     for (i, t) in ids.enumerated() { ma[i] = NSNumber(value: t) }
@@ -2059,7 +2068,7 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let text = str("text"), let modelDir = str("modelDir") else {
             throw EngineError(message: "clip_encode_text requires 'text' and 'modelDir'")
         }
-        return try background { try clipEncodeText(text, modelDir: modelDir) }
+        return try background { try clipEncodeText(text, modelDir: modelDir, vocabPath: str("vocabPath")) }
 
     case "clip_encode_image":
         guard let path = str("path"), let modelDir = str("modelDir") else {

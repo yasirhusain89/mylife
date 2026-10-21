@@ -23,7 +23,7 @@ pub struct Engine {
     pending: Arc<Mutex<HashMap<u64, Sender<Envelope>>>>,
 }
 
-fn engine_path() -> Option<PathBuf> {
+pub(crate) fn engine_path() -> Option<PathBuf> {
     #[cfg(target_arch = "aarch64")]
     let triple = "aarch64-apple-darwin";
     #[cfg(target_arch = "x86_64")]
