@@ -4985,6 +4985,13 @@
               {trip.stopCount} stop{trip.stopCount === 1 ? "" : "s"} ·
               {trip.assetCount} asset{trip.assetCount === 1 ? "" : "s"}{#if trip.place} · {trip.place}{/if}
             </p>
+            <p class="story">{trip.summary}</p>
+            <p class="meta trip-stats">
+              <span class="chip static">{trip.kind === "routine" ? "Routine" : "Away"}</span>
+              {#if trip.topPeople.length}
+                {trip.topPeople.map((p) => `${p.name} ×${p.faces}`).join(" · ")}
+              {/if}
+            </p>
             {#if albumOptions.length > 0}
               <div class="row-actions">
                 <select

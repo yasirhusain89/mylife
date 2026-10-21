@@ -1978,6 +1978,8 @@ test("trips group events with album and curated-best actions", async ({ page }) 
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   // One mock event → one trip card with both actions, no expand needed.
   await expect(page.getByText("Trips · 1")).toBeVisible();
+  await expect(page.locator(".trip-stats .chip")).toContainText("Away");
+  await expect(page.locator("article.group .story").first()).toContainText("Getaway · 1 day · 8 photos");
   await page.getByRole("button", { name: /Curate best 24 from trip/ }).click();
   await expect(page.locator(".toast")).toContainText("Added 8 trip picks from");
   await expect(page.locator(".toast")).toContainText("Trip Share");

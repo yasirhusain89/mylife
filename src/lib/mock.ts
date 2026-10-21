@@ -978,6 +978,13 @@ export type TripRow = {
   stopCount: number;
   assetCount: number;
   eventIds: number[];
+  kind: string;
+  summary: string;
+  dayCount: number;
+  photoCount: number;
+  videoCount: number;
+  places: string[];
+  topPeople: { name: string; faces: number }[];
 };
 
 /** Trip stand-in: the mock library clusters into one event, so one trip.
@@ -998,7 +1005,14 @@ export async function tripsList(): Promise<TripRow[]> {
       endedAt: last.endedAt,
       stopCount: events.length,
       assetCount: events.reduce((s, e) => s + e.assetCount, 0),
-      eventIds: events.map((e) => e.id)
+      eventIds: events.map((e) => e.id),
+      kind: "trip",
+      summary: "Getaway · 1 day · 8 photos",
+      dayCount: 1,
+      photoCount: events.reduce((s, e) => s + e.assetCount, 0),
+      videoCount: 0,
+      places: [],
+      topPeople: []
     }
   ];
 }

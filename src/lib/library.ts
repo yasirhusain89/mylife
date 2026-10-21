@@ -610,6 +610,11 @@ export function eventAssets(eventId: number): Promise<EventAssetRow[]> {
   return invoke("event_assets", { eventId });
 }
 
+export type TopPerson = {
+  name: string;
+  faces: number;
+};
+
 export type TripRow = {
   id: string;
   name: string;
@@ -619,6 +624,13 @@ export type TripRow = {
   stopCount: number;
   assetCount: number;
   eventIds: number[];
+  kind: string;
+  summary: string;
+  dayCount: number;
+  photoCount: number;
+  videoCount: number;
+  places: string[];
+  topPeople: TopPerson[];
 };
 
 /** Trip → stop hierarchy over the event list (dynamic, display keys only). */

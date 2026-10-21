@@ -1313,8 +1313,15 @@ struct EventCandidate {
     longitude: Option<f64>,
 }
 
+/// A distance split means "settled somewhere new": consecutive shots far
+/// apart in space only start a new event when the hop also exceeds this gap.
+/// Below it they are travel (driving, walking between viewpoints), not a new
+/// occasion.
+pub const EVENT_STOP_GAP_S: f64 = 1800.0;
+
 /// Sequential clustering: ordered by capture time; a new event starts when
-/// the gap exceeds gap_hours, or when consecutive photos are far apart.
+/// the gap exceeds gap_hours, or when consecutive photos are far apart AND
+/// settled (see EVENT_STOP_GAP_S).
 pub fn cluster_events(
     conn: &Connection,
     gap_hours: f64,
@@ -1385,9 +1392,17 @@ pub fn cluster_events(
     for c in &candidates {
         let same_event = match last_time {
             Some(t) => {
-                let time_ok = (c.taken_at - t) <= gap_seconds;
+                let hop = c.taken_at - t;
+                let time_ok = hop <= gap_seconds;
+                // Drive-by guard: shots far apart in space but close in time
+                // are travel, not a new occasion — measured: 500m splits carved
+                // a night drive into seven 1-photo events. The distance split
+                // only fires once the hop exceeds the stop gap.
+                let settled = hop > EVENT_STOP_GAP_S;
                 let dist_ok = match (last_lat, last_lon, c.latitude, c.longitude) {
-                    (Some(a), Some(b), Some(x), Some(y)) => haversine_m(a, b, x, y) <= max_distance_m,
+                    (Some(a), Some(b), Some(x), Some(y)) => {
+                        !settled || haversine_m(a, b, x, y) <= max_distance_m
+                    }
                     _ => true,
                 };
                 time_ok && dist_ok
@@ -1660,6 +1675,56 @@ pub fn rename_event(conn: &Connection, event_id: i64, name: &str) -> Result<(), 
 /// ids are positional and unstable across rebuilds — display keys only.
 pub const TRIP_GAP_HOURS: f64 = 48.0;
 pub const TRIP_RADIUS_M: f64 = 50_000.0;
+/// Home-base detection (Tankoyeu-style routine locations): a rounded GPS cell
+/// counts as routine when it sees activity on at least ROUTINE_MIN_DAYS
+/// distinct days spanning ROUTINE_MIN_SPAN_S — a two-week vacation never
+/// qualifies; home and work do.
+pub const ROUTINE_MIN_DAYS: i64 = 5;
+pub const ROUTINE_MIN_SPAN_S: f64 = 30.0 * 86400.0;
+
+fn round_cell(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Routine (home-base) GPS cells, each a rounded (lat, lon) pair.
+pub fn routine_cells(conn: &Connection) -> Result<Vec<(f64, f64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ROUND(latitude, 2), ROUND(longitude, 2),
+                    COUNT(DISTINCT DATE(COALESCE(captured_at, modified), 'unixepoch')),
+                    MIN(COALESCE(captured_at, modified)), MAX(COALESCE(captured_at, modified))
+             FROM assets
+             WHERE missing = 0 AND latitude IS NOT NULL AND longitude IS NOT NULL
+             GROUP BY 1, 2",
+        )
+        .map_err(|e| format!("prepare routine cells: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, f64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })
+        .map_err(|e| format!("query routine cells: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (lat, lon, days, first, last) = row.map_err(|e| format!("routine cell row: {e}"))?;
+        if days >= ROUTINE_MIN_DAYS && last - first >= ROUTINE_MIN_SPAN_S {
+            out.push((round_cell(lat), round_cell(lon)));
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TopPerson {
+    pub name: String,
+    pub faces: i64,
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1672,6 +1737,45 @@ pub struct TripRow {
     pub stop_count: i64,
     pub asset_count: i64,
     pub event_ids: Vec<i64>,
+    /// "trip" (away from routine cells) or "routine" (home-base cluster).
+    pub kind: String,
+    /// One-line deterministic narrative (no model): place, span, volume, people.
+    pub summary: String,
+    pub day_count: i64,
+    pub photo_count: i64,
+    pub video_count: i64,
+    pub places: Vec<String>,
+    pub top_people: Vec<TopPerson>,
+}
+
+/// Deterministic trip narrative from stats — the shippable stand-in for an
+/// LLM summary (no on-device LLM ships with the app; model downloads are
+/// banned). Shape is a single line so a future LLM pass can replace or
+/// extend it without touching callers.
+pub fn trip_summary(
+    place: Option<&str>,
+    kind: &str,
+    days: i64,
+    photos: i64,
+    videos: i64,
+    people: &[TopPerson],
+) -> String {
+    let mut s = match (place, kind) {
+        (Some(p), "routine") => format!("{p} home base"),
+        (Some(p), _) => format!("{p} getaway"),
+        (None, "routine") => "Home base".to_string(),
+        (None, _) => "Getaway".to_string(),
+    };
+    s.push_str(&format!(" · {} day{}", days.max(1), if days.max(1) == 1 { "" } else { "s" }));
+    s.push_str(&format!(" · {} photo{}", photos, if photos == 1 { "" } else { "s" }));
+    if videos > 0 {
+        s.push_str(&format!(" · {} video{}", videos, if videos == 1 { "" } else { "s" }));
+    }
+    let names: Vec<&str> = people.iter().take(3).map(|p| p.name.as_str()).collect();
+    if !names.is_empty() {
+        s.push_str(&format!(" · with {}", names.join(", ")));
+    }
+    s
 }
 
 pub fn trips_list(conn: &Connection) -> Result<Vec<TripRow>, String> {
@@ -1704,50 +1808,153 @@ pub fn trips_list(conn: &Connection) -> Result<Vec<TripRow>, String> {
     }
     groups.push(current);
 
-    let mut trips: Vec<TripRow> = groups
+    let routine: std::collections::HashSet<(i64, i64)> = routine_cells(conn)?
         .into_iter()
-        .enumerate()
-        .map(|(n, idxs)| {
-            let first = &events[idxs[0]];
-            let last = &events[idxs[idxs.len() - 1]];
-            let asset_count: i64 = idxs.iter().map(|&k| events[k].asset_count).sum();
-            // Modal place across stops; ties keep the earliest stop's label.
-            let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-            for &k in &idxs {
-                if let Some(p) = events[k].place.as_deref() {
-                    *counts.entry(p).or_insert(0) += 1;
-                }
-            }
-            let mut best: Option<&str> = None;
-            let mut best_n = 0i64;
-            for &k in &idxs {
-                if let Some(p) = events[k].place.as_deref() {
-                    let c = counts.get(p).copied().unwrap_or(0);
-                    if c > best_n {
-                        best_n = c;
-                        best = Some(p);
-                    }
-                }
-            }
-            let span = format_event_range(first.started_at, last.ended_at);
-            let name = match best {
-                Some(p) => format!("{p} · {span}"),
-                None => span,
-            };
-            TripRow {
-                id: format!("trip-{n}"),
-                name,
-                place: best.map(str::to_string),
-                started_at: first.started_at,
-                ended_at: last.ended_at,
-                stop_count: idxs.len() as i64,
-                asset_count,
-                event_ids: idxs.iter().map(|&k| events[k].id).collect(),
-            }
-        })
+        .map(|(la, lo)| ((la * 100.0).round() as i64, (lo * 100.0).round() as i64))
         .collect();
+
+    let mut trips: Vec<TripRow> = Vec::new();
+    for (n, idxs) in groups.into_iter().enumerate() {
+        let first = &events[idxs[0]];
+        let last = &events[idxs[idxs.len() - 1]];
+        let asset_count: i64 = idxs.iter().map(|&k| events[k].asset_count).sum();
+        // Modal place across stops; ties keep the earliest stop's label.
+        let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for &k in &idxs {
+            if let Some(p) = events[k].place.as_deref() {
+                *counts.entry(p).or_insert(0) += 1;
+            }
+        }
+        let mut best: Option<&str> = None;
+        let mut best_n = 0i64;
+        for &k in &idxs {
+            if let Some(p) = events[k].place.as_deref() {
+                let c = counts.get(p).copied().unwrap_or(0);
+                if c > best_n {
+                    best_n = c;
+                    best = Some(p);
+                }
+            }
+        }
+        let eids: Vec<i64> = idxs.iter().map(|&k| events[k].id).collect();
+        // Routine iff every located stop sits in a home-base cell.
+        // No located stop at all reads as a trip (nothing proves routine).
+        let mut known = 0i64;
+        let mut away = false;
+        for &k in &idxs {
+            if let (Some(la), Some(lo)) = (events[k].latitude, events[k].longitude) {
+                known += 1;
+                let cell = ((la * 100.0).round() as i64, (lo * 100.0).round() as i64);
+                if !routine.contains(&cell) {
+                    away = true;
+                }
+            }
+        }
+        let kind = if known > 0 && !away { "routine" } else { "trip" };
+        let stats = trip_stats(conn, &eids).unwrap_or_default();
+        let mut places: Vec<String> = Vec::new();
+        for &k in &idxs {
+            if let Some(p) = events[k].place.as_deref() {
+                if !places.iter().any(|q| q == p) {
+                    places.push(p.to_string());
+                }
+            }
+        }
+        let span = format_event_range(first.started_at, last.ended_at);
+        let name = match best {
+            Some(p) => format!("{p} · {span}"),
+            None => span,
+        };
+        let summary = trip_summary(
+            best,
+            kind,
+            stats.day_count,
+            stats.photo_count,
+            stats.video_count,
+            &stats.top_people,
+        );
+        trips.push(TripRow {
+            id: format!("trip-{n}"),
+            name,
+            place: best.map(str::to_string),
+            started_at: first.started_at,
+            ended_at: last.ended_at,
+            stop_count: idxs.len() as i64,
+            asset_count,
+            event_ids: eids,
+            kind: kind.to_string(),
+            summary,
+            day_count: stats.day_count,
+            photo_count: stats.photo_count,
+            video_count: stats.video_count,
+            places,
+            top_people: stats.top_people,
+        });
+    }
     trips.reverse();
     Ok(trips)
+}
+
+/// Per-trip aggregates for stats + summaries. Default (zeros) on any query
+/// failure so one bad group never breaks the trip list.
+#[derive(Default)]
+struct TripStats {
+    day_count: i64,
+    photo_count: i64,
+    video_count: i64,
+    top_people: Vec<TopPerson>,
+}
+
+fn trip_stats(conn: &Connection, event_ids: &[i64]) -> Result<TripStats, String> {
+    let ids_json = serde_json::to_string(event_ids).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.kind, COALESCE(a.captured_at, a.modified) FROM assets a
+             JOIN event_assets ea ON ea.asset_id = a.id
+             WHERE ea.event_id IN (SELECT value FROM json_each(?1)) AND a.missing = 0",
+        )
+        .map_err(|e| format!("prepare trip assets: {e}"))?;
+    let rows = stmt
+        .query_map(params![ids_json], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+        .map_err(|e| format!("query trip assets: {e}"))?;
+    let mut photos = 0i64;
+    let mut videos = 0i64;
+    let mut days: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for row in rows {
+        let (kind, taken) = row.map_err(|e| format!("trip asset row: {e}"))?;
+        if kind == "video" {
+            videos += 1;
+        } else {
+            photos += 1;
+        }
+        days.insert((taken / 86400.0).floor() as i64);
+    }
+    let mut pstat = conn
+        .prepare(
+            "SELECT fc.name, COUNT(*) FROM faces f
+             JOIN face_clusters fc ON fc.id = f.cluster_id
+             WHERE f.cluster_id IS NOT NULL AND fc.name IS NOT NULL AND TRIM(fc.name) != ''
+               AND f.path IN (SELECT a.path FROM assets a
+                              JOIN event_assets ea ON ea.asset_id = a.id
+                              WHERE ea.event_id IN (SELECT value FROM json_each(?1)))
+             GROUP BY fc.name ORDER BY 2 DESC LIMIT 3",
+        )
+        .map_err(|e| format!("prepare trip people: {e}"))?;
+    let prows = pstat
+        .query_map(params![ids_json], |r| {
+            Ok(TopPerson { name: r.get(0)?, faces: r.get(1)? })
+        })
+        .map_err(|e| format!("query trip people: {e}"))?;
+    let mut top_people = Vec::new();
+    for row in prows {
+        top_people.push(row.map_err(|e| format!("trip person row: {e}"))?);
+    }
+    Ok(TripStats {
+        day_count: days.len() as i64,
+        photo_count: photos,
+        video_count: videos,
+        top_people,
+    })
 }
 
 /// Top picks for an event: sharpest first (quality_score), blurred excluded,
@@ -5090,6 +5297,37 @@ mod tests {
     }
 
     #[test]
+    fn cluster_events_keeps_fast_movers_in_one_event() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // Night drive: 5 shots ~90s apart alternating between two coords
+        // 100km apart. Close in time = travel, not five occasions.
+        let t0 = 1_700_000_000.0;
+        for (i, name) in ["/d1.jpg", "/d2.jpg", "/d3.jpg", "/d4.jpg", "/d5.jpg"]
+            .into_iter()
+            .enumerate()
+        {
+            upsert_asset(&conn, &asset(name, 1, t0 + i as f64 * 90.0), scan).unwrap();
+        }
+        conn.execute(
+            "UPDATE assets SET latitude = 37.7749, longitude = -122.4194
+             WHERE path IN ('/d1.jpg', '/d3.jpg', '/d5.jpg')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE assets SET latitude = 38.5, longitude = -121.0
+             WHERE path IN ('/d2.jpg', '/d4.jpg')",
+            [],
+        )
+        .unwrap();
+        let (events, assets) = cluster_events(&conn, 4.0, 500.0).unwrap();
+        assert_eq!(events, 1, "fast-moving shots stay in one driving event");
+        assert_eq!(assets, 5);
+    }
+
+    #[test]
     fn cluster_events_name_spans_and_cached_places() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -5478,6 +5716,109 @@ mod tests {
         assert_eq!(trips[2].event_ids.len(), 2);
         let total: i64 = trips.iter().map(|t| t.asset_count).sum();
         assert_eq!(total, 4, "every asset belongs to exactly one trip");
+    }
+
+    #[test]
+    fn routine_cells_need_repeat_days_across_a_month() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let day = 1_700_000_000.0;
+        // Home cell: 6 shots on distinct days spanning 60 days.
+        for i in 0..6 {
+            let p = format!("/h{i}.jpg");
+            upsert_asset(&conn, &asset(&p, 1, day + i as f64 * 1_036_800.0), scan).unwrap();
+        }
+        conn.execute(
+            "UPDATE assets SET latitude = 37.7749, longitude = -122.4194 WHERE path LIKE '/h%.jpg'",
+            [],
+        )
+        .unwrap();
+        // Vacation cell: 3 shots on distinct days spanning 3 days.
+        for i in 0..3 {
+            let p = format!("/v{i}.jpg");
+            upsert_asset(&conn, &asset(&p, 1, day + i as f64 * 86400.0), scan).unwrap();
+        }
+        conn.execute(
+            "UPDATE assets SET latitude = 36.1, longitude = -112.1 WHERE path LIKE '/v%.jpg'",
+            [],
+        )
+        .unwrap();
+        let cells = routine_cells(&conn).unwrap();
+        assert_eq!(cells.len(), 1, "only the home cell is routine");
+        assert!((cells[0].0 - 37.77).abs() < 0.005, "home lat, got {:?}", cells[0]);
+    }
+
+    #[test]
+    fn trips_mark_home_base_routine_and_travel_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let day = 1_700_000_000.0;
+        for i in 0..6 {
+            let p = format!("/h{i}.jpg");
+            upsert_asset(&conn, &asset(&p, 1, day + i as f64 * 1_036_800.0), scan).unwrap();
+        }
+        conn.execute(
+            "UPDATE assets SET latitude = 37.7749, longitude = -122.4194 WHERE path LIKE '/h%.jpg'",
+            [],
+        )
+        .unwrap();
+        upsert_asset(&conn, &asset("/away.jpg", 1, day + 70_000_000.0), scan).unwrap();
+        conn.execute(
+            "UPDATE assets SET latitude = 36.1, longitude = -112.1 WHERE path = '/away.jpg'",
+            [],
+        )
+        .unwrap();
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let trips = trips_list(&conn).unwrap();
+        let kinds: Vec<&str> = trips.iter().map(|t| t.kind.as_str()).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == "routine").count(), 6, "home stops read routine: {kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| **k == "trip").count(), 1, "away stop reads trip: {kinds:?}");
+        let away = trips.iter().find(|t| t.kind == "trip").unwrap();
+        assert!(away.summary.contains("Getaway"), "away summary, got: {}", away.summary);
+        let home = trips.iter().find(|t| t.kind == "routine").unwrap();
+        assert!(home.summary.contains("Home base"), "routine summary, got: {}", home.summary);
+    }
+
+    #[test]
+    fn trip_stats_name_top_people_and_days() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        let day = 1_700_000_000.0;
+        upsert_asset(&conn, &asset("/a1.jpg", 1, day), scan).unwrap();
+        upsert_asset(&conn, &asset("/a2.jpg", 1, day + 3600.0), scan).unwrap();
+        conn.execute(
+            "INSERT INTO face_clusters (face_count, created_at, name) VALUES (3, 1, 'Amol'), (1, 1, 'Y1')",
+            [],
+        )
+        .unwrap();
+        let amol: i64 = conn
+            .query_row("SELECT id FROM face_clusters WHERE name = 'Amol'", [], |r| r.get(0))
+            .unwrap();
+        let y1: i64 = conn
+            .query_row("SELECT id FROM face_clusters WHERE name = 'Y1'", [], |r| r.get(0))
+            .unwrap();
+        for (path, cid) in [("/a1.jpg", amol), ("/a1.jpg", amol), ("/a2.jpg", amol), ("/a2.jpg", y1)] {
+            conn.execute(
+                "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at)
+                 VALUES (?1, ?2, 0.1, 0.1, 0.2, 0.2, 0.9, 1)",
+                params![path, cid],
+            )
+            .unwrap();
+        }
+        cluster_events(&conn, 4.0, 500.0).unwrap();
+        let trips = trips_list(&conn).unwrap();
+        assert_eq!(trips.len(), 1);
+        let t = &trips[0];
+        assert_eq!(t.day_count, 1);
+        assert_eq!(t.photo_count, 2);
+        assert_eq!(t.top_people.len(), 2);
+        assert_eq!(t.top_people[0].name, "Amol");
+        assert_eq!(t.top_people[0].faces, 3);
+        assert!(t.summary.contains("Amol"), "summary names people, got: {}", t.summary);
+        assert!(t.summary.contains("2 photos"), "summary counts volume, got: {}", t.summary);
     }
 
     #[test]
