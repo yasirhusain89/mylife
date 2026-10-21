@@ -868,7 +868,7 @@
   let qualityState = $state<CleanupProgress | null>(null);
   let deleteMode = $state<"trash" | "flag">("trash");
   let confirm = $state<{ ids: number[]; label: string } | null>(null);
-  let tab = $state<"library" | "cleanup" | "people" | "events" | "albums" | "map" | "settings">("library");
+  let tab = $state<"library" | "search" | "cleanup" | "people" | "events" | "albums" | "map" | "settings">("library");
   let flagged = $state<Set<number>>(loadFlagged());
   let peopleLoading = $state(false);
   let events = $state<EventRow[]>([]);
@@ -2023,13 +2023,14 @@
   }
 
   // A11y (issue #4): roving-tabindex tablist with automatic activation.
-  const TAB_ORDER = ["library", "cleanup", "people", "events", "albums", "map", "settings"] as const;
+  const TAB_ORDER = ["library", "search", "cleanup", "people", "events", "albums", "map", "settings"] as const;
   type TabId = (typeof TAB_ORDER)[number];
 
   function activateTab(next: TabId) {
     if (tab === next) return;
     tab = next;
     if (next === "library") void refresh();
+    else if (next === "search") void loadClipReady();
     else if (next === "cleanup") void refreshCleanup();
     else if (next === "people") { void loadPeople(); void loadPets(); }
     else if (next === "events") void loadEvents();
@@ -4273,6 +4274,7 @@
       <!-- svelte-ignore a11y_interactive_supports_focus: roving-tabindex tablist, only the active tab is a tab stop -->
       <div class="tabs" role="tablist" aria-label="Library sections" onkeydown={tabKey}>
     <button id="tab-library" class="tab" class:on={tab === "library"} role="tab" aria-selected={tab === "library"} tabindex={tab === "library" ? 0 : -1} onclick={() => { tab = "library"; void refresh(); }}>Library</button>
+    <button id="tab-search" class="tab" class:on={tab === "search"} role="tab" aria-selected={tab === "search"} tabindex={tab === "search" ? 0 : -1} onclick={() => { tab = "search"; void loadClipReady(); }}>Search</button>
     <button id="tab-cleanup" class="tab" class:on={tab === "cleanup"} role="tab" aria-selected={tab === "cleanup"} tabindex={tab === "cleanup" ? 0 : -1} onclick={() => { tab = "cleanup"; void refreshCleanup(); }}>
       Cleanup{#if cleanup && cleanup.duplicateGroups > 0}&nbsp;{cleanup.duplicateGroups}{/if}
     </button>
@@ -4329,6 +4331,100 @@
       <span>{error}</span>
       <button class="tiny" onclick={() => (error = null)} aria-label="Dismiss error">Dismiss</button>
     </div>
+  {/if}
+
+  {#if tab === "search"}
+  <section class="card" aria-labelledby="search-heading">
+    <div class="card-head">
+      <h2 id="search-heading">Search</h2>
+    </div>
+    {#if clipReady === false}
+      <p class="hint">
+        Describe a photo or a video moment and jump straight to it. First use
+        downloads the on-device search models once (~280MB); afterwards
+        everything stays on this machine.
+      </p>
+      <div class="row-actions">
+        <button onclick={() => void enableSearch()} disabled={clipWorking}>
+          {clipWorking ? "Preparing search…" : "Enable search"}
+        </button>
+      </div>
+      {#if clipDl}
+        <p class="hint">
+          Downloading search models ({clipDl.name}):
+          {Math.round(clipDl.received / 1048576)} of {Math.round(clipDl.total / 1048576)} MB…
+        </p>
+      {/if}
+    {:else}
+      <form
+        class="path-entry"
+        role="search"
+        onsubmit={(e) => {
+          e.preventDefault();
+          void runSemanticSearch();
+        }}
+      >
+        <input
+          type="search"
+          placeholder="Describe a photo… (“a red rock desert”)"
+          aria-label="Describe a photo to find"
+          bind:value={semanticQuery}
+        />
+        <button type="submit" disabled={semanticLoading || semanticQuery.trim() === ""}>
+          {semanticLoading ? "Searching…" : "Search"}
+        </button>
+        {#if semantic}
+          <button
+            type="button"
+            class="ghost"
+            onclick={() => { semantic = null; }}
+          >Clear</button>
+        {/if}
+      </form>
+      {#if semanticLoading}
+        <p class="hint">
+          {#if embedState}
+            First run: embedding library for search… {embedState.processed} processed
+          {:else}
+            Searching photos and video moments…
+          {/if}
+        </p>
+      {:else if semantic}
+        {#if semantic.rows.length}
+          <p class="hint">{semantic.rows.length} match{semantic.rows.length === 1 ? "" : "es"} for “{semantic.query}”</p>
+          <div class="members">
+            {#each semantic.rows as m, i (m.assetId)}
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[m.path]}
+                    <img src={thumbs[m.path]} alt={m.name} loading="lazy" />
+                  {:else}
+                    <span class="placeholder">IMG</span>
+                  {/if}
+                </div>
+                <figcaption>
+                  <button
+                    type="button"
+                    class="tiny ghost"
+                    title={m.kind === "video" ? `Jump to ${fmtClock(m.tSeconds ?? 0)}` : "Open photo"}
+                    onclick={() => openSearchHit(i)}
+                  >
+                    <span class="name" title={m.path}>{m.name}</span>
+                    {#if m.kind === "video" && m.tSeconds != null}
+                      <span class="meta">▶ {fmtClock(m.tSeconds)}</span>
+                    {/if}
+                    <span class="meta">{Math.round(m.score * 100)}% match</span>
+                  </button>
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">No matches for “{semantic.query}” — try different words.</p>
+        {/if}
+      {/if}
+    {/if}
+  </section>
   {/if}
 
   {#if tab === "cleanup"}
@@ -4706,48 +4802,6 @@
           <button class="chip" onclick={() => void applySearch(r)}>{r}</button>
         {/each}
       </div>
-    {/if}
-
-    <form
-      class="path-entry"
-      role="search"
-      aria-label="Semantic search"
-      onsubmit={(e) => {
-        e.preventDefault();
-        void runSemanticSearch();
-      }}
-    >
-      <input
-        type="search"
-        placeholder="Describe a photo… (“a red rock desert”)"
-        aria-label="Describe a photo to find"
-        bind:value={semanticQuery}
-      />
-      {#if clipReady === false}
-        <button
-          type="button"
-          onclick={() => void enableSearch()}
-          disabled={clipWorking}
-          title="Downloads the on-device search models once (~280MB)"
-        >{clipWorking ? "Preparing search…" : "Enable search"}</button>
-      {:else}
-        <button type="submit" disabled={semanticLoading || semanticQuery.trim() === ""}>
-          {semanticLoading ? "Searching…" : "Search"}
-        </button>
-      {/if}
-      {#if semantic}
-        <button
-          type="button"
-          class="ghost"
-          onclick={() => { semantic = null; }}
-        >Clear</button>
-      {/if}
-    </form>
-    {#if clipDl}
-      <p class="hint">
-        Downloading search models ({clipDl.name}):
-        {Math.round(clipDl.received / 1048576)} of {Math.round(clipDl.total / 1048576)} MB…
-      </p>
     {/if}
 
     <form
@@ -6315,65 +6369,6 @@
         </div>
       {/if}
       <p class="hint theater-hint">‹ › move · +/− zoom · 0 reset · space plays/pauses · esc closes</p>
-    </div>
-  {/if}
-
-  {#if semantic}
-    {@const sem = semantic}
-    <!-- svelte-ignore a11y_click_events_have_key_events: scrim click is a pointer affordance; Esc cancels via dialogFocus -->
-    <div
-      class="scrim"
-      role="dialog"
-      aria-modal="true"
-      aria-label={`Search results for ${sem.query}`}
-      tabindex={-1}
-      onclick={(e) => { if (e.target === e.currentTarget) semantic = null; }}
-    >
-      <div class="dialog wide" use:dialogFocus={() => (semantic = null)}>
-        <h3>“{sem.query}”</h3>
-        {#if semanticLoading}
-          <p class="hint">
-            {#if embedState}
-              First run: embedding library for search… {embedState.processed} processed
-            {:else}
-              Searching photos and video moments…
-            {/if}
-          </p>
-        {:else if sem.rows.length}
-          <div class="members">
-            {#each sem.rows as m, i (m.assetId)}
-              <figure>
-                <div class="thumb small">
-                  {#if thumbs[m.path]}
-                    <img src={thumbs[m.path]} alt={m.name} loading="lazy" />
-                  {:else}
-                    <span class="placeholder">IMG</span>
-                  {/if}
-                </div>
-                <figcaption>
-                  <button
-                    type="button"
-                    class="tiny ghost"
-                    title={m.kind === "video" ? `Jump to ${fmtClock(m.tSeconds ?? 0)}` : "Open photo"}
-                    onclick={() => { openSearchHit(i); semantic = null; }}
-                  >
-                    <span class="name" title={m.path}>{m.name}</span>
-                    {#if m.kind === "video" && m.tSeconds != null}
-                      <span class="meta">▶ {fmtClock(m.tSeconds)}</span>
-                    {/if}
-                    <span class="meta">{Math.round(m.score * 100)}% match</span>
-                  </button>
-                </figcaption>
-              </figure>
-            {/each}
-          </div>
-        {:else}
-          <p class="hint">No matches — try different words.</p>
-        {/if}
-        <div class="dialog-actions">
-          <button class="ghost" onclick={() => (semantic = null)}>Back to Library</button>
-        </div>
-      </div>
     </div>
   {/if}
 

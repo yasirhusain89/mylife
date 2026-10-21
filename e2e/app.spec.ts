@@ -39,9 +39,16 @@ test("tabs expose tablist semantics with arrow-key navigation", async ({ page })
   await expect(libraryTab).toHaveAttribute("aria-selected", "true");
   await libraryTab.focus();
   await page.keyboard.press("ArrowRight");
+  const searchTab = page.getByRole("tab", { name: "Search", exact: true });
+  await expect(searchTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("heading", { name: "Search" })).toBeVisible();
+  await page.keyboard.press("ArrowRight");
   const cleanupTab = page.getByRole("tab", { name: /^Cleanup/ });
   await expect(cleanupTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("heading", { name: "Cleanup" })).toBeVisible();
+  await page.keyboard.press("ArrowLeft");
+  await expect(searchTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("heading", { name: "Search" })).toBeVisible();
   await page.keyboard.press("ArrowLeft");
   await expect(libraryTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("heading", { name: "Library" })).toBeVisible();
@@ -1409,26 +1416,23 @@ test("person filter narrows to one cluster", async ({ page }) => {
 });
 
 test("semantic search narrows to matches and opens video moments", async ({ page }) => {
-  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Search" })).toBeVisible();
   await page.getByLabel("Describe a photo to find").fill("VID_20261007");
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Search results for VID_20261007" });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByText("▶ 0:02")).toHaveCount(2);
-  await dialog.getByRole("button", { name: /VID_20261007_192001/ }).click();
+  await expect(page.getByText("2 matches for “VID_20261007”")).toBeVisible();
+  await expect(page.getByText("▶ 0:02")).toHaveCount(2);
+  await page.getByRole("button", { name: /VID_20261007_192001/ }).click();
   await expect(page.getByText("Video playback needs the desktop app")).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(dialog).toBeHidden();
 });
 
 test("semantic search finds a photo by name fragment", async ({ page }) => {
-  await page.getByRole("tab", { name: "Library", exact: true }).click();
+  await page.getByRole("tab", { name: "Search", exact: true }).click();
   await page.getByLabel("Describe a photo to find").fill("IMG_20261007_185817");
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Search results for IMG_20261007_185817" });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByText("% match")).toHaveCount(1);
-  await dialog.getByRole("button", { name: /IMG_20261007_185817/ }).click();
+  await expect(page.getByText("1 match for “IMG_20261007_185817”")).toBeVisible();
+  await page.getByRole("button", { name: /IMG_20261007_185817/ }).click();
   await expect(page.locator(".viewer-stage img").first()).toBeVisible();
 });
 
