@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreImage
@@ -649,40 +650,15 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
 ///
 /// Still images expose zero AVAssetTrack instances on the macOS 26 SDK, so a
 /// composition-based export cannot include them; photo frames are synthesized
-/// directly instead (3s per photo at 30fps, H.264). Video clips are decoded
-/// with AVAssetReader and their frames drawn onto the same 1920x1080 canvas
-/// (up to 3s per clip). Video-only: no audio track (camera-audio mixing is
-/// deferred — any audio-track interaction poisons video decoding of the same
-/// file in-process on macOS 26). The timeline is capped at maxSeconds. Files
-/// that decode as neither photo nor video count as skipped.
-func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -> [String: Any] {
-    // The video track is queried EXACTLY once per file, here: tracks()
-    // races on background threads on macOS 26 (same file answers
-    // differently across calls), and a reader rejects tracks from a foreign
-    // asset — so the asset and its video track travel together from
-    // classification onward. No audio-track interaction anywhere on this
-    // path (see the video-only note below).
-    enum Clip {
-        case photo(CGImage)
-        case video(path: String, asset: AVURLAsset, vTrack: AVAssetTrack)
-    }
-    var clips: [Clip] = []
-    var skipped = 0
-    for path in paths {
-        let url = URL(fileURLWithPath: path)
-        if let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-           let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-            clips.append(.photo(cg))
-            continue
-        }
-        let asset = AVURLAsset(url: url)
-        if let vTrack = asset.tracks(withMediaType: .video).first {
-            clips.append(.video(path: path, asset: asset, vTrack: vTrack))
-        } else {
-            skipped += 1
-        }
-    }
-    guard !clips.isEmpty else { throw EngineError(message: "no decodable photos or videos for highlight") }
+/// directly instead (3s per photo at 30fps, H.264) with a slow Ken Burns
+/// zoom-in and upward drift. Video clips are decoded with AVAssetReader and
+/// their frames drawn onto the same 1920x1080 canvas (up to 3s per clip).
+/// Video-only: no audio track (camera-audio mixing is deferred — any
+/// audio-track interaction poisons video decoding of the same file
+/// in-process on macOS 26). Inputs carry optional day-boundary chapter
+/// titles, rendered as dark title cards. The timeline is capped at
+/// maxSeconds. Files that decode as neither photo nor video count as skipped.
+func makeHighlight(inputs: [(path: String, title: String?)], output: String, maxSeconds: Double) throws -> [String: Any] {
     let cap = max(1.0, maxSeconds)
 
     // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
@@ -691,6 +667,80 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
     let secondsPerPhoto = 3.0
     let secondsPerClip = 3.0
     let framesPerPhoto = Int(secondsPerPhoto * Double(fps))
+
+    // Chapter title card: dark still with a centered caption, rendered into
+    // its own top-down bitmap first so it takes exactly the same orientation
+    // path as photos below (whatever that is, cards match it by
+    // construction). AppKit text runs in a flipped context so the caption
+    // reads upright in the top-down bitmap. Lives up here because
+    // classification (below) already renders cards.
+    func titleCardImage(_ text: String) -> CGImage? {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard
+            let ctx = CGContext(
+                data: nil, width: outW, height: outH, bitsPerComponent: 8,
+                bytesPerRow: 0, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return nil }
+        ctx.setFillColor(CGColor(red: 0.055, green: 0.065, blue: 0.09, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: outW, height: outH))
+        let s = text as NSString
+        var size: CGFloat = 76
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: size, weight: .semibold),
+            .foregroundColor: NSColor(white: 0.96, alpha: 1.0),
+        ]
+        var textSize = s.size(withAttributes: attrs)
+        while textSize.width > CGFloat(outW) - 320 && size > 30 {
+            size -= 4
+            attrs[.font] = NSFont.systemFont(ofSize: size, weight: .semibold)
+            textSize = s.size(withAttributes: attrs)
+        }
+        let rect = CGRect(
+            x: (CGFloat(outW) - textSize.width) / 2,
+            y: (CGFloat(outH) - textSize.height) / 2,
+            width: textSize.width, height: textSize.height)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        s.draw(in: rect, withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
+    }
+
+    enum Clip {
+        case photo(CGImage)
+        case video(path: String, asset: AVURLAsset, vTrack: AVAssetTrack)
+        case titlecard(CGImage)
+    }
+    var clips: [Clip] = []
+    var skipped = 0
+    var prevTitle: String? = nil
+    func emitCard(_ title: String?) {
+        if let t = title, t != prevTitle {
+            if let card = titleCardImage(t) {
+                clips.append(.titlecard(card))
+            }
+            prevTitle = t
+        }
+    }
+    for input in inputs {
+        let url = URL(fileURLWithPath: input.path)
+        if let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            emitCard(input.title)
+            clips.append(.photo(cg))
+            continue
+        }
+        let asset = AVURLAsset(url: url)
+        if let vTrack = asset.tracks(withMediaType: .video).first {
+            emitCard(input.title)
+            clips.append(.video(path: input.path, asset: asset, vTrack: vTrack))
+        } else {
+            skipped += 1
+        }
+    }
+    guard !clips.isEmpty else { throw EngineError(message: "no decodable photos or videos for highlight") }
 
     let outURL = URL(fileURLWithPath: output)
     try? FileManager.default.removeItem(atPath: output)
@@ -741,7 +791,7 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         }
     }
 
-    func makePixelBuffer(_ image: CGImage, index: Int64) throws -> CVPixelBuffer {
+    func makePixelBuffer(_ image: CGImage, index: Int64, zoom: CGFloat = 1, driftY: CGFloat = 0) throws -> CVPixelBuffer {
         var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBuffer(
             nil, adaptor.pixelBufferPool!, &pixelBuffer)
@@ -763,12 +813,15 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         guard let ctx else { throw EngineError(message: "cannot create buffer context") }
         ctx.setFillColor(CGColor(gray: 0.05, alpha: 1.0))
         ctx.fill(CGRect(x: 0, y: 0, width: outW, height: outH))
-        // Aspect-fill
-        let scale = max(CGFloat(outW) / CGFloat(image.width), CGFloat(outH) / CGFloat(image.height))
+        // Aspect-fill, plus the Ken Burns drift: callers ease zoom 1.00→1.10
+        // with a slight upward pan across a still's hold. driftY is a
+        // fraction of the canvas height.
+        let scale = max(CGFloat(outW) / CGFloat(image.width), CGFloat(outH) / CGFloat(image.height)) * zoom
         let drawW = CGFloat(image.width) * scale
         let drawH = CGFloat(image.height) * scale
         ctx.draw(image, in: CGRect(
-            x: (CGFloat(outW) - drawW) / 2, y: (CGFloat(outH) - drawH) / 2,
+            x: (CGFloat(outW) - drawW) / 2,
+            y: (CGFloat(outH) - drawH) / 2 + driftY * CGFloat(outH),
             width: drawW, height: drawH))
         _ = index
         return pb
@@ -776,6 +829,7 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
 
     var frame: Int64 = 0
     var photos = 0
+    var cards = 0
     var videosIncluded = 0
     var videoFrames = 0
     var clipErrors: [String] = []
@@ -842,14 +896,28 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         switch clip {
         case .photo(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
-            for _ in 0..<min(framesPerPhoto, budget) {
+            let total = min(framesPerPhoto, budget)
+            for j in 0..<total {
                 try waitReady(vInput, what: "photo frame")
-                let pb = try makePixelBuffer(image, index: frame)
+                // Ken Burns: ease 1.00→1.10 zoom with a gentle upward drift
+                // across the hold so stills feel like slow camera moves.
+                let t = total > 1 ? Double(j) / Double(total - 1) : 0
+                let pb = try makePixelBuffer(image, index: frame, zoom: 1.0 + 0.10 * t, driftY: 0.02 * t)
                 adaptor.append(pb, withPresentationTime: cursor)
                 frame += 1
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             photos += 1
+        case .titlecard(let image):
+            let budget = Int((cap - cursor.seconds) * Double(fps))
+            for _ in 0..<min(framesPerPhoto, budget) {
+                try waitReady(vInput, what: "title card")
+                let pb = try makePixelBuffer(image, index: frame)
+                adaptor.append(pb, withPresentationTime: cursor)
+                frame += 1
+                cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
+            }
+            cards += 1
         case .video(let path, let asset, let vTrack):
             let take = min(secondsPerClip, cap - cursor.seconds)
             do {
@@ -880,6 +948,7 @@ func makeHighlight(paths: [String], output: String, maxSeconds: Double) throws -
         "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
         "seconds": cursor.seconds,
         "photos": photos,
+        "cards": cards,
         "videosIncluded": videosIncluded,
         "videosSkipped": skipped,
         "videoFrames": videoFrames,
@@ -1372,12 +1441,24 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         return try background { try compressVideo(path: path, output: output) }
 
     case "make_highlight":
-        guard let paths = params["paths"] as? [String], !paths.isEmpty else {
-            throw EngineError(message: "make_highlight requires a non-empty 'paths' array")
-        }
         guard let output = str("output") else { throw EngineError(message: "make_highlight requires 'output'") }
         let maxSeconds = dbl("maxSeconds", 60)
-        return try background { try makeHighlight(paths: paths, output: output, maxSeconds: maxSeconds) }
+        // Story clips (path + optional day-boundary title); legacy "paths"
+        // arrays still accepted and render untitled.
+        var inputs: [(path: String, title: String?)] = []
+        if let arr = params["clips"] as? [[String: Any]] {
+            for d in arr {
+                if let p = d["path"] as? String {
+                    inputs.append((path: p, title: d["title"] as? String))
+                }
+            }
+        } else if let paths = params["paths"] as? [String] {
+            inputs = paths.map { (path: $0, title: nil) }
+        }
+        guard !inputs.isEmpty else {
+            throw EngineError(message: "make_highlight requires 'clips' or a non-empty 'paths' array")
+        }
+        return try background { try makeHighlight(inputs: inputs, output: output, maxSeconds: maxSeconds) }
 
     case "face_thumb":
         guard let path = str("path") else { throw EngineError(message: "face_thumb requires 'path'") }

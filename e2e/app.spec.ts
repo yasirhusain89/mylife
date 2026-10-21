@@ -727,6 +727,11 @@ test("highlight video reports photos and clips", async ({ page }) => {
   await page.getByRole("button", { name: "Highlight video" }).click();
   await expect(page.getByText("3 photos")).toBeVisible();
   await expect(page.getByText("1 video clip")).toBeVisible();
+  // Watch opens the exported file in the viewer (web preview: poster hint).
+  await page.getByRole("button", { name: "Watch highlight video" }).click();
+  const viewer = page.getByRole("dialog", { name: "highlight.mp4" });
+  await expect(viewer).toBeVisible();
+  await expect(viewer.getByText("Video playback needs the desktop app")).toBeVisible();
 });
 
 test("events render as a month-grouped timeline", async ({ page }) => {

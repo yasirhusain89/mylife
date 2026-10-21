@@ -1922,6 +1922,11 @@ pub struct HighlightResult {
 
 /// Exports a highlight slideshow for an event (or an explicit path list) into
 /// the app's exports directory.
+///
+/// Story mode for event/album scopes: members beyond the clip budget go
+/// through balanced coverage curation (Stage 2), then a chronological chapter
+/// plan (Stage 3) — the video spans the whole timeline with a title card per
+/// day instead of stopping after the first 20 filenames.
 #[tauri::command]
 async fn export_highlight(
     app: tauri::AppHandle,
@@ -1930,31 +1935,130 @@ async fn export_highlight(
     paths: Option<Vec<String>>,
     name: Option<String>,
 ) -> Result<HighlightResult, String> {
+    /// Story budget: 3s per clip; 16 curated clips leave headroom for day cards.
+    const HIGHLIGHT_CLIP_BUDGET: i64 = 16;
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
-        let asset_paths: Vec<String> = match (paths, event_id, album_id) {
-            (Some(p), _, _) => p,
-            // Event/album order is the timeline: photos and video clips
-            // interleave chronologically; the engine caps each clip.
-            (None, Some(eid), _) => db::event_assets(&conn, eid)?
+        // (id, path) rows for curated picks, with capture times attached.
+        let items_for_ids = |conn: &rusqlite::Connection,
+                             ids_paths: &[(i64, String)],
+                             place: Option<String>|
+         -> Result<Vec<db::HighlightItem>, String> {
+            let ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
+            let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, COALESCE(captured_at, modified) FROM assets
+                     WHERE id IN (SELECT value FROM json_each(?1))",
+                )
+                .map_err(|e| format!("prepare highlight times: {e}"))?;
+            let rows = stmt
+                .query_map(params![json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+                .map_err(|e| format!("query highlight times: {e}"))?;
+            let mut taken: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+            for row in rows {
+                let (id, t) = row.map_err(|e| format!("highlight time row: {e}"))?;
+                taken.insert(id, t);
+            }
+            Ok(ids_paths
+                .iter()
+                .map(|(id, path)| db::HighlightItem {
+                    path: path.clone(),
+                    taken: taken.get(id).copied().unwrap_or(0.0),
+                    place: place.clone(),
+                })
+                .collect())
+        };
+
+        let clips: Vec<db::HighlightClip> = match (paths, event_id, album_id) {
+            (Some(p), _, _) => p
                 .into_iter()
-                .map(|a| a.path)
+                .map(|path| db::HighlightClip { path, title: None })
                 .collect(),
-            (None, None, Some(aid)) => db::album_assets(&conn, aid)?
-                .into_iter()
-                .map(|a| a.path)
-                .collect(),
+            (None, Some(eid), _) => {
+                let place: Option<String> = conn
+                    .query_row("SELECT place FROM events WHERE id = ?1", params![eid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| format!("highlight event: {e}"))?;
+                let members = db::event_assets(&conn, eid)?;
+                let ids_paths: Vec<(i64, String)> =
+                    members.into_iter().map(|m| (m.id, m.path)).collect();
+                let items = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+                    let picks = db::curate_picks(&conn, &[eid], HIGHLIGHT_CLIP_BUDGET)?;
+                    let picked: Vec<(i64, String)> = picks
+                        .into_iter()
+                        .filter_map(|p| {
+                            ids_paths.iter().find(|(id, _)| *id == p.id).cloned()
+                        })
+                        .collect();
+                    items_for_ids(&conn, &picked, place)?
+                } else {
+                    items_for_ids(&conn, &ids_paths, place)?
+                };
+                db::highlight_plan(items)
+            }
+            (None, None, Some(aid)) => {
+                let members = db::album_assets(&conn, aid)?;
+                let ids_paths: Vec<(i64, String)> =
+                    members.into_iter().map(|m| (m.id, m.path)).collect();
+                let items = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+                    let member_ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
+                    let json = serde_json::to_string(&member_ids).map_err(|e| e.to_string())?;
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT DISTINCT ea.event_id FROM event_assets ea
+                             WHERE ea.asset_id IN (SELECT value FROM json_each(?1))",
+                        )
+                        .map_err(|e| format!("prepare highlight events: {e}"))?;
+                    let rows = stmt
+                        .query_map(params![json], |r| r.get::<_, i64>(0))
+                        .map_err(|e| format!("query highlight events: {e}"))?;
+                    let mut eids = Vec::new();
+                    for row in rows {
+                        eids.push(row.map_err(|e| format!("highlight event row: {e}"))?);
+                    }
+                    let picked: Vec<(i64, String)> = if eids.is_empty() {
+                        // Unclustered members: first budget slice, chronological.
+                        ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+                    } else {
+                        let picks = db::curate_picks_constrained(
+                            &conn,
+                            &eids,
+                            Some(&member_ids),
+                            HIGHLIGHT_CLIP_BUDGET,
+                        )?;
+                        let got: Vec<(i64, String)> = picks
+                            .into_iter()
+                            .filter_map(|p| {
+                                ids_paths.iter().find(|(id, _)| *id == p.id).cloned()
+                            })
+                            .collect();
+                        if got.is_empty() {
+                            ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+                        } else {
+                            got
+                        }
+                    };
+                    items_for_ids(&conn, &picked, None)?
+                } else {
+                    items_for_ids(&conn, &ids_paths, None)?
+                };
+                db::highlight_plan(items)
+            }
             (None, None, None) => {
                 return Err("export_highlight needs paths, event_id or album_id".into())
             }
         };
         drop(conn);
 
-        if asset_paths.is_empty() {
+        if clips.is_empty() {
             return Err("no photos or videos in this event for a highlight video".into());
         }
+        // Titled stories breathe: 90s cap when chapters exist, else 60s.
+        let titled = clips.iter().any(|c| c.title.is_some());
 
         let dir = app
             .path()
@@ -1975,9 +2079,9 @@ async fn export_highlight(
             &engine_state,
             "make_highlight",
             Some(json!({
-                "paths": asset_paths,
+                "clips": clips,
                 "output": output.to_string_lossy(),
-                "maxSeconds": 60,
+                "maxSeconds": if titled { 90 } else { 60 },
             })),
             Duration::from_secs(600),
         )?;

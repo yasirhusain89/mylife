@@ -2179,6 +2179,33 @@
     }
   }
 
+  // Watch the exported highlight in the viewer: a synthetic video row over
+  // the exports file (same pattern as cluster review). Starring is disabled
+  // for it, like other non-library rows.
+  function watchHighlight() {
+    if (!highlightResult) return;
+    const path = highlightResult.output;
+    const name = path.split("/").pop() ?? path;
+    viewerList = [
+      {
+        id: -1, path, name, ext: "mp4", kind: "video" as const,
+        mime: "video/mp4", sizeBytes: highlightResult.bytes, modified: 0,
+        capturedAt: null, width: 1920, height: 1080,
+        duration: highlightResult.seconds, favorite: 0, missing: 0,
+        sha256: null, place: null, people: [], cameraMake: null,
+        cameraModel: null, lens: null, latitude: null, longitude: null,
+        iso: null, fNumber: null, exposureTime: null, focalLength: null,
+        focalLength35: null
+      }
+    ];
+    reviewCluster = null;
+    viewer = { index: 0 };
+    viewerSrc = null;
+    viewerError = null;
+    viewerTags = [];
+    void loadViewer(viewerList[0]);
+  }
+
   let peopleFaces = $state<Record<number, FaceRow[]>>({});
   let deadFaces = $state<Set<number>>(new Set());
   let clusterState = $state<{ processed: number; total: number } | null>(null);
@@ -4881,6 +4908,15 @@
                 {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
                 <br />{highlightResult.output}
               </p>
+              <div class="row-actions">
+                <button
+                  type="button"
+                  class="tiny"
+                  title="Watch the highlight video"
+                  aria-label="Watch highlight video"
+                  onclick={watchHighlight}
+                >▶ Watch</button>
+              </div>
             {/if}
             {#if exportResult && exportKey === `e${event.id}`}
               <p class="hint">
@@ -4960,6 +4996,15 @@
                 {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
                 <br />{highlightResult.output}
               </p>
+              <div class="row-actions">
+                <button
+                  type="button"
+                  class="tiny"
+                  title="Watch the highlight video"
+                  aria-label="Watch highlight video"
+                  onclick={watchHighlight}
+                >▶ Watch</button>
+              </div>
             {/if}
             {#if exportResult && exportKey?.startsWith(`a${album.id}-`)}
               <p class="hint">

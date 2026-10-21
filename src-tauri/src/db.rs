@@ -1830,11 +1830,25 @@ pub fn curate_picks(
     event_ids: &[i64],
     limit: i64,
 ) -> Result<Vec<CuratePick>, String> {
+    curate_picks_constrained(conn, event_ids, None, limit)
+}
+
+/// Curate with an optional asset-id constraint (album members): candidates
+/// must belong to the given events AND to the id set. Powers highlight
+/// stories over albums, whose members are a handpicked subset of events.
+pub fn curate_picks_constrained(
+    conn: &Connection,
+    event_ids: &[i64],
+    only_ids: Option<&[i64]>,
+    limit: i64,
+) -> Result<Vec<CuratePick>, String> {
     if event_ids.is_empty() {
         return Err("curate_picks needs event_ids".into());
     }
     let limit = limit.clamp(1, 200) as usize;
     let ids_json = serde_json::to_string(event_ids).map_err(|e| e.to_string())?;
+    let only_json: Option<String> =
+        only_ids.map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".into()));
 
     let mut stmt = conn
         .prepare(
@@ -1843,6 +1857,7 @@ pub fn curate_picks(
                     a.width, a.height, a.dhash
              FROM assets a JOIN event_assets ea ON ea.asset_id = a.id
              WHERE ea.event_id IN (SELECT value FROM json_each(?1))
+               AND (?2 IS NULL OR a.id IN (SELECT value FROM json_each(?2)))
                AND a.missing = 0 AND COALESCE(a.blurred, 0) = 0
                AND NOT (
                  a.duplicate_group_id IS NOT NULL AND a.id != COALESCE(
@@ -1857,7 +1872,7 @@ pub fn curate_picks(
         )
         .map_err(|e| format!("prepare curate candidates: {e}"))?;
     let rows = stmt
-        .query_map(params![ids_json], |r| {
+        .query_map(params![ids_json, only_json], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -2119,6 +2134,52 @@ pub fn curate_picks(
     });
     out.truncate(limit);
     Ok(out)
+}
+
+// MARK: - Highlight story plan (coverage → chapters)
+
+/// One story clip: the file plus an optional day-boundary chapter title.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightClip {
+    pub path: String,
+    pub title: Option<String>,
+}
+
+/// Caller-fetched story row: file, capture time, and stop label.
+pub struct HighlightItem {
+    pub path: String,
+    pub taken: f64,
+    pub place: Option<String>,
+}
+
+/// Story plan: chronological items with a chapter title at each UTC-day
+/// boundary ("Apr 18 · Grand County, Utah", else bare "Apr 18"). Pure: the
+/// caller fetches rows, the engine renders the cards. Unit-tested below.
+pub fn highlight_plan(mut items: Vec<HighlightItem>) -> Vec<HighlightClip> {
+    items.sort_by(|a, b| {
+        a.taken
+            .partial_cmp(&b.taken)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.path.cmp(&b.path))
+    });
+    let mut out = Vec::with_capacity(items.len());
+    let mut prev_day: Option<i64> = None;
+    for it in items {
+        let day = (it.taken / 86400.0).floor() as i64;
+        let title = if prev_day != Some(day) {
+            prev_day = Some(day);
+            let mut t = format_event_time(it.taken);
+            if let Some(p) = it.place {
+                t = format!("{t} · {p}");
+            }
+            Some(t)
+        } else {
+            None
+        };
+        out.push(HighlightClip { path: it.path, title });
+    }
+    out
 }
 
 // MARK: - Place names (reverse-geocode cache; the one network exception)
@@ -5324,6 +5385,25 @@ mod tests {
             .query_row("SELECT id FROM assets WHERE path = '/p3.jpg'", [], |r| r.get(0))
             .unwrap();
         assert!(ids.contains(&named), "named face tips the mid-pack photo in");
+    }
+
+    #[test]
+    fn highlight_plan_chapters_each_day_and_orders_chronologically() {
+        let day = 1_700_000_000.0;
+        let items = vec![
+            HighlightItem { path: "/b.jpg".into(), taken: day + 90000.0, place: Some("Moab".into()) },
+            HighlightItem { path: "/a.jpg".into(), taken: day, place: Some("Moab".into()) },
+            HighlightItem { path: "/c.jpg".into(), taken: day + 90100.0, place: None },
+        ];
+        let clips = highlight_plan(items);
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].path, "/a.jpg", "chronological regardless of input order");
+        assert_eq!(clips[1].path, "/b.jpg");
+        assert!(clips[0].title.is_some(), "first item opens a chapter");
+        assert!(clips[1].title.is_some(), "new UTC day opens a chapter");
+        assert!(clips[2].title.is_none(), "same day continues silently");
+        let first = clips[0].title.as_ref().unwrap();
+        assert!(first.contains("Moab"), "place rides the chapter, got: {first}");
     }
 
     #[test]
