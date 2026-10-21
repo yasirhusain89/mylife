@@ -353,6 +353,7 @@ export type DuplicateMember = {
   isDuplicate: boolean;
   capturedAt: number | null;
   qualityScore: number | null;
+  favorite: boolean;
 };
 
 export type DuplicateGroup = {

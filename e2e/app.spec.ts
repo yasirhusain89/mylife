@@ -1626,6 +1626,9 @@ test("compare panels render keeper and candidate panes with names", async ({ pag
   );
   await expect(nearCompare.locator('[data-pane="candidate"]')).toContainText("IMG_20261007_191433.jpg");
   await expect(nearCompare.locator('[data-pane="candidate"] img')).toBeVisible();
+  // Keeper breakdown mirrors the backend order (favourite → quality → earliest).
+  await expect(dupCompare.locator(".keeper-why")).toContainText("why keeper: sharpest (180) · earliest");
+  await expect(nearCompare.locator(".keeper-why")).toContainText("why keeper: earliest");
 });
 
 test("picking another member updates the candidate pane", async ({ page }) => {

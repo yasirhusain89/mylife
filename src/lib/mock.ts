@@ -178,7 +178,8 @@ function memberOf(a: AssetRow): DuplicateMember {
     name: a.name,
     isDuplicate: true,
     capturedAt: a.capturedAt,
-    qualityScore: 180
+    qualityScore: 180,
+    favorite: a.favorite !== 0
   };
 }
 

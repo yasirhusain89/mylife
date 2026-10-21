@@ -2837,6 +2837,7 @@ pub struct DuplicateMember {
     pub is_duplicate: bool,
     pub captured_at: Option<f64>,
     pub quality_score: Option<f64>,
+    pub favorite: bool,
 }
 
 /// Rebuilds duplicate groups from hashed assets.
@@ -2956,7 +2957,7 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>, String
         let members: Vec<DuplicateMember> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, path, name, is_duplicate, captured_at, quality_score FROM assets
+                    "SELECT id, path, name, is_duplicate, captured_at, quality_score, favorite FROM assets
                      WHERE duplicate_group_id = ?1 ORDER BY is_duplicate ASC, captured_at ASC, id",
                 )
                 .map_err(|e| format!("prepare members: {e}"))?;
@@ -2969,6 +2970,7 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>, String
                         is_duplicate: r.get::<_, i64>(3)? == 1,
                         captured_at: r.get(4)?,
                         quality_score: r.get(5)?,
+                        favorite: r.get::<_, i64>(6)? == 1,
                     })
                 })
                 .map_err(|e| format!("query members: {e}"))?;
@@ -3055,6 +3057,10 @@ pub fn dhash_distance(a: &str, b: &str) -> Option<u32> {
 
 /// Pairs at or under this distance read as "visually the same shot".
 pub const NEAR_DUPE_THRESHOLD: u32 = 8;
+/// Union-find chains across hours (measured: 50 lookalikes spanning 22.7h via
+/// single bridge pairs). Components split wherever consecutive captures gap
+/// wider than this, so each group is one shootable burst.
+pub const NEAR_BURST_GAP_S: f64 = 600.0;
 /// Pairwise grouping is O(n^2); above this many hashed images the pass
 /// refuses rather than wedging the app.
 pub const NEAR_DUPE_MAX_IMAGES: i64 = 20_000;
@@ -3174,10 +3180,36 @@ pub fn rebuild_near_groups(conn: &Connection) -> Result<(i64, i64), String> {
         let r = find(&mut parent, i);
         components.entry(r).or_default().push(i);
     }
-    let mut groups: Vec<Vec<usize>> = components
-        .into_values()
-        .filter(|c| c.len() > 1)
-        .collect();
+    // Burst-split: sort each component by capture time and cut wherever the
+    // gap exceeds NEAR_BURST_GAP_S. Runs of 1 are lone shots, not groups.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (_, mut comp) in components {
+        if comp.len() < 2 {
+            continue;
+        }
+        comp.sort_by(|&a, &b| {
+            assets[a]
+                .6
+                .partial_cmp(&assets[b].6)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(assets[a].0.cmp(&assets[b].0))
+        });
+        let mut run: Vec<usize> = vec![comp[0]];
+        for &m in &comp[1..] {
+            let gap = assets[m].6.unwrap_or(0.0) - run.last().map(|&l| assets[l].6.unwrap_or(0.0)).unwrap_or(0.0);
+            if gap > NEAR_BURST_GAP_S {
+                if run.len() > 1 {
+                    groups.push(std::mem::take(&mut run));
+                } else {
+                    run.clear();
+                }
+            }
+            run.push(m);
+        }
+        if run.len() > 1 {
+            groups.push(run);
+        }
+    }
     // Deterministic order: biggest groups first.
     groups.sort_by_key(|c| std::cmp::Reverse(c.len()));
 
@@ -3246,7 +3278,7 @@ pub fn near_groups(conn: &Connection) -> Result<Vec<NearGroup>, String> {
         let members: Vec<DuplicateMember> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, path, name, is_near_duplicate, captured_at, quality_score FROM assets
+                    "SELECT id, path, name, is_near_duplicate, captured_at, quality_score, favorite FROM assets
                      WHERE near_group_id = ?1 ORDER BY is_near_duplicate ASC, captured_at ASC, id",
                 )
                 .map_err(|e| format!("prepare near members: {e}"))?;
@@ -3259,6 +3291,7 @@ pub fn near_groups(conn: &Connection) -> Result<Vec<NearGroup>, String> {
                         is_duplicate: r.get::<_, i64>(3)? == 1,
                         captured_at: r.get(4)?,
                         quality_score: r.get(5)?,
+                        favorite: r.get::<_, i64>(6)? == 1,
                     })
                 })
                 .map_err(|e| format!("query near members: {e}"))?;
@@ -4069,6 +4102,44 @@ mod tests {
         near_keep(&conn, list[0].id, id_for("/a.jpg")).unwrap();
         assert_eq!(near_groups(&conn).unwrap()[0].kept_id, Some(id_for("/a.jpg")));
         assert!(near_keep(&conn, list[0].id, 9999).is_err(), "outsider keeper rejected");
+    }
+
+    #[test]
+    fn near_dupes_split_chains_into_time_bursts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let scan = begin_scan(&conn, "/tmp", true).unwrap();
+        // One dHash component (identical hashes) in two bursts 3h apart.
+        upsert_asset(&conn, &asset("/b1a.jpg", 100, 1000.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b1b.jpg", 100, 1010.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b2a.jpg", 100, 11800.0), scan).unwrap();
+        upsert_asset(&conn, &asset("/b2b.jpg", 100, 11810.0), scan).unwrap();
+        let id_for = |path: &str| -> i64 {
+            conn.query_row("SELECT id FROM assets WHERE path = ?1", params![path], |r| r.get(0))
+                .unwrap()
+        };
+        for p in ["/b1a.jpg", "/b1b.jpg", "/b2a.jpg", "/b2b.jpg"] {
+            apply_dhash(&conn, id_for(p), "0000000000000000").unwrap();
+        }
+        set_favorite(&conn, id_for("/b2b.jpg"), true).unwrap();
+
+        let (groups, _) = rebuild_near_groups(&conn).unwrap();
+        assert_eq!(groups, 2, "3h gap splits one hash chain into two bursts");
+        let list = near_groups(&conn).unwrap();
+        assert_eq!(list.len(), 2);
+        for g in &list {
+            assert_eq!(g.members.len(), 2, "each burst keeps its pair");
+        }
+        let b2 = list.iter().find(|g| g.members.iter().any(|m| m.id == id_for("/b2b.jpg"))).unwrap();
+        assert_eq!(b2.kept_id, Some(id_for("/b2b.jpg")), "favourite wins its burst");
+        assert!(
+            b2.members.iter().find(|m| m.id == id_for("/b2b.jpg")).unwrap().favorite,
+            "members carry the favourite flag for keeper breakdown"
+        );
+        assert!(
+            !b2.members.iter().find(|m| m.id == id_for("/b2a.jpg")).unwrap().favorite,
+            "non-favourite reads false"
+        );
     }
 
     #[test]

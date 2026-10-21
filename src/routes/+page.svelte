@@ -3360,6 +3360,23 @@
     return g.members.find((m) => m.id === g.keptId) ?? g.members[0];
   }
 
+  // Keeper score breakdown, mirroring the backend order (favourite, then
+  // quality, then earliest capture). Plain span — never role=status (shared
+  // with toasts; export assertions scope on it).
+  function keeperWhy(g: CompareGroup, keeper: DuplicateMember): string {
+    const bits: string[] = [];
+    if (keeper.favorite) bits.push("★ favourite");
+    const bestQ = Math.max(...g.members.map((m) => m.qualityScore ?? -1));
+    if ((keeper.qualityScore ?? -1) >= bestQ && bestQ > 0)
+      bits.push(`sharpest (${Math.round(bestQ)})`);
+    const earliest = Math.min(
+      ...g.members.map((m) => m.capturedAt ?? Number.POSITIVE_INFINITY)
+    );
+    if ((keeper.capturedAt ?? Number.POSITIVE_INFINITY) <= earliest)
+      bits.push("earliest");
+    return bits.length > 0 ? `why keeper: ${bits.join(" · ")}` : keeper.name;
+  }
+
   function pickCandidate(g: CompareGroup, key: string): DuplicateMember | undefined {
     const sel = compareSel[key];
     // An explicit pick (even the keeper) wins; otherwise the first
@@ -3714,7 +3731,8 @@
       name: a.name,
       isDuplicate: false,
       capturedAt: a.capturedAt,
-      qualityScore: null
+      qualityScore: null,
+      favorite: a.favorite !== 0
     };
   }
 
@@ -4092,6 +4110,7 @@
               <div class="compare-panes">
                 <figure class="compare-pane" data-pane="keeper">
                   <span class="badge keep">Keeper</span>
+                  <span class="keeper-why">{keeperWhy(g, keeper)}</span>
                   <div class="compare-img">
                     {@render comparePane(keeper)}
                   </div>
