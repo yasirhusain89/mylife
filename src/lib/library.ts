@@ -700,6 +700,32 @@ export function addEventPicksToAlbum(eventId: number, albumId: number, limit = 1
   return invoke("add_event_picks_to_album", { eventId, albumId, limit });
 }
 
+/** One-click family share pack: memory video + Day-organized handpicked media + offline gallery. */
+export type SharePackSummary = {
+  dir: string;
+  video: string;
+  exported: number;
+  skipped: number;
+  bytes: number;
+};
+
+export function exportSharePack(
+  source: { eventIds?: number[]; albumId?: number },
+  name: string,
+  mode: "drive" | "compact",
+  stripGps: boolean,
+  destDir: string,
+): Promise<SharePackSummary> {
+  return invoke("export_share_pack", {
+    eventIds: source.eventIds ?? null,
+    albumId: source.albumId ?? null,
+    name,
+    mode,
+    stripGps,
+    destDir
+  });
+}
+
 // Recently Deleted: trashed assets beyond the session-undo window.
 export type TrashEntry = {
   assetId: number;

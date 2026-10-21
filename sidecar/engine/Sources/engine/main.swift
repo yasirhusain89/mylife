@@ -1016,6 +1016,56 @@ func compressVideo(path: String, output: String) throws -> [String: Any] {
     ]
 }
 
+/// Privacy copy: full-resolution bytes with location/metadata stripped.
+/// Images decode fully and re-encode as JPEG (q0.92) with a fresh, empty
+/// metadata dictionary — no EXIF, no GPS. Videos remux with the passthrough
+/// preset and an empty metadata filter, so the media is bit-identical while
+/// container-level location and creation tags are dropped. The compact
+/// recode path needs no such step (thumbnail-API output carries no metadata
+/// at all — probed clean); this exists for full-quality sharing.
+func stripCopy(path: String, output: String) throws -> [String: Any] {
+    let ext = (path as NSString).pathExtension.lowercased()
+    try? FileManager.default.removeItem(atPath: output)
+    if VIDEO_EXTS.contains(ext) {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        guard asset.tracks(withMediaType: .video).first != nil else {
+            throw EngineError(message: "no video track: \(path)")
+        }
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            throw EngineError(message: "no export session for: \(path)")
+        }
+        session.outputURL = URL(fileURLWithPath: output)
+        session.outputFileType = .mp4
+        session.metadataItemFilter = .forSharing()
+        let sem = DispatchSemaphore(value: 0)
+        session.exportAsynchronously { sem.signal() }
+        sem.wait()
+        guard session.status == .completed else {
+            throw EngineError(message: "strip export failed: \(session.error.map(String.init(describing:)) ?? "unknown")")
+        }
+    } else {
+        guard let src = CGImageSourceCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+        else { throw EngineError(message: "cannot decode image: \(path)") }
+        let outURL = URL(fileURLWithPath: output) as CFURL
+        guard
+            let dest = CGImageDestinationCreateWithURL(outURL, "public.jpeg" as CFString, 1, nil)
+        else { throw EngineError(message: "cannot write: \(output)") }
+        // No properties dictionary: nothing carries over, GPS included.
+        CGImageDestinationAddImage(
+            dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else {
+            throw EngineError(message: "cannot finalize: \(output)")
+        }
+    }
+    let attrs = try FileManager.default.attributesOfItem(atPath: output)
+    return [
+        "output": output,
+        "bytes": (attrs[.size] as? NSNumber)?.int64Value ?? 0,
+    ]
+}
+
 // MARK: - Batch hashing
 
 /// Hashes many files in one call so the Rust side pays a single round-trip
@@ -1439,6 +1489,11 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard let path = str("path") else { throw EngineError(message: "compress_video requires 'path'") }
         guard let output = str("output") else { throw EngineError(message: "compress_video requires 'output'") }
         return try background { try compressVideo(path: path, output: output) }
+
+    case "strip_copy":
+        guard let path = str("path") else { throw EngineError(message: "strip_copy requires 'path'") }
+        guard let output = str("output") else { throw EngineError(message: "strip_copy requires 'output'") }
+        return try stripCopy(path: path, output: output)
 
     case "make_highlight":
         guard let output = str("output") else { throw EngineError(message: "make_highlight requires 'output'") }

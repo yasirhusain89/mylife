@@ -2146,18 +2146,18 @@ pub struct HighlightClip {
     pub title: Option<String>,
 }
 
-/// Caller-fetched story row: file, capture time, and stop label.
+/// Caller-fetched story row: file, capture time, stop label, media kind.
 pub struct HighlightItem {
     pub path: String,
     pub taken: f64,
     pub place: Option<String>,
+    pub kind: String,
 }
 
 /// Story plan: chronological items with a chapter title at each UTC-day
 /// boundary ("Apr 18 · Grand County, Utah", else bare "Apr 18"). Pure: the
 /// caller fetches rows, the engine renders the cards. Unit-tested below.
-pub fn highlight_plan(mut items: Vec<HighlightItem>) -> Vec<HighlightClip> {
-    items.sort_by(|a, b| {
+pub fn highlight_plan(mut items: Vec<HighlightItem>) -> Vec<HighlightClip> {    items.sort_by(|a, b| {
         a.taken
             .partial_cmp(&b.taken)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -2180,6 +2180,151 @@ pub fn highlight_plan(mut items: Vec<HighlightItem>) -> Vec<HighlightClip> {
         out.push(HighlightClip { path: it.path, title });
     }
     out
+}
+
+// MARK: - Share pack (family distribution bundle)
+
+/// UTC calendar label for a capture time: ("2026-04-18", "Apr 18") for day
+/// folders and chapter text. Same bucketing as curation/chapters (UTC day),
+/// same calendar math as format_event_time.
+pub fn share_day_label(taken: f64) -> (String, String) {
+    let days = (taken / 86400.0).floor() as i64;
+    let mut d = days;
+    let mut y = 1970;
+    if d >= 0 {
+        while d >= 365 + leap(y) as i64 {
+            d -= 365 + leap(y) as i64;
+            y += 1;
+        }
+    } else {
+        while d < 0 {
+            y -= 1;
+            d += 365 + leap(y) as i64;
+        }
+    }
+    let mut m = 0;
+    for dim in month_days(y) {
+        if d < dim {
+            break;
+        }
+        d -= dim;
+        m += 1;
+    }
+    let mon = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][m];
+    (
+        format!("{y:04}-{:02}-{:02}", m + 1, d + 1),
+        format!("{mon} {}", d + 1),
+    )
+}
+
+/// Earliest event's place per asset (deterministic): folder and caption
+/// labels for share packs and stories spanning several stops.
+pub fn places_for_ids(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Option<String>>, String> {
+    let json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT aid, place FROM (
+               SELECT ea.asset_id AS aid, e.place AS place,
+                      ROW_NUMBER() OVER (PARTITION BY ea.asset_id ORDER BY e.id) AS rn
+               FROM event_assets ea JOIN events e ON e.id = ea.event_id
+               WHERE ea.asset_id IN (SELECT value FROM json_each(?1))
+             ) WHERE rn = 1",
+        )
+        .map_err(|e| format!("prepare places for ids: {e}"))?;
+    let rows = stmt
+        .query_map(params![json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+        .map_err(|e| format!("query places for ids: {e}"))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (id, place) = row.map_err(|e| format!("place row: {e}"))?;
+        out.insert(id, place);
+    }
+    Ok(out)
+}
+
+/// Minimal HTML escaper for gallery captions and paths.
+pub fn esc_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// One gallery day: folder (relative), display label, and files.
+pub struct ShareDay {
+    pub folder: String,
+    pub label: String,
+    pub files: Vec<ShareFile>,
+}
+
+/// One gallery file: path relative to the pack root, caption, media kind.
+pub struct ShareFile {
+    pub file: String,
+    pub caption: String,
+    pub kind: String,
+}
+
+/// Offline story gallery: memory video up top, then a section per day with
+/// captioned photos and playable clips. No JS, no external requests — safe
+/// over file:// for friends and family on any device.
+pub fn share_index_html(
+    pack_name: &str,
+    video_file: &str,
+    video_seconds: f64,
+    days: &[ShareDay],
+    total: i64,
+) -> String {
+    let mut h = String::new();
+    h.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    h.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>");
+    h.push_str(&esc_html(pack_name));
+    h.push_str("</title>\n<style>\n:root{color-scheme:light dark}\n");
+    h.push_str("body{font-family:system-ui,sans-serif;max-width:70rem;margin:0 auto;padding:1.5rem;line-height:1.5}\n");
+    h.push_str("h1{font-size:1.5rem}h2{font-size:1.15rem;margin-top:2rem;border-bottom:1px solid #888;padding-bottom:.3rem}\n");
+    h.push_str(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:.9rem}\n");
+    h.push_str("figure{margin:0}img,video{width:100%;border-radius:8px;display:block}\n");
+    h.push_str("figcaption{font-size:.82rem;opacity:.8;margin-top:.25rem}\n");
+    h.push_str("video.hero{max-height:70vh;background:#000}\n</style>\n</head>\n<body>\n<h1>");
+    h.push_str(&esc_html(pack_name));
+    h.push_str("</h1>\n<p>");
+    h.push_str(&total.to_string());
+    h.push_str(" handpicked photos and videos");
+    if video_seconds > 0.0 {
+        h.push_str(&format!(" · {:.0}s memory video below", video_seconds));
+    }
+    h.push_str("</p>\n<h2>Memory video</h2>\n<video class=\"hero\" src=\"");
+    h.push_str(&esc_html(video_file));
+    h.push_str("\" controls playsinline preload=\"metadata\"></video>\n");
+    for day in days {
+        h.push_str("<h2>");
+        h.push_str(&esc_html(&day.label));
+        h.push_str("</h2>\n<div class=\"grid\">\n");
+        for f in &day.files {
+            h.push_str("<figure>");
+            if f.kind == "video" {
+                h.push_str("<video src=\"");
+                h.push_str(&esc_html(&f.file));
+                h.push_str("\" controls playsinline preload=\"metadata\"></video>");
+            } else {
+                h.push_str("<img src=\"");
+                h.push_str(&esc_html(&f.file));
+                h.push_str("\" alt=\"");
+                h.push_str(&esc_html(&f.caption));
+                h.push_str("\" loading=\"lazy\">");
+            }
+            h.push_str("<figcaption>");
+            h.push_str(&esc_html(&f.caption));
+            h.push_str("</figcaption></figure>\n");
+        }
+        h.push_str("</div>\n");
+    }
+    h.push_str("</body>\n</html>\n");
+    h
 }
 
 // MARK: - Place names (reverse-geocode cache; the one network exception)
@@ -5391,9 +5536,9 @@ mod tests {
     fn highlight_plan_chapters_each_day_and_orders_chronologically() {
         let day = 1_700_000_000.0;
         let items = vec![
-            HighlightItem { path: "/b.jpg".into(), taken: day + 90000.0, place: Some("Moab".into()) },
-            HighlightItem { path: "/a.jpg".into(), taken: day, place: Some("Moab".into()) },
-            HighlightItem { path: "/c.jpg".into(), taken: day + 90100.0, place: None },
+            HighlightItem { path: "/b.jpg".into(), taken: day + 90000.0, place: Some("Moab".into()), kind: "image".into() },
+            HighlightItem { path: "/a.jpg".into(), taken: day, place: Some("Moab".into()), kind: "image".into() },
+            HighlightItem { path: "/c.jpg".into(), taken: day + 90100.0, place: None, kind: "image".into() },
         ];
         let clips = highlight_plan(items);
         assert_eq!(clips.len(), 3);
@@ -5404,6 +5549,34 @@ mod tests {
         assert!(clips[2].title.is_none(), "same day continues silently");
         let first = clips[0].title.as_ref().unwrap();
         assert!(first.contains("Moab"), "place rides the chapter, got: {first}");
+    }
+
+    #[test]
+    fn share_day_label_and_gallery_escape() {
+        assert_eq!(
+            share_day_label(1_700_000_000.0),
+            ("2023-11-14".to_string(), "Nov 14".to_string())
+        );
+        assert_eq!(
+            share_day_label(1_700_000_000.0 + 90000.0),
+            ("2023-11-15".to_string(), "Nov 15".to_string())
+        );
+        let days = vec![ShareDay {
+            folder: "2023-11-14".into(),
+            label: "Nov 14 2023".into(),
+            files: vec![
+                ShareFile { file: "photos/2023-11-14/a.jpg".into(), caption: "a<b>&\"c".into(), kind: "image".into() },
+                ShareFile { file: "photos/2023-11-14/v.mp4".into(), caption: "v".into(), kind: "video".into() },
+            ],
+        }];
+        let html = share_index_html("Trip <Best>", "trip-memory.mp4", 9.0, &days, 2);
+        assert!(html.contains("<title>Trip &lt;Best&gt;</title>"), "title escaped");
+        assert!(html.contains("Nov 14 2023"), "day section present");
+        assert!(html.contains("<video class=\"hero\" src=\"trip-memory.mp4\""), "hero video wired");
+        assert!(html.contains("<img src=\"photos/2023-11-14/a.jpg\""), "photo wired");
+        assert!(html.contains("a&lt;b&gt;&amp;&quot;c"), "caption escaped");
+        assert!(html.contains("<video src=\"photos/2023-11-14/v.mp4\""), "clip playable");
+        assert!(!html.contains("<script"), "no scripts for file:// safety");
     }
 
     #[test]

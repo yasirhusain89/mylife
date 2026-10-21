@@ -84,7 +84,7 @@ test("album create+add via UI then Albums tab shows the count", async ({ page })
   // Scope to this run's album card: the shared DB file keeps albums
   // from earlier runs, so bare lookups would match several cards.
   const card = page.locator("article", { hasText: name });
-  await expect(card.getByRole("button", { name })).toBeVisible();
+  await expect(card.getByRole("button", { name, exact: true })).toBeVisible();
   await card.getByRole("button", { name: "Add photos" }).click();
   await page.locator('button[title="IMG_20261007_185817.jpg"]').click();
   await page.getByRole("button", { name: "Add 1 photo" }).click();

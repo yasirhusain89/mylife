@@ -1904,6 +1904,22 @@ test("trips group events with album and curated-best actions", async ({ page }) 
   await expect(page.locator(".toast")).toContainText("Trip Share");
 });
 
+test("share pack dialog builds and offers the pack video", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: /Share pack for trip/ }).click();
+  const dialog = page.getByRole("dialog", { name: /Share .* with family/ });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Browse…" }).click();
+  await expect(dialog.getByLabel("Share pack destination")).toHaveValue("/mock/picked-folder");
+  await dialog.getByRole("button", { name: "Build share pack" }).click();
+  await expect(dialog.getByText(/Packed 8 photos/)).toBeVisible();
+  await expect(dialog.getByText(/-share/)).toBeVisible();
+  await dialog.getByRole("button", { name: "▶ Watch pack video" }).click();
+  const viewer = page.getByRole("dialog", { name: /-memory\.mp4/ });
+  await expect(viewer).toBeVisible();
+});
+
 test("space saver compresses dup extras plus blurred", async ({ page }) => {
   await page.getByRole("tab", { name: /^Cleanup/ }).click();
   await page.getByRole("button", { name: "Compress extras (2)" }).click();

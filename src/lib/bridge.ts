@@ -126,6 +126,7 @@ export const albumAssets = pick("albumAssets");
 export const albumAdd = pickWrite("albumAdd");
 export const albumRemove = pick("albumRemove");
 export const exportBundle = pick("exportBundle");
+export const exportSharePack = pick("exportSharePack");
 export const exportHighlight = pick("exportHighlight");
 export const ingestCopy = pick("ingestCopy");
 export const onIngestProgress = pick("onIngestProgress");
@@ -199,6 +200,7 @@ export type {
   ScanRoot,
   SceneTag,
   SceneTagCount,
+  SharePackSummary,
   RemoveRootSummary,
   RestoreSummary,
   SimilarHit,

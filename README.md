@@ -21,7 +21,7 @@ Status against what has actually shipped (see git log):
 - **P3 Intelligence — partial.** Face detection + feature-print clustering, named people, albums, pet (dog/cat) detection with sightings. Open: MobileCLIP2 embeddings + semantic search, VLM captions on demand.
 - **P4 Events & Summaries — partial.** Time + GPS event clustering with naming. Open: routine-vs-trip distinction, LLM text summaries, event stats (top people, days, places).
 - **P5 Highlight videos — partial.** Per-event mixed photo/video montage, capped at 60s. Open: camera-audio mixing (deferred: any audio-track interaction poisons video decoding in-process on macOS 26 — needs off-AVAssetReader extraction), diversity-picked shots, Ken Burns pans, transitions, title cards, narration, export presets.
-- **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles (photos and videos). Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.
+- **P6 Audience distribution — partial.** Named albums as audience groups, per-event/per-album Drive + WhatsApp bundles (photos and videos), and one-click Share Packs (memory video + Day-organized best + offline gallery; Drive full-quality or Compact chat-size with GPS stripping). Open: redaction policies, watermarks, faces allowlists, selection budgets, Mail.app attach.
 
 ## Architecture
 

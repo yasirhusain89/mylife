@@ -34,6 +34,8 @@
     exportBundle,
     type ExportSummary,
     type HighlightResult,
+    type SharePackSummary,
+    exportSharePack,
     ingestCopy,
     onIngestProgress,
     type IngestProgress,
@@ -2185,13 +2187,16 @@
   function watchHighlight() {
     if (!highlightResult) return;
     const path = highlightResult.output;
-    const name = path.split("/").pop() ?? path;
+    watchPath(path, path.split("/").pop() ?? path, highlightResult.bytes, highlightResult.seconds);
+  }
+
+  function watchPath(path: string, name: string, sizeBytes: number, duration: number | null) {
     viewerList = [
       {
         id: -1, path, name, ext: "mp4", kind: "video" as const,
-        mime: "video/mp4", sizeBytes: highlightResult.bytes, modified: 0,
+        mime: "video/mp4", sizeBytes, modified: 0,
         capturedAt: null, width: 1920, height: 1080,
-        duration: highlightResult.seconds, favorite: 0, missing: 0,
+        duration, favorite: 0, missing: 0,
         sha256: null, place: null, people: [], cameraMake: null,
         cameraModel: null, lens: null, latitude: null, longitude: null,
         iso: null, fNumber: null, exposureTime: null, focalLength: null,
@@ -2204,6 +2209,69 @@
     viewerError = null;
     viewerTags = [];
     void loadViewer(viewerList[0]);
+  }
+
+  // Share pack: memory video + Day-organized best + offline gallery for
+  // family. Compact (chat-size, metadata-free) is the default; Drive keeps
+  // full quality with an optional GPS strip.
+  type ShareTarget =
+    | { kind: "trip"; trip: TripRow }
+    | { kind: "event"; event: EventRow }
+    | { kind: "album"; album: AlbumRow };
+  let sharePack = $state<ShareTarget | null>(null);
+  let shareMode = $state<"drive" | "compact">("compact");
+  let shareStrip = $state(true);
+  let shareDest = $state("");
+  let shareBusy = $state(false);
+  let shareResult = $state<SharePackSummary | null>(null);
+
+  function shareTitle(): string {
+    if (!sharePack) return "";
+    return sharePack.kind === "trip"
+      ? sharePack.trip.name
+      : sharePack.kind === "event"
+        ? sharePack.event.name
+        : sharePack.album.name;
+  }
+
+  function openSharePack(target: ShareTarget) {
+    sharePack = target;
+    shareMode = "compact";
+    shareStrip = true;
+    shareDest = "";
+    shareResult = null;
+  }
+
+  async function pickShareDest() {
+    try {
+      const dest = await open({ directory: true, multiple: false, title: "Share pack goes to…" });
+      if (typeof dest === "string" && dest !== "") shareDest = dest;
+    } catch (e) {
+      error = `Folder picker unavailable: ${String(e).replace(/^Error: /, "")}`;
+    }
+  }
+
+  async function runSharePack() {
+    const target = sharePack;
+    const dest = shareDest.trim();
+    if (!target || shareBusy || dest === "") return;
+    shareBusy = true;
+    shareResult = null;
+    try {
+      const source =
+        target.kind === "album"
+          ? { albumId: target.album.id }
+          : target.kind === "trip"
+            ? { eventIds: target.trip.eventIds }
+            : { eventIds: [target.event.id] };
+      shareResult = await exportSharePack(source, shareTitle(), shareMode, shareStrip, dest);
+      const r = shareResult;
+      toast = `Packed ${r.exported} photo${r.exported === 1 ? "" : "s"}${r.skipped > 0 ? ` · ${r.skipped} skipped` : ""} to ${r.dir}`;
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      shareBusy = false;
+    }
   }
 
   let peopleFaces = $state<Record<number, FaceRow[]>>({});
@@ -4830,6 +4898,15 @@
                 </button>
               </div>
             {/if}
+            <div class="row-actions">
+              <button
+                class="tiny"
+                disabled={trip.assetCount === 0}
+                aria-label={`Share pack for trip ${trip.name}`}
+                title="Memory video + Day-organized best + offline gallery for family"
+                onclick={() => openSharePack({ kind: "trip", trip })}
+              >＋ Share pack…</button>
+            </div>
           </article>
         {/each}
       {/if}
@@ -4900,6 +4977,15 @@
                   {eventAlbumBusy === event.id ? "Adding…" : "＋ Best 12"}
                 </button>
               {/if}
+            </div>
+            <div class="row-actions">
+              <button
+                class="tiny"
+                disabled={event.assetCount === 0}
+                aria-label={`Share pack for ${event.name}`}
+                title="Memory video + Day-organized best + offline gallery for family"
+                onclick={() => openSharePack({ kind: "event", event })}
+              >Share pack…</button>
             </div>
             {#if highlightResult && highlightKey === `e${event.id}`}
               <p class="hint">
@@ -4987,6 +5073,13 @@
               <button class="tiny" disabled={album.assetCount === 0 || highlightBusy !== null} onclick={() => void makeHighlight({ albumId: album.id }, album.name)}>
                 {highlightBusy === `a${album.id}` ? "Exporting…" : "Highlight video"}
               </button>
+              <button
+                class="tiny"
+                disabled={album.assetCount === 0}
+                aria-label={`Share pack for album ${album.name}`}
+                title="Memory video + Day-organized best + offline gallery for family"
+                onclick={() => openSharePack({ kind: "album", album })}
+              >Share pack…</button>
               <button class="tiny danger" onclick={() => void deleteAlbum(album)}>Delete album</button>
             </div>
             {#if highlightResult && highlightKey === `a${album.id}`}
@@ -5197,6 +5290,71 @@
             </button>
           {/if}
         </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if sharePack}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget && !shareBusy) sharePack = null; }}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="share-heading" tabindex={-1} use:dialogFocus={() => { if (!shareBusy) sharePack = null; }}>
+        <h3 id="share-heading">Share “{shareTitle()}” with family</h3>
+        {#if shareResult}
+          {@const r = shareResult}
+          <p class="hint">
+            Packed {r.exported} photo{r.exported === 1 ? "" : "s"}{#if r.skipped > 0} · {r.skipped} skipped{/if}
+            ({fmtBytes(r.bytes)}) to {r.dir} — memory video plus Day folders plus an offline gallery page.
+          </p>
+          <div class="dialog-actions">
+            <button class="ghost" onclick={() => (sharePack = null)}>Close</button>
+            <button
+              onclick={() => {
+                const v = r.video;
+                sharePack = null;
+                watchPath(v, v.split("/").pop() ?? v, r.bytes, null);
+              }}
+            >▶ Watch pack video</button>
+          </div>
+        {:else}
+          <p class="hint">Memory video + Day-organized best picks + an offline gallery page friends can open in any browser.</p>
+          <div class="seg" role="group" aria-label="Pack quality">
+            <button
+              type="button"
+              class="ghost"
+              class:on={shareMode === "compact"}
+              aria-pressed={shareMode === "compact"}
+              onclick={() => (shareMode = "compact")}
+            >Chat-size</button>
+            <button
+              type="button"
+              class="ghost"
+              class:on={shareMode === "drive"}
+              aria-pressed={shareMode === "drive"}
+              onclick={() => (shareMode = "drive")}
+            >Full quality</button>
+          </div>
+          <label class="mode">
+            <input type="checkbox" bind:checked={shareStrip} />
+            Strip GPS location{#if shareMode === "compact"} (chat-size copies carry no metadata anyway){/if}
+          </label>
+          <div class="path-entry">
+            <input
+              type="text"
+              placeholder="Save pack to… (folder)"
+              aria-label="Share pack destination"
+              bind:value={shareDest}
+              disabled={shareBusy}
+            />
+            <button type="button" class="ghost" disabled={shareBusy} onclick={() => void pickShareDest()}>Browse…</button>
+          </div>
+          <div class="dialog-actions">
+            <button class="ghost" disabled={shareBusy} onclick={() => (sharePack = null)}>Cancel</button>
+            <button disabled={shareBusy || shareDest.trim() === ""} onclick={() => void runSharePack()}>
+              {shareBusy ? "Packing…" : "Build share pack"}
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

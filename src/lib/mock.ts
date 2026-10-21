@@ -37,6 +37,7 @@ import type {
   ScanRoot,
   SceneTag,
   SceneTagCount,
+  SharePackSummary,
   SimilarHit,
   TagProgress,
   TagScenesSummary,
@@ -1018,6 +1019,23 @@ export async function curatePicksToAlbum(
   return added;
 }
 
+/** Share-pack stand-in: counts the scope without touching disk. */
+export async function exportSharePack(
+  _source: { eventIds?: number[]; albumId?: number },
+  eventName: string,
+  _mode: "drive" | "compact",
+  _stripGps: boolean,
+  destDir: string,
+): Promise<SharePackSummary> {
+  const dir = `${destDir}/${eventName}-share`;
+  return {
+    dir,
+    video: `${dir}/${eventName}-memory.mp4`,
+    exported: assets.length,
+    skipped: 0,
+    bytes: assets.reduce((s, a) => s + a.sizeBytes, 0)
+  };
+}
 /** SSD ingest stand-in: everything "copies" instantly, nothing fails. */
 export async function ingestCopy(src: string, dest: string): Promise<IngestSummary> {
   void src;

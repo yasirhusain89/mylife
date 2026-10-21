@@ -1920,6 +1920,191 @@ pub struct HighlightResult {
     pub videos_skipped: i64,
 }
 
+/// Story budget: 3s per clip; 16 curated clips leave headroom for day cards.
+const HIGHLIGHT_CLIP_BUDGET: i64 = 16;
+
+/// (id, path) rows with capture times and per-asset places attached.
+fn items_for_ids(
+    conn: &rusqlite::Connection,
+    ids_paths: &[(i64, String)],
+    places: &std::collections::HashMap<i64, Option<String>>,
+) -> Result<Vec<db::HighlightItem>, String> {
+    let ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
+    let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(captured_at, modified), kind FROM assets
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )
+        .map_err(|e| format!("prepare highlight times: {e}"))?;
+    let rows = stmt
+        .query_map(params![json], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("query highlight times: {e}"))?;
+    let mut meta: std::collections::HashMap<i64, (f64, String)> = std::collections::HashMap::new();
+    for row in rows {
+        let (id, t, kind) = row.map_err(|e| format!("highlight time row: {e}"))?;
+        meta.insert(id, (t, kind));
+    }
+    Ok(ids_paths
+        .iter()
+        .map(|(id, path)| {
+            let (taken, kind) = meta.get(id).cloned().unwrap_or((0.0, "image".into()));
+            db::HighlightItem {
+                path: path.clone(),
+                taken,
+                place: places.get(id).cloned().unwrap_or(None),
+                kind,
+            }
+        })
+        .collect())
+}
+
+/// Curated-or-complete picks for an id set, kept in the caller's order.
+fn filter_to_picks(
+    ids_paths: &[(i64, String)],
+    picks: &[db::CuratePick],
+) -> Vec<(i64, String)> {
+    picks
+        .iter()
+        .filter_map(|p| ids_paths.iter().find(|(id, _)| *id == p.id).cloned())
+        .collect()
+}
+
+/// Story clips for one event: the event's place chapters every card.
+fn plan_event_clips(
+    conn: &rusqlite::Connection,
+    eid: i64,
+) -> Result<Vec<db::HighlightClip>, String> {
+    let place: Option<String> = conn
+        .query_row("SELECT place FROM events WHERE id = ?1", params![eid], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("highlight event: {e}"))?;
+    let members = db::event_assets(conn, eid)?;
+    let ids_paths: Vec<(i64, String)> = members.into_iter().map(|m| (m.id, m.path)).collect();
+    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+        let picks = db::curate_picks(conn, &[eid], HIGHLIGHT_CLIP_BUDGET)?;
+        filter_to_picks(&ids_paths, &picks)
+    } else {
+        ids_paths.clone()
+    };
+    let places: std::collections::HashMap<i64, Option<String>> =
+        chosen.iter().map(|(id, _)| (*id, place.clone())).collect();
+    Ok(db::highlight_plan(items_for_ids(conn, &chosen, &places)?))
+}
+
+/// Story clips for an album: day-only chapters (albums span places).
+fn plan_album_clips(
+    conn: &rusqlite::Connection,
+    aid: i64,
+) -> Result<Vec<db::HighlightClip>, String> {
+    let members = db::album_assets(conn, aid)?;
+    let ids_paths: Vec<(i64, String)> = members.into_iter().map(|m| (m.id, m.path)).collect();
+    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+        let member_ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
+        let json = serde_json::to_string(&member_ids).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT ea.event_id FROM event_assets ea
+                 WHERE ea.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(|e| format!("prepare highlight events: {e}"))?;
+        let rows = stmt
+            .query_map(params![json], |r| r.get::<_, i64>(0))
+            .map_err(|e| format!("query highlight events: {e}"))?;
+        let mut eids = Vec::new();
+        for row in rows {
+            eids.push(row.map_err(|e| format!("highlight event row: {e}"))?);
+        }
+        if eids.is_empty() {
+            // Unclustered members: first budget slice, chronological.
+            ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+        } else {
+            let picks =
+                db::curate_picks_constrained(conn, &eids, Some(&member_ids), HIGHLIGHT_CLIP_BUDGET)?;
+            let got = filter_to_picks(&ids_paths, &picks);
+            if got.is_empty() {
+                ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+            } else {
+                got
+            }
+        }
+    } else {
+        ids_paths.clone()
+    };
+    let places: std::collections::HashMap<i64, Option<String>> = std::collections::HashMap::new();
+    Ok(db::highlight_plan(items_for_ids(conn, &chosen, &places)?))
+}
+
+/// Story clips across several events (a trip): per-stop places chapter cards.
+fn plan_trip_clips(
+    conn: &rusqlite::Connection,
+    eids: &[i64],
+) -> Result<Vec<db::HighlightClip>, String> {
+    let mut ids_paths: Vec<(i64, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for eid in eids {
+        for m in db::event_assets(conn, *eid)? {
+            if seen.insert(m.id) {
+                ids_paths.push((m.id, m.path));
+            }
+        }
+    }
+    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+        let picks = db::curate_picks(conn, eids, HIGHLIGHT_CLIP_BUDGET)?;
+        filter_to_picks(&ids_paths, &picks)
+    } else {
+        ids_paths.clone()
+    };
+    let ids: Vec<i64> = chosen.iter().map(|(id, _)| *id).collect();
+    let places = db::places_for_ids(conn, &ids)?;
+    Ok(db::highlight_plan(items_for_ids(conn, &chosen, &places)?))
+}
+
+struct StoryRender {
+    bytes: i64,
+    seconds: f64,
+    photos: i64,
+    videos_included: i64,
+    videos_skipped: i64,
+}
+
+/// Renders story clips to one MP4. Titled stories breathe (90s cap when
+/// chapters exist, else 60s).
+fn render_story(
+    engine_state: &engine::EngineState,
+    clips: &[db::HighlightClip],
+    output: &std::path::Path,
+) -> Result<StoryRender, String> {
+    if clips.is_empty() {
+        return Err("no photos or videos in this event for a highlight video".into());
+    }
+    let titled = clips.iter().any(|c| c.title.is_some());
+    let reply = engine::call_blocking(
+        engine_state,
+        "make_highlight",
+        Some(json!({
+            "clips": clips,
+            "output": output.to_string_lossy(),
+            "maxSeconds": if titled { 90 } else { 60 },
+        })),
+        Duration::from_secs(600),
+    )?;
+    Ok(StoryRender {
+        bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
+        seconds: reply.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
+        photos: reply.get("photos").and_then(Value::as_i64).unwrap_or(0),
+        videos_included: reply.get("videosIncluded").and_then(Value::as_i64).unwrap_or(0),
+        videos_skipped: reply.get("videosSkipped").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
 /// Exports a highlight slideshow for an event (or an explicit path list) into
 /// the app's exports directory.
 ///
@@ -1935,130 +2120,22 @@ async fn export_highlight(
     paths: Option<Vec<String>>,
     name: Option<String>,
 ) -> Result<HighlightResult, String> {
-    /// Story budget: 3s per clip; 16 curated clips leave headroom for day cards.
-    const HIGHLIGHT_CLIP_BUDGET: i64 = 16;
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
-
-        // (id, path) rows for curated picks, with capture times attached.
-        let items_for_ids = |conn: &rusqlite::Connection,
-                             ids_paths: &[(i64, String)],
-                             place: Option<String>|
-         -> Result<Vec<db::HighlightItem>, String> {
-            let ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
-            let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, COALESCE(captured_at, modified) FROM assets
-                     WHERE id IN (SELECT value FROM json_each(?1))",
-                )
-                .map_err(|e| format!("prepare highlight times: {e}"))?;
-            let rows = stmt
-                .query_map(params![json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
-                .map_err(|e| format!("query highlight times: {e}"))?;
-            let mut taken: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-            for row in rows {
-                let (id, t) = row.map_err(|e| format!("highlight time row: {e}"))?;
-                taken.insert(id, t);
-            }
-            Ok(ids_paths
-                .iter()
-                .map(|(id, path)| db::HighlightItem {
-                    path: path.clone(),
-                    taken: taken.get(id).copied().unwrap_or(0.0),
-                    place: place.clone(),
-                })
-                .collect())
-        };
 
         let clips: Vec<db::HighlightClip> = match (paths, event_id, album_id) {
             (Some(p), _, _) => p
                 .into_iter()
                 .map(|path| db::HighlightClip { path, title: None })
                 .collect(),
-            (None, Some(eid), _) => {
-                let place: Option<String> = conn
-                    .query_row("SELECT place FROM events WHERE id = ?1", params![eid], |r| {
-                        r.get(0)
-                    })
-                    .map_err(|e| format!("highlight event: {e}"))?;
-                let members = db::event_assets(&conn, eid)?;
-                let ids_paths: Vec<(i64, String)> =
-                    members.into_iter().map(|m| (m.id, m.path)).collect();
-                let items = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
-                    let picks = db::curate_picks(&conn, &[eid], HIGHLIGHT_CLIP_BUDGET)?;
-                    let picked: Vec<(i64, String)> = picks
-                        .into_iter()
-                        .filter_map(|p| {
-                            ids_paths.iter().find(|(id, _)| *id == p.id).cloned()
-                        })
-                        .collect();
-                    items_for_ids(&conn, &picked, place)?
-                } else {
-                    items_for_ids(&conn, &ids_paths, place)?
-                };
-                db::highlight_plan(items)
-            }
-            (None, None, Some(aid)) => {
-                let members = db::album_assets(&conn, aid)?;
-                let ids_paths: Vec<(i64, String)> =
-                    members.into_iter().map(|m| (m.id, m.path)).collect();
-                let items = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
-                    let member_ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
-                    let json = serde_json::to_string(&member_ids).map_err(|e| e.to_string())?;
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT DISTINCT ea.event_id FROM event_assets ea
-                             WHERE ea.asset_id IN (SELECT value FROM json_each(?1))",
-                        )
-                        .map_err(|e| format!("prepare highlight events: {e}"))?;
-                    let rows = stmt
-                        .query_map(params![json], |r| r.get::<_, i64>(0))
-                        .map_err(|e| format!("query highlight events: {e}"))?;
-                    let mut eids = Vec::new();
-                    for row in rows {
-                        eids.push(row.map_err(|e| format!("highlight event row: {e}"))?);
-                    }
-                    let picked: Vec<(i64, String)> = if eids.is_empty() {
-                        // Unclustered members: first budget slice, chronological.
-                        ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
-                    } else {
-                        let picks = db::curate_picks_constrained(
-                            &conn,
-                            &eids,
-                            Some(&member_ids),
-                            HIGHLIGHT_CLIP_BUDGET,
-                        )?;
-                        let got: Vec<(i64, String)> = picks
-                            .into_iter()
-                            .filter_map(|p| {
-                                ids_paths.iter().find(|(id, _)| *id == p.id).cloned()
-                            })
-                            .collect();
-                        if got.is_empty() {
-                            ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
-                        } else {
-                            got
-                        }
-                    };
-                    items_for_ids(&conn, &picked, None)?
-                } else {
-                    items_for_ids(&conn, &ids_paths, None)?
-                };
-                db::highlight_plan(items)
-            }
+            (None, Some(eid), _) => plan_event_clips(&conn, eid)?,
+            (None, None, Some(aid)) => plan_album_clips(&conn, aid)?,
             (None, None, None) => {
                 return Err("export_highlight needs paths, event_id or album_id".into())
             }
         };
         drop(conn);
-
-        if clips.is_empty() {
-            return Err("no photos or videos in this event for a highlight video".into());
-        }
-        // Titled stories breathe: 90s cap when chapters exist, else 60s.
-        let titled = clips.iter().any(|c| c.title.is_some());
 
         let dir = app
             .path()
@@ -2075,24 +2152,15 @@ async fn export_highlight(
         }
 
         let engine_state = app.state::<engine::EngineState>();
-        let reply = engine::call_blocking(
-            &engine_state,
-            "make_highlight",
-            Some(json!({
-                "clips": clips,
-                "output": output.to_string_lossy(),
-                "maxSeconds": if titled { 90 } else { 60 },
-            })),
-            Duration::from_secs(600),
-        )?;
+        let render = render_story(&engine_state, &clips, &output)?;
 
         Ok(HighlightResult {
             output: output.to_string_lossy().to_string(),
-            bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
-            seconds: reply.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
-            photos: reply.get("photos").and_then(Value::as_i64).unwrap_or(0),
-            videos_included: reply.get("videosIncluded").and_then(Value::as_i64).unwrap_or(0),
-            videos_skipped: reply.get("videosSkipped").and_then(Value::as_i64).unwrap_or(0),
+            bytes: render.bytes,
+            seconds: render.seconds,
+            photos: render.photos,
+            videos_included: render.videos_included,
+            videos_skipped: render.videos_skipped,
         })
     })
     .await
@@ -2106,6 +2174,373 @@ fn chrono_stamp() -> String {
         .unwrap_or(0);
     format!("{secs}")
 }
+
+// MARK: - Share pack (family distribution bundle)
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePackSummary {
+    pub dir: String,
+    pub video: String,
+    pub exported: i64,
+    pub skipped: i64,
+    pub bytes: i64,
+}
+
+/// One-click family share pack: a memory video plus the handpicked
+/// photos/videos organized in Day folders, plus an offline index.html story
+/// gallery friends can open in any browser.
+///
+/// - `event_ids` (trip/event stops) or `album_id` selects the scope; albums
+///   curate within their own members.
+/// - `mode` "drive" copies byte-for-byte, "compact" recodes small (1280px).
+/// - `strip_gps` rewrites Drive copies without location metadata (Compact
+///   recodes carry no metadata by construction).
+/// - Scopes past SHARE_PACK_BUDGET go through balanced coverage curation;
+///   one corrupt file skips instead of aborting the pack.
+#[tauri::command]
+async fn export_share_pack(
+    app: tauri::AppHandle,
+    event_ids: Option<Vec<i64>>,
+    album_id: Option<i64>,
+    name: String,
+    mode: String,
+    strip_gps: bool,
+    dest_dir: String,
+) -> Result<SharePackSummary, String> {
+    if mode != "drive" && mode != "compact" {
+        return Err(format!("unknown export mode '{mode}'"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let engine_state = app.state::<engine::EngineState>();
+        build_share_pack(&conn, &engine_state, event_ids, album_id, name, mode, strip_gps, dest_dir)
+    })
+    .await
+    .map_err(|e| format!("share pack task join failed: {e}"))?
+}
+
+/// Generous handpicked set for Day folders (curation past this).
+const SHARE_PACK_BUDGET: i64 = 60;
+
+fn build_share_pack(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    event_ids: Option<Vec<i64>>,
+    album_id: Option<i64>,
+    name: String,
+    mode: String,
+    strip_gps: bool,
+    dest_dir: String,
+) -> Result<SharePackSummary, String> {
+    // 1. Scope members with times and stop labels.
+    let ids_paths: Vec<(i64, String)> = match (&event_ids, album_id) {
+        (Some(eids), _) if !eids.is_empty() => {
+            let mut all = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for eid in eids {
+                for m in db::event_assets(&conn, *eid)? {
+                    if seen.insert(m.id) {
+                        all.push((m.id, m.path));
+                    }
+                }
+            }
+            all
+        }
+        (_, Some(aid)) => db::album_assets(&conn, aid)?
+            .into_iter()
+            .map(|m| (m.id, m.path))
+            .collect(),
+        _ => return Err("export_share_pack needs event_ids or album_id".into()),
+    };
+    if ids_paths.is_empty() {
+        return Err("nothing to pack — the scope has no readable photos or videos".into());
+    }
+    let member_ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
+    let scope_events: Vec<i64> = match (&event_ids, album_id) {
+        (Some(eids), _) if !eids.is_empty() => eids.clone(),
+        _ => {
+            let json = serde_json::to_string(&member_ids).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT ea.event_id FROM event_assets ea
+                     WHERE ea.asset_id IN (SELECT value FROM json_each(?1))",
+                )
+                .map_err(|e| format!("prepare pack events: {e}"))?;
+            let rows = stmt
+                .query_map(params![json], |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("query pack events: {e}"))?;
+            let mut eids = Vec::new();
+            for row in rows {
+                eids.push(row.map_err(|e| format!("pack event row: {e}"))?);
+            }
+            eids
+        }
+    };
+    let places = db::places_for_ids(&conn, &member_ids)?;
+    let mut items = items_for_ids(&conn, &ids_paths, &places)?;
+    items.sort_by(|a, b| {
+        a.taken
+            .partial_cmp(&b.taken)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.path.cmp(&b.path))
+    });
+
+    // 2. Curate past the budget (keeps every day/stop represented).
+    // Paths are unique per asset, so membership resolves through them.
+    let path_to_id: std::collections::HashMap<&str, i64> =
+        ids_paths.iter().map(|(id, p)| (p.as_str(), *id)).collect();
+    let picked: Vec<db::HighlightItem> = if items.len() > SHARE_PACK_BUDGET as usize {
+        if scope_events.is_empty() {
+            items.into_iter().take(SHARE_PACK_BUDGET as usize).collect()
+        } else {
+            let picks = if album_id.is_some() {
+                db::curate_picks_constrained(
+                    &conn,
+                    &scope_events,
+                    Some(&member_ids),
+                    SHARE_PACK_BUDGET,
+                )?
+            } else {
+                db::curate_picks(&conn, &scope_events, SHARE_PACK_BUDGET)?
+            };
+            let keep: std::collections::HashSet<i64> = picks.into_iter().map(|p| p.id).collect();
+            let mut got: Vec<db::HighlightItem> = items
+                .into_iter()
+                .filter(|it| path_to_id.get(it.path.as_str()).map_or(false, |id| keep.contains(id)))
+                .collect();
+            if got.is_empty() {
+                // Curate found nothing usable (all blurred/dupes): fall
+                // back to the chronological head rather than an empty pack.
+                got = items_for_ids(&conn, &ids_paths, &places)?
+                    .into_iter()
+                    .take(SHARE_PACK_BUDGET as usize)
+                    .collect();
+                got.sort_by(|a, b| {
+                    a.taken
+                        .partial_cmp(&b.taken)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            got
+        }
+    } else {
+        items
+    };
+    drop(conn);
+
+    // 3. Pack root + Day folders ("2026-04-18 grand-county-utah").
+    let title = if name.trim().is_empty() { "Shared photos".to_string() } else { name.trim().to_string() };
+    let slug = slugify(&title);
+    let root = std::path::Path::new(&dest_dir).join(if slug.is_empty() { "share-pack".into() } else { slug });
+    std::fs::create_dir_all(&root).map_err(|e| format!("create {root:?}: {e}"))?;
+    let photos_dir = root.join("photos");
+    let mut folders: std::collections::BTreeMap<String, (String, Vec<usize>)> =
+        std::collections::BTreeMap::new();
+    for (i, it) in picked.iter().enumerate() {
+        let (day, mondd) = db::share_day_label(it.taken);
+        let year = day.get(0..4).unwrap_or("");
+        let mut label = format!("{mondd} {year}");
+        let folder = match &it.place {
+            Some(p) if !p.trim().is_empty() => {
+                label = format!("{label} · {p}");
+                format!("{day} {}", slugify(p))
+            }
+            _ => day,
+        };
+        folders.entry(folder).or_insert_with(|| (label, Vec::new())).1.push(i);
+    }
+
+    // 4. Media: copy, recode, or strip per pick. One bad file skips
+    // instead of aborting the family pack.
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (mut exported, mut skipped, mut bytes) = (0i64, 0i64, 0i64);
+    let mut first_err: Option<String> = None;
+    let mut fail = |msg: String| {
+        skipped += 1;
+        if first_err.is_none() {
+            first_err = Some(msg);
+        }
+    };
+    struct PackedFile {
+        rel: String,
+        caption: String,
+        kind: String,
+    }
+    let mut by_folder: std::collections::BTreeMap<String, Vec<PackedFile>> = std::collections::BTreeMap::new();
+    for (folder, (_label, idxs)) in &folders {
+        let dir = photos_dir.join(folder);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let msg = format!("create {dir:?}: {e}");
+            for _ in idxs {
+                fail(msg.clone());
+            }
+            continue;
+        }
+        for &i in idxs {
+            let it = &picked[i];
+            let src = std::path::Path::new(&it.path);
+            if !src.exists() {
+                fail(format!("missing file: {}", it.path));
+                continue;
+            }
+            let orig = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("photo-{i}"));
+            let stem = orig.rsplit_once('.').map(|(s, _)| s).unwrap_or(&orig);
+            let orig_ext = orig
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_lowercase())
+                .unwrap_or_else(|| "jpg".into());
+            let stem = slugify(stem);
+            let stem = if stem.is_empty() { format!("photo-{i}") } else { stem };
+            let exists = |c: &str| dir.join(c).exists();
+            let put = |dest: std::path::PathBuf| -> String {
+                format!("photos/{folder}/{}", dest.file_name().unwrap().to_string_lossy())
+            };
+            if mode == "drive" && !strip_gps {
+                let dest = dir.join(unique_bundle_name(&mut used_names, &exists, &stem, &orig_ext));
+                match std::fs::copy(src, &dest) {
+                    Ok(_) => {
+                        bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+                        exported += 1;
+                        by_folder.entry(folder.clone()).or_default().push(PackedFile {
+                            rel: put(dest),
+                            caption: orig.clone(),
+                            kind: it.kind.clone(),
+                        });
+                    }
+                    Err(e) => fail(format!("copy {}: {e}", it.path)),
+                }
+                continue;
+            }
+            if mode == "drive" {
+                // strip_gps: full-resolution rewrite without metadata.
+                let dest = dir.join(unique_bundle_name(
+                    &mut used_names,
+                    &exists,
+                    &stem,
+                    if it.kind == "video" { "mp4" } else { "jpg" },
+                ));
+                match engine::call_blocking(
+                    &engine_state,
+                    "strip_copy",
+                    Some(json!({
+                        "path": it.path,
+                        "output": dest.to_string_lossy(),
+                    })),
+                    Duration::from_secs(300),
+                ) {
+                    Ok(reply) => {
+                        bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+                        exported += 1;
+                        by_folder.entry(folder.clone()).or_default().push(PackedFile {
+                            rel: put(dest),
+                            caption: orig.clone(),
+                            kind: it.kind.clone(),
+                        });
+                    }
+                    Err(e) => fail(format!("strip {}: {e}", it.path)),
+                }
+                continue;
+            }
+            // compact: small recode (metadata-free by construction).
+            if it.kind == "video" {
+                let dest = dir.join(unique_bundle_name(&mut used_names, &exists, &stem, "mp4"));
+                match engine::call_blocking(
+                    &engine_state,
+                    "compress_video",
+                    Some(json!({
+                        "path": it.path,
+                        "output": dest.to_string_lossy(),
+                    })),
+                    Duration::from_secs(300),
+                ) {
+                    Ok(reply) => {
+                        bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+                        exported += 1;
+                        by_folder.entry(folder.clone()).or_default().push(PackedFile {
+                            rel: put(dest),
+                            caption: orig.clone(),
+                            kind: it.kind.clone(),
+                        });
+                    }
+                    Err(e) => fail(format!("compress {}: {e}", it.path)),
+                }
+            } else {
+                let dest = dir.join(unique_bundle_name(&mut used_names, &exists, &stem, "jpg"));
+                match engine::call_blocking(
+                    &engine_state,
+                    "compress",
+                    Some(json!({
+                        "path": it.path,
+                        "output": dest.to_string_lossy(),
+                        "maxPx": 1280,
+                        "quality": 0.72,
+                    })),
+                    Duration::from_secs(60),
+                ) {
+                    Ok(reply) => {
+                        bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+                        exported += 1;
+                        by_folder.entry(folder.clone()).or_default().push(PackedFile {
+                            rel: put(dest),
+                            caption: orig.clone(),
+                            kind: it.kind.clone(),
+                        });
+                    }
+                    Err(e) => fail(format!("compress {}: {e}", it.path)),
+                }
+            }
+        }
+    }
+    if exported == 0 {
+        return Err(first_err.unwrap_or_else(|| "nothing to pack".into()));
+    }
+
+    // 5. Memory video over the same picks (chapters included).
+    let video_name = format!(
+        "{}-memory.mp4",
+        root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "share-pack".into())
+    );
+    let video_path = root.join(&video_name);
+    let clips = db::highlight_plan(picked);
+    let render = render_story(&engine_state, &clips, &video_path)?;
+    bytes += render.bytes;
+
+    // 6. Offline gallery.
+    let days: Vec<db::ShareDay> = by_folder
+        .into_iter()
+        .map(|(folder, files)| {
+            let label = folders
+                .get(&folder)
+                .map(|(l, _)| l.clone())
+                .unwrap_or_else(|| folder.clone());
+            db::ShareDay {
+                folder,
+                label,
+                files: files
+                    .into_iter()
+                    .map(|f| db::ShareFile { file: f.rel, caption: f.caption, kind: f.kind })
+                    .collect(),
+            }
+        })
+        .collect();
+    let html = db::share_index_html(&title, &video_name, render.seconds, &days, exported);
+    std::fs::write(root.join("index.html"), html).map_err(|e| format!("write gallery: {e}"))?;
+
+    Ok(SharePackSummary {
+        dir: root.to_string_lossy().to_string(),
+        video: video_path.to_string_lossy().to_string(),
+        exported,
+        skipped,
+        bytes,
+    })
+}
+
+// MARK: - Distribution bundles
 
 // MARK: - Distribution bundles
 
