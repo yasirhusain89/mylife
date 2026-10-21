@@ -899,6 +899,25 @@ fn clip_model_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> 
 pub struct ClipModelsStatus {
     pub ready: bool,
     pub bytes_total: u64,
+    pub bytes_on_disk: u64,
+}
+
+/// Disk usage of a directory tree (models + compiled CoreML caches).
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
 
 /// Whether both CoreML packages are on disk (unpacked, ready to load).
@@ -906,7 +925,8 @@ pub struct ClipModelsStatus {
 fn clip_models_present(app: tauri::AppHandle) -> Result<ClipModelsStatus, String> {
     let dir = clip_model_dir(&app)?;
     let ready = dir.join("CLIPImage.mlpackage").is_dir() && dir.join("CLIPText.mlpackage").is_dir();
-    Ok(ClipModelsStatus { ready, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES })
+    let bytes_on_disk = if dir.is_dir() { dir_size(&dir) } else { 0 };
+    Ok(ClipModelsStatus { ready, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES, bytes_on_disk })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -985,10 +1005,22 @@ async fn download_clip_models(app: tauri::AppHandle) -> Result<ClipModelsStatus,
             }
             let _ = std::fs::remove_file(&zip_path);
         }
-        Ok(ClipModelsStatus { ready: true, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES })
+        let bytes_on_disk = dir_size(&dir);
+        Ok(ClipModelsStatus { ready: true, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES, bytes_on_disk })
     })
     .await
     .map_err(|e| format!("clip download join failed: {e}"))?
+}
+
+/// Deletes the downloaded models (and their compiled caches) to reclaim
+/// disk. Search keeps working after a fresh download + backfill.
+#[tauri::command]
+async fn remove_clip_models(app: tauri::AppHandle) -> Result<ClipModelsStatus, String> {
+    let dir = clip_model_dir(&app)?;
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("remove models: {e}"))?;
+    }
+    Ok(ClipModelsStatus { ready: false, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES, bytes_on_disk: 0 })
 }
 
 /// Backfills CLIP photo vectors (images) and keyframe moments (videos) for
@@ -3848,6 +3880,7 @@ pub fn run() {
             clip_models_present,
             download_clip_models,
             embed_clip_backfill,
+            remove_clip_models,
             search_text,
             scene_tags,
             asset_tags,

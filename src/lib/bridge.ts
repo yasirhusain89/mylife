@@ -116,6 +116,7 @@ export const clipModelsPresent = pick("clipModelsPresent");
 export const downloadClipModels = pick("downloadClipModels");
 export const onClipDownloadProgress = pick("onClipDownloadProgress");
 export const embedClipBackfill = pick("embedClipBackfill");
+export const removeClipModels = pick("removeClipModels");
 export const searchText = pick("searchText");
 export const clusterEvents = pick("clusterEvents");
 export const eventsList = pickRead("eventsList");

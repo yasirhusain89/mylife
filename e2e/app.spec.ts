@@ -1427,6 +1427,19 @@ test("semantic search narrows to matches and opens video moments", async ({ page
   await page.keyboard.press("Escape");
 });
 
+test("settings manages search models: remove then re-enable", async ({ page }) => {
+  await page.getByRole("tab", { name: "Settings", exact: true }).click();
+  const card = page.locator("section", { has: page.getByRole("heading", { name: "Semantic search" }) });
+  await expect(card.getByText("Ready")).toBeVisible();
+  await expect(card.getByText("MB on this device")).toBeVisible();
+  await card.getByRole("button", { name: "Remove models…" }).click();
+  await card.getByRole("button", { name: "Confirm remove" }).click();
+  await expect(card.getByRole("button", { name: "Enable search" })).toBeVisible();
+  // Re-enable so later tests see ready models.
+  await card.getByRole("button", { name: "Enable search" }).click();
+  await expect(card.getByText("Ready")).toBeVisible();
+});
+
 test("semantic search finds a photo by name fragment", async ({ page }) => {
   await page.getByRole("tab", { name: "Search", exact: true }).click();
   await page.getByLabel("Describe a photo to find").fill("IMG_20261007_185817");

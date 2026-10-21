@@ -838,11 +838,19 @@ export async function dismissReviewCandidate(faceA: number, faceB: number): Prom
   reviewDismissed.add(`${Math.min(faceA, faceB)}-${Math.max(faceA, faceB)}`);
 }
 
+let clipModelsReady = true;
+
 export async function clipModelsPresent(): Promise<ClipModelsStatus> {
-  return { ready: true, bytesTotal: 279143896 };
+  return { ready: clipModelsReady, bytesTotal: 279143896, bytesOnDisk: clipModelsReady ? 289000000 : 0 };
 }
 
 export async function downloadClipModels(): Promise<ClipModelsStatus> {
+  clipModelsReady = true;
+  return clipModelsPresent();
+}
+
+export async function removeClipModels(): Promise<ClipModelsStatus> {
+  clipModelsReady = false;
   return clipModelsPresent();
 }
 

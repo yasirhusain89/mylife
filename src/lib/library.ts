@@ -588,6 +588,7 @@ export type SearchHit = {
 export type ClipModelsStatus = {
   ready: boolean;
   bytesTotal: number;
+  bytesOnDisk: number;
 };
 
 export type ClipDownloadProgress = {
@@ -610,6 +611,10 @@ export function onClipDownloadProgress(cb: (p: ClipDownloadProgress) => void): P
 
 export function embedClipBackfill(): Promise<{ embedded: number; failed: number }> {
   return invoke("embed_clip_backfill");
+}
+
+export function removeClipModels(): Promise<ClipModelsStatus> {
+  return invoke("remove_clip_models");
 }
 
 export type ReviewClusterRef = {

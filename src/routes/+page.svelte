@@ -93,8 +93,10 @@
     downloadClipModels,
     onClipDownloadProgress,
     embedClipBackfill,
+    removeClipModels,
     searchText as searchClipText,
     type SearchHit,
+    type ClipModelsStatus,
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
@@ -1814,6 +1816,8 @@
   let clipReady = $state<boolean | null>(null);
   let clipWorking = $state(false);
   let clipDl = $state<{ name: string; received: number; total: number } | null>(null);
+  let clipModels = $state<ClipModelsStatus | null>(null);
+  let confirmRemoveModels = $state(false);
 
   function fmtClock(t: number): string {
     const m = Math.floor(t / 60);
@@ -1824,9 +1828,26 @@
   async function loadClipReady() {
     if (clipReady !== null) return;
     try {
-      clipReady = (await clipModelsPresent()).ready;
+      clipModels = await clipModelsPresent();
+      clipReady = clipModels.ready;
     } catch {
       clipReady = null;
+    }
+  }
+
+  async function removeSearchModels() {
+    if (clipWorking) return;
+    clipWorking = true;
+    try {
+      clipModels = await removeClipModels();
+      clipReady = false;
+      confirmRemoveModels = false;
+      semantic = null;
+      toast = "Search models removed — library and tags untouched";
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      clipWorking = false;
     }
   }
 
@@ -1839,8 +1860,8 @@
         clipDl = p;
       });
       try {
-        const status = await downloadClipModels();
-        clipReady = status.ready;
+        clipModels = await downloadClipModels();
+        clipReady = clipModels.ready;
       } finally {
         (await off)();
       }
@@ -5905,6 +5926,49 @@
     {/if}
 
     <p class="hint">Storage: library index and thumbnails stay on this device. Only reverse-geocoding lookups leave the machine.</p>
+  </section>
+  <section class="card" aria-labelledby="search-models-heading">
+    <div class="card-head">
+      <h2 id="search-models-heading">Semantic search</h2>
+    </div>
+    {#if clipReady === null}
+      <p class="hint">Checking models…</p>
+    {:else if !clipReady}
+      <p class="hint">
+        Describe a photo or a video moment and jump straight to it. First use
+        downloads the on-device search models once (~280MB); afterwards
+        everything stays on this machine.
+      </p>
+      <div class="row-actions">
+        <button onclick={() => void enableSearch()} disabled={clipWorking}>
+          {clipWorking ? "Preparing search…" : "Enable search"}
+        </button>
+      </div>
+    {:else}
+      {@const gb = (clipModels?.bytesOnDisk ?? 0) / 1073741824}
+      <p class="hint">Ready · {gb >= 1 ? `${gb.toFixed(2)} GB` : `${Math.round((clipModels?.bytesOnDisk ?? 0) / 1048576)} MB`} on this device.</p>
+      <div class="row-actions">
+        <button
+          class="ghost"
+          onclick={() => { tab = "search"; void loadClipReady(); }}
+        >Open Search</button>
+        {#if !confirmRemoveModels}
+          <button class="ghost" onclick={() => (confirmRemoveModels = true)}>Remove models…</button>
+        {:else}
+          <button
+            onclick={() => void removeSearchModels()}
+            disabled={clipWorking}
+          >Confirm remove</button>
+          <button class="ghost" onclick={() => (confirmRemoveModels = false)}>Keep</button>
+        {/if}
+      </div>
+    {/if}
+    {#if clipDl}
+      <p class="hint">
+        Downloading search models ({clipDl.name}):
+        {Math.round(clipDl.received / 1048576)} of {Math.round(clipDl.total / 1048576)} MB…
+      </p>
+    {/if}
   </section>
   {/if}
     </div><!-- /.content -->
