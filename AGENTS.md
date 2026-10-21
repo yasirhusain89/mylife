@@ -26,9 +26,9 @@ Non-functional:
 - On-device only. Model downloads ≤ ~2GB total. Network = reverse geocode +
   OSM/OpenTopoMap tiles (no other outbound).
 - Face embeddings are biometric (GDPR Art. 9) → explicit consent UX.
-- Story videos are silent for now; camera-audio mixing needs off-AVAssetReader
-  extraction (any audio-track interaction poisons in-process video decode on
-  macOS 26).
+- Story videos carry native camera audio where the source clip has it
+  (ExtAudioFile-fed AAC, native levels; stills and title cards stay silent);
+  mixing levels/ducking is a follow-up.
 - Deletion = macOS Trash only; never bypass system dialog.
 - Progress bars count finished units, never wall time — heavy units hold, then
   jump; the filename/clip label proves liveness.
@@ -99,8 +99,9 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   no N+1), neutral summary labels without GPS evidence, local-time event
   names (`name_manual` provenance; backfill keeps hand-renamed labels). Open: LLM narratives
   (no on-device LLM ships; downloads banned).
-- **P5 Highlight videos — partial.** Open: camera-audio mixing (deferred,
-  see quirks), diversity-picked shots, Ken Burns pans, transitions, narration,
+- **P5 Highlight videos — partial.** Shipped: camera-audio mixing via
+  ExtAudioFile-fed AAC (native levels; silence fallback; A/V-mismatch guard
+  drops camera audio on stalled clips). Open: diversity-picked shots, Ken Burns pans, transitions, narration,
   export presets.
 - **P6 Audience distribution — partial.** Open: redaction policies, watermarks,
   faces allowlists, selection budgets, Mail.app attach.

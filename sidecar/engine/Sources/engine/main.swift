@@ -1,4 +1,5 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
 import CoreGraphics
 import CoreImage
@@ -702,6 +703,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
     let outW = 1920, outH = 1080
     let fps = 30
+    let audioRate = 44100.0
     let secondsPerPhoto = 3.0
     let secondsPerClip = 3.0
     let framesPerPhoto = Int(secondsPerPhoto * Double(fps))
@@ -746,8 +748,24 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
 
     enum Clip {
         case photo(CGImage)
-        case video(path: String, asset: AVURLAsset, vTrack: AVAssetTrack)
+        case video(path: String, asset: AVURLAsset, vTrack: AVAssetTrack, hasAudio: Bool)
         case titlecard(CGImage)
+    }
+
+    // Presence probe: ExtAudioFile header open only. A missing/unreadable
+    // audio stream reads as "no audio" — silence downstream, never an error.
+    // Never AVAssetReader audio outputs: those poison in-process video
+    // decode on macOS 26.
+    func extAudioPresent(_ path: String) -> Bool {
+        var fref: ExtAudioFileRef?
+        guard ExtAudioFileOpenURL(URL(fileURLWithPath: path) as CFURL, &fref) == noErr,
+              let f = fref else { return false }
+        defer { ExtAudioFileDispose(f) }
+        var client = AudioStreamBasicDescription(mSampleRate: audioRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4,
+            mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+        return ExtAudioFileSetProperty(f, kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client) == noErr
     }
     var clips: [Clip] = []
     var skipped = 0
@@ -771,7 +789,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         let asset = AVURLAsset(url: url)
         if let vTrack = asset.tracks(withMediaType: .video).first {
             emitCard(input.title)
-            clips.append(.video(path: input.path, asset: asset, vTrack: vTrack))
+            // Audio presence via ExtAudioFile header open only — never
+            // AVAssetReader audio outputs, which poison in-process video
+            // decode on macOS 26. Falls back to silence per clip below.
+            clips.append(.video(path: input.path, asset: asset, vTrack: vTrack, hasAudio: extAudioPresent(input.path)))
         } else {
             skipped += 1
         }
@@ -797,6 +818,113 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         ])
     guard writer.canAdd(vInput) else { throw EngineError(message: "cannot add video input") }
     writer.add(vInput)
+
+    // Camera audio, prototype: one AAC track fed from ExtAudioFile PCM (the
+    // /tmp/audio_mix-proven path — video-only AVAssetReader + ExtAudioFile
+    // reads, never a reader audio output). Added only when at least one clip
+    // carries audio; otherwise the export stays exactly as before.
+    let wantAudio = clips.contains {
+        if case .video(_, _, _, let h) = $0 { h } else { false }
+    }
+    var aInput: AVAssetWriterInput? = nil
+    var audioFmt: CMAudioFormatDescription? = nil
+    if wantAudio {
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC as NSNumber,
+            AVSampleRateKey: 44100 as NSNumber,
+            AVNumberOfChannelsKey: 1 as NSNumber,
+            AVEncoderBitRateKey: 64000 as NSNumber])
+        input.expectsMediaDataInRealTime = false
+        if writer.canAdd(input) {
+            var asbd = AudioStreamBasicDescription(mSampleRate: audioRate, mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4,
+                mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+            var fmt: CMAudioFormatDescription?
+            if CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd,
+                layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+                extensions: nil, formatDescriptionOut: &fmt) == noErr, fmt != nil {
+                writer.add(input)
+                aInput = input
+                audioFmt = fmt
+            }
+        }
+    }
+    let audioActive = aInput != nil && audioFmt != nil
+
+    func silencePCM(_ seconds: Double) -> Data {
+        Data(count: max(0, Int(audioRate * seconds)) * 4)
+    }
+
+    // PCM for up to `seconds` of a clip, converted to mono 44.1k float by
+    // ExtAudioFile; padded with silence to exactly `seconds` so the audio
+    // cursor tracks the video cursor. Unreadable audio degrades to silence —
+    // video stays the deliverable, audio is best-effort in this prototype.
+    func clipPCM(_ path: String, seconds: Double) -> Data {
+        let want = Int(audioRate * seconds)
+        guard want > 0 else { return Data() }
+        var fref: ExtAudioFileRef?
+        guard ExtAudioFileOpenURL(URL(fileURLWithPath: path) as CFURL, &fref) == noErr,
+              let f = fref else { return Data(count: want * 4) }
+        defer { ExtAudioFileDispose(f) }
+        var client = AudioStreamBasicDescription(mSampleRate: audioRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4,
+            mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+        guard ExtAudioFileSetProperty(f, kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client) == noErr else {
+            return Data(count: want * 4)
+        }
+        var out = Data()
+        out.reserveCapacity(want * 4)
+        let chunk: UInt32 = 4096
+        let buf = malloc(Int(chunk) * 4)!
+        defer { free(buf) }
+        var total = 0
+        while total < want {
+            var abl = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                mNumberChannels: 1, mDataByteSize: chunk * 4, mData: buf))
+            var nframes: UInt32 = min(chunk, UInt32(want - total))
+            guard ExtAudioFileRead(f, &nframes, &abl) == noErr, nframes > 0 else { break }
+            out.append(contentsOf: UnsafeRawBufferPointer(start: buf, count: Int(nframes) * 4))
+            total += Int(nframes)
+        }
+        if total < want {
+            out.append(contentsOf: [UInt8](repeating: 0, count: (want - total) * 4))
+        }
+        return out
+    }
+
+    // Appends mono-44.1k-float PCM at `pts`, chunked so the AAC encoder never
+    // sees an unbounded buffer. Stalls throw via waitReady instead of hanging.
+    func appendAudioPCM(_ pcm: Data, at pts: CMTime) throws {
+        guard let input = aInput, let fd = audioFmt, !pcm.isEmpty else { return }
+        var offset = 0
+        let totalFrames = pcm.count / 4
+        while offset < totalFrames {
+            try waitReady(input, what: "highlight audio")
+            let chunk = min(4096, totalFrames - offset)
+            var block: CMBlockBuffer?
+            guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+                blockLength: chunk * 4, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+                offsetToData: 0, dataLength: chunk * 4, flags: 0, blockBufferOut: &block) == kCMBlockBufferNoErr,
+                  let bb = block else {
+                throw EngineError(message: "highlight audio block failed")
+            }
+            pcm.withUnsafeBytes { ptr in
+                _ = CMBlockBufferReplaceDataBytes(with: ptr.baseAddress! + offset * 4,
+                    blockBuffer: bb, offsetIntoDestination: 0, dataLength: chunk * 4)
+            }
+            var sb: CMSampleBuffer?
+            let ts = CMTimeAdd(pts, CMTime(value: Int64(offset), timescale: 44100))
+            let status = CMAudioSampleBufferCreateWithPacketDescriptions(allocator: kCFAllocatorDefault,
+                dataBuffer: bb, dataReady: true, makeDataReadyCallback: nil, refcon: nil,
+                formatDescription: fd, sampleCount: chunk,
+                presentationTimeStamp: ts, packetDescriptions: nil, sampleBufferOut: &sb)
+            guard status == noErr, let audioSB = sb, input.append(audioSB) else {
+                throw EngineError(message: "highlight audio append failed: \(status)")
+            }
+            offset += chunk
+        }
+    }
 
     // Video-only by design (for now): any audio-track interaction — even a
     // bare tracks(.audio) query with no reader — poisons later video decoding
@@ -868,8 +996,11 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     var cards = 0
     var videosIncluded = 0
     var videoFrames = 0
+    var audioClips = 0
+    var audioFrames: Int64 = 0
     var clipErrors: [String] = []
     var cursor = CMTime.zero
+    var audioCursor = CMTime.zero
     let ciCtx = CIContext()
 
     // Center-cropped CGImage covering the 16:9 canvas from a decoded frame.
@@ -947,6 +1078,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         case .photo(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
             let total = min(framesPerPhoto, budget)
+            let spanStart = cursor
             for j in 0..<total {
                 try waitReady(vInput, what: "photo frame")
                 // Ken Burns: ease 1.00→1.10 zoom with a gentle upward drift
@@ -958,8 +1090,17 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             photos += 1
+            if audioActive {
+                // Stills are silent by design; explicit silence keeps the
+                // audio cursor glued to the video cursor.
+                let span = (cursor - spanStart).seconds
+                try appendAudioPCM(silencePCM(span), at: audioCursor)
+                audioFrames += Int64(audioRate * span)
+                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: span, preferredTimescale: 44100))
+            }
         case .titlecard(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
+            let spanStart = cursor
             for _ in 0..<min(framesPerPhoto, budget) {
                 try waitReady(vInput, what: "title card")
                 let pb = try makePixelBuffer(image, index: frame)
@@ -968,11 +1109,22 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             cards += 1
-        case .video(let path, let asset, let vTrack):
+            if audioActive {
+                let span = (cursor - spanStart).seconds
+                try appendAudioPCM(silencePCM(span), at: audioCursor)
+                audioFrames += Int64(audioRate * span)
+                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: span, preferredTimescale: 44100))
+            }
+        case .video(let path, let asset, let vTrack, let hasAudio):
             let take = min(secondsPerClip, cap - cursor.seconds)
+            // Audio must never outrun video: a stalled/skipped clip gets
+            // silence for its span (the waitReady cap turns the pool stall
+            // into a loud skip instead of a hang).
+            var wroteVideo = false
             do {
                 if try appendClip(asset: asset, vTrack: vTrack, take: take) {
                     videosIncluded += 1
+                    wroteVideo = true
                 } else {
                     skipped += 1
                 }
@@ -982,6 +1134,18 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 // file from a pipeline stall without guessing.
                 clipErrors.append("\((path as NSString).lastPathComponent): \(error)")
             }
+            if audioActive {
+                let pcm: Data
+                if hasAudio && wroteVideo {
+                    pcm = clipPCM(path, seconds: take)
+                    audioClips += 1
+                } else {
+                    pcm = silencePCM(take)
+                }
+                try appendAudioPCM(pcm, at: audioCursor)
+                audioFrames += Int64(pcm.count / 4)
+                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: take, preferredTimescale: 44100))
+            }
             cursor = CMTimeAdd(cursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
         }
         doneClips += 1
@@ -990,6 +1154,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         ]))
     }
     vInput.markAsFinished()
+    aInput?.markAsFinished()
     let sem = DispatchSemaphore(value: 0)
     writer.finishWriting { sem.signal() }
     sem.wait()
@@ -1006,6 +1171,8 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         "videosIncluded": videosIncluded,
         "videosSkipped": skipped,
         "videoFrames": videoFrames,
+        "audioClips": audioClips,
+        "audioFrames": audioFrames,
         "clipErrors": clipErrors,
     ]
 }
