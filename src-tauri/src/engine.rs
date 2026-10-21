@@ -389,6 +389,33 @@ mod tests {
         assert!(err.contains("unknown command"), "got: {err}");
     }
 
+    /// The share-pack video phase runs one ephemeral engine per worker
+    /// thread: concurrent states must not cross-talk, deadlock, or leak
+    /// children (Drop kills each child on thread exit).
+    #[test]
+    fn concurrent_ephemeral_engines_stay_isolated() {
+        let _ = state_with_engine(); // validates the binary path once
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for w in 0..3 {
+                handles.push(s.spawn(move || {
+                    let state = new_state();
+                    for i in 0..10 {
+                        let r = call_blocking(&state, "ping", None, Duration::from_secs(10))
+                            .unwrap_or_else(|e| panic!("worker {w} ping {i} failed: {e}"));
+                        assert_eq!(r["pong"], true, "worker {w} ping {i}");
+                    }
+                    // Same process reused within the worker (no respawn storm).
+                    state
+                }));
+            }
+            for h in handles {
+                h.join().expect("worker panicked");
+                // Joined states drop here: children killed + reaped.
+            }
+        });
+    }
+
     #[test]
     fn process_is_reused_across_calls() {
         let state = state_with_engine();
