@@ -2012,11 +2012,46 @@ test("trips group events with album and curated-best actions", async ({ page }) 
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   // One mock event → one trip card with both actions, no expand needed.
   await expect(page.getByText("Trips · 1")).toBeVisible();
-  await expect(page.locator(".trip-stats .chip")).toContainText("Away");
+  await expect(page.locator("article.group header .chip").first()).toContainText("Away");
   await expect(page.locator("article.group .story").first()).toContainText("Getaway · 1 day · 8 photos");
   await page.getByRole("button", { name: /Curate best 24 from trip/ }).click();
   await expect(page.locator(".toast")).toContainText("Added 8 trip picks from");
   await expect(page.locator(".toast")).toContainText("Trip Share");
+});
+
+test("trips filter by kind and expand to stops", async ({ page }) => {
+  await page.goto("/?web=1&routine=1");
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await expect(page.getByText("Trips · 2")).toBeVisible();
+  // Both kinds listed with structured stats on each card; days are nested
+  // inside their parent trip card (never duplicated as a second flat list).
+  await expect(page.locator("article.trip-card")).toHaveCount(2);
+  await expect(page.locator("article.event-card")).toHaveCount(3);
+  await expect(page.locator("article.trip-card article.event-card")).toHaveCount(3);
+  await expect(page.locator("article.group .story").first()).toContainText("Getaway · 2 days · 16 photos");
+  await expect(page.locator("article.group .story").nth(1)).toContainText("Home base · 30 days");
+  await expect(page.locator(".trip-stats").first()).toContainText("2 days · 2 stops");
+  await expect(page.locator(".trip-stats").nth(1)).toContainText("30 days");
+  await expect(page.locator(".trip-stats").nth(1)).toContainText("Ada ×4");
+  const awayTrip = page.locator("article.trip-card").first();
+  await expect(awayTrip.locator(".stop-step").first()).toHaveText("Day 1");
+  await expect(awayTrip.locator(".stop-step").nth(1)).toHaveText("Day 2");
+  await expect(awayTrip.getByRole("button", { name: "InlawsVisit2026", exact: true })).toBeVisible();
+  await expect(awayTrip.getByRole("button", { name: "GoldenGateWalk2026", exact: true })).toBeVisible();
+  // Routine-only filter hides the away trip and its nested stops together.
+  await page.getByRole("button", { name: "Routine (1)", exact: true }).click();
+  await expect(page.locator("article.trip-card")).toHaveCount(1);
+  await expect(page.locator("article.event-card")).toHaveCount(1);
+  await expect(page.locator("article.group .story")).toContainText("Home base");
+  // Back to all; expand photos inside a nested stop, then collapse/re-expand stops.
+  await page.getByRole("button", { name: "All (2)", exact: true }).click();
+  await awayTrip.getByRole("button", { name: "Show photos" }).first().click();
+  await expect(awayTrip.locator(".stop-photos .members figure")).toHaveCount(8);
+  await page.getByRole("button", { name: /Hide stops of/ }).first().click();
+  await expect(awayTrip.locator(".stop-list")).toHaveCount(0);
+  await page.getByRole("button", { name: /Show stops of/ }).first().click();
+  await expect(awayTrip.locator(".stop-list")).toHaveCount(1);
 });
 
 test("share pack dialog builds and offers the pack video", async ({ page }) => {

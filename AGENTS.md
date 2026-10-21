@@ -92,9 +92,12 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   (`EVENT_STOP_GAP_S=1800` — distance splits only settled stops; a night
   drive was seven 1-photo events before it), routine-vs-away trips
   (home-base cells: 5+ days over 30+ days), deterministic trip summaries + stats
-  (top people/days/places on every trip card). Open: LLM narratives
-  (no on-device LLM ships; downloads banned), full trip→stops nesting
-  in the Events tab (stops still listed flat under months).
+  (top people/days/places on every trip card), Trips/Routine filter,
+  nested Month → Trip → Day/stop hierarchy (trips expanded by default, no
+  duplicate flat event list; honest Routine/Away/Collection badges), event
+  coordinate backfill from located members, batched trip stats (one pass,
+  no N+1), neutral summary labels without GPS evidence. Open: LLM narratives
+  (no on-device LLM ships; downloads banned).
 - **P5 Highlight videos — partial.** Open: camera-audio mixing (deferred,
   see quirks), diversity-picked shots, Ken Burns pans, transitions, narration,
   export presets.

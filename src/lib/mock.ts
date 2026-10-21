@@ -829,6 +829,17 @@ export async function engineThumb(path: string, _maxPx = 256): Promise<{ path: s
   return { path, image: svgThumb(path.split("/").pop() ?? "?") };
 }
 
+/** Test affordance (?routine=1): seeds a second home-base event so trip
+ *  lists contain one Away trip and one Routine trip. Default stays one
+ *  event / one trip so existing assertions never move. */
+function wantRoutineTrip(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get("routine") === "1";
+  } catch {
+    return false;
+  }
+}
+
 export async function clusterEvents(
   _gapHours = 4,
   _maxDistanceM = 500,
@@ -848,6 +859,32 @@ export async function clusterEvents(
         faceCount: 0
       }
     ];
+    if (wantRoutineTrip()) {
+      events.push(
+        {
+          id: eventId++,
+          name: "GoldenGateWalk2026",
+          startedAt: start + 86400,
+          endedAt: start + 86400 + 3600 * 4,
+          latitude: 37.8199,
+          longitude: -122.4783,
+          place: "San Francisco, California",
+          assetCount: assets.length,
+          faceCount: 1
+        },
+        {
+          id: eventId++,
+          name: "HomeEvenings2026",
+          startedAt: start - 30 * 86400,
+          endedAt: start - 30 * 86400 + 3600 * 2,
+          latitude: 37.7749,
+          longitude: -122.4194,
+          place: "San Francisco, California",
+          assetCount: assets.length,
+          faceCount: 2
+        }
+      );
+    }
   }
   return { events: events.length, assets: assets.length };
 }
@@ -992,29 +1029,63 @@ export type TripRow = {
  *  assertions don't collide with the trip card. */
 export async function tripsList(): Promise<TripRow[]> {
   if (events.length === 0) return [];
-  const first = events[events.length - 1];
-  const last = events[0];
+  const primary = events[0];
   const span = (t: number) =>
     new Date(t * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-  return [
-    {
-      id: "trip-0",
-      name: `Trip ${span(first.startedAt)}`,
-      place: first.place,
-      startedAt: first.startedAt,
-      endedAt: last.endedAt,
-      stopCount: events.length,
-      assetCount: events.reduce((s, e) => s + e.assetCount, 0),
-      eventIds: events.map((e) => e.id),
-      kind: "trip",
-      summary: "Getaway · 1 day · 8 photos",
-      dayCount: 1,
-      photoCount: events.reduce((s, e) => s + e.assetCount, 0),
-      videoCount: 0,
-      places: [],
-      topPeople: []
-    }
-  ];
+  const away: TripRow = {
+    id: "trip-0",
+    name: `Trip ${span(primary.startedAt)}`,
+    place: primary.place,
+    startedAt: primary.startedAt,
+    endedAt: primary.endedAt,
+    stopCount: 1,
+    assetCount: primary.assetCount,
+    eventIds: [primary.id],
+    kind: "trip",
+    summary: "Getaway · 1 day · 8 photos",
+    dayCount: 1,
+    photoCount: primary.assetCount,
+    videoCount: 0,
+    places: [],
+    topPeople: []
+  };
+  // ?routine=1: trip-0 spans two days/stops and trip-1 is a Routine home-base
+  // trip in an earlier month, exercising Month → Trip → Day nesting + filters.
+  if (wantRoutineTrip() && events.length >= 3) {
+    const day2 = events[1];
+    const home = events[2];
+    return [
+      {
+        ...away,
+        endedAt: day2.endedAt,
+        stopCount: 2,
+        assetCount: primary.assetCount + day2.assetCount,
+        eventIds: [primary.id, day2.id],
+        summary: "Getaway · 2 days · 16 photos",
+        dayCount: 2,
+        photoCount: primary.assetCount + day2.assetCount,
+        places: ["San Francisco, California"]
+      },
+      {
+        id: "trip-1",
+        name: `Home base ${span(home.startedAt)}`,
+        place: home.place,
+        startedAt: home.startedAt,
+        endedAt: home.endedAt,
+        stopCount: 1,
+        assetCount: home.assetCount,
+        eventIds: [home.id],
+        kind: "routine",
+        summary: "Home base · 30 days · 6 photos · 2 videos · with Ada",
+        dayCount: 30,
+        photoCount: 6,
+        videoCount: 2,
+        places: ["San Francisco, California"],
+        topPeople: [{ name: "Ada", faces: 4 }]
+      }
+    ];
+  }
+  return [away];
 }
 
 /** Trip curation stand-in: first members across the given events. */

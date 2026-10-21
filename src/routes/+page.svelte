@@ -872,6 +872,87 @@
   let trips = $state<TripRow[]>([]);
   let tripAlbumChoice = $state<Record<string, number | null>>({});
   let tripAlbumBusy = $state<string | null>(null);
+  // Trip list organization: Routine/Away filter + expandable stops nested
+  // under each trip card (resolved from the loaded event list by id).
+  // Trips start expanded so the Month → Trip → Day hierarchy is immediately
+  // visible without a duplicate flat event list below.
+  let tripKindFilter = $state<"all" | "trip" | "routine">("all");
+  let collapsedTrips = $state<Set<string>>(new Set());
+  let filteredTrips = $derived(
+    tripKindFilter === "all" ? trips : trips.filter((t) => t.kind === tripKindFilter)
+  );
+  let tripKindCounts = $derived.by(() => ({
+    trip: trips.filter((t) => t.kind === "trip").length,
+    routine: trips.filter((t) => t.kind === "routine").length
+  }));
+
+  function isTripOpen(trip: TripRow): boolean {
+    return !collapsedTrips.has(trip.id);
+  }
+
+  function toggleTrip(trip: TripRow) {
+    const next = new Set(collapsedTrips);
+    if (next.has(trip.id)) next.delete(trip.id);
+    else next.add(trip.id);
+    collapsedTrips = next;
+  }
+
+  function tripStops(trip: TripRow): EventRow[] {
+    const byId = new Map(events.map((e) => [e.id, e] as const));
+    const out: EventRow[] = [];
+    for (const id of trip.eventIds) {
+      const hit = byId.get(id);
+      if (hit) out.push(hit);
+    }
+    return out;
+  }
+
+  function groupTripsByMonth(list: TripRow[]): { month: string; trips: TripRow[] }[] {
+    const map = new Map<string, TripRow[]>();
+    for (const t of list) {
+      const d = new Date(t.startedAt * 1000);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const bucket = map.get(key);
+      if (bucket) bucket.push(t);
+      else map.set(key, [t]);
+    }
+    return [...map.entries()].map(([month, bucket]) => ({ month, trips: bucket }));
+  }
+
+  function sameCalendarDay(aSec: number, bSec: number): boolean {
+    const a = new Date(aSec * 1000);
+    const b = new Date(bSec * 1000);
+    return (
+      a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate()
+    );
+  }
+
+  function fmtDateSpan(startedAt: number, endedAt: number): string {
+    const s = new Date(startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    if (sameCalendarDay(startedAt, endedAt)) return s;
+    const e = new Date(endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return `${s} – ${e}`;
+  }
+
+  function fmtStopWindow(startedAt: number, endedAt: number): string {
+    const span = fmtDateSpan(startedAt, endedAt);
+    if (!sameCalendarDay(startedAt, endedAt) || endedAt <= startedAt) return span;
+    const t0 = new Date(startedAt * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const t1 = new Date(endedAt * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    return t0 === t1 ? span : `${span} · ${t0} – ${t1}`;
+  }
+
+  function tripBadge(trip: TripRow): { label: string; title: string } {
+    if (trip.kind === "routine") {
+      return { label: "Routine", title: "Home-base routine" };
+    }
+    if (trip.summary.startsWith("Collection")) {
+      return { label: "Collection", title: "Grouped by time (no GPS location)" };
+    }
+    return { label: "Away", title: "Away from home" };
+  }
   let resolvingPlaces = $state(false);
   let geocodeState = $state<GeocodeProgress | null>(null);
   // Lightbox viewer over the current library page (index into `assets`),
@@ -4975,211 +5056,280 @@
         </p>
       {/if}
       <p class="hint">Place names come from OpenStreetMap and are cached on this device.</p>
-      {#if trips.length}
-        <h3 class="sub">Trips · {trips.length}</h3>
-        {#each trips as trip (trip.id)}
-          <article class="group event-card">
-            <header>
-              <span title={`${trip.stopCount} stops`}>{trip.name}</span>
-              <span class="waste">
-                {new Date(trip.startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-                – {new Date(trip.endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-              </span>
-            </header>
-            <p class="meta">
-              {trip.stopCount} stop{trip.stopCount === 1 ? "" : "s"} ·
-              {trip.assetCount} asset{trip.assetCount === 1 ? "" : "s"}{#if trip.place} · {trip.place}{/if}
-            </p>
-            <p class="story">{trip.summary}</p>
-            <p class="meta trip-stats">
-              <span class="chip static">{trip.kind === "routine" ? "Routine" : "Away"}</span>
-              {#if trip.topPeople.length}
-                {trip.topPeople.map((p) => `${p.name} ×${p.faces}`).join(" · ")}
+      {#snippet eventMembersGrid(event: EventRow)}
+        {#if eventMembers[event.id]?.length}
+          <div class="members">
+            {#each eventMembers[event.id] as member (member.id)}
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[member.path]}
+                    <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
+                  {:else}
+                    <span class="placeholder">{member.kind === "video" ? "VID" : "IMG"}</span>
+                  {/if}
+                </div>
+                <figcaption>
+                  <span class="name" title={member.path}>{member.name}</span>
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">No readable photos in this event.</p>
+        {/if}
+      {/snippet}
+      {#snippet stopCard(event: EventRow, stepLabel = "")}
+        <article class="group event-card" class:stop-card={stepLabel !== ""}>
+          <header>
+            <div class="stop-head-left">
+              {#if stepLabel}
+                <span class="stop-step">{stepLabel}</span>
               {/if}
-            </p>
+              <button class="ename" title="Click to show photos" onclick={() => toggleEvent(event)}>{event.name}</button>
+            </div>
+            <span class="waste">{fmtStopWindow(event.startedAt, event.endedAt)}</span>
+          </header>
+          <p class="meta">
+            {event.assetCount} asset{event.assetCount === 1 ? "" : "s"} ·
+            {event.faceCount} face{event.faceCount === 1 ? "" : "s"} ·
+            {event.place ?? (event.latitude !== null && event.longitude !== null
+              ? `${event.latitude.toFixed(4)}, ${event.longitude.toFixed(4)}`
+              : "no location")}
+          </p>
+          <div class="row-actions">
+            <button
+              class="tiny"
+              aria-expanded={openEventId === event.id}
+              onclick={() => toggleEvent(event)}
+            >
+              {openEventId === event.id ? "Hide photos" : "Show photos"}
+            </button>
+            <button class="tiny" onclick={() => void doRename(event)}>Rename</button>
+            <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>
+              {exportBusy === `e${event.id}-drive` ? "Copying…" : "For Google Drive"}
+            </button>
+            <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "whatsapp")}>
+              {exportBusy === `e${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
+            </button>
+            <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight({ eventId: event.id }, event.name)}>
+              {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
+            </button>
             {#if albumOptions.length > 0}
-              <div class="row-actions">
-                <select
-                  aria-label={`Add ${trip.name} to album`}
-                  onchange={(e) => {
-                    tripAlbumChoice = {
-                      ...tripAlbumChoice,
-                      [trip.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
-                    };
-                  }}
-                >
-                  {#each albumOptions as a (a.id)}
-                    <option
-                      value={a.id}
-                      selected={(tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) === a.id}
-                    >{a.name}</option>
-                  {/each}
-                </select>
-                <button
-                  class="tiny"
-                  disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
-                  aria-label={`Add trip ${trip.name} to album`}
-                  title={`Add trip ${trip.name} to album`}
-                  onclick={() => void addTripToAlbum(trip)}
-                >
-                  {tripAlbumBusy === trip.id ? "Adding…" : "＋ Album"}
-                </button>
-                <button
-                  class="tiny"
-                  disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
-                  aria-label={`Curate best 24 from trip ${trip.name}`}
-                  title="Balanced best across every day and stop — favorites, named people, videos mixed in"
-                  onclick={() => void addTripPicks(trip)}
-                >
-                  {tripAlbumBusy === trip.id ? "Adding…" : "＋ Best 24"}
-                </button>
-              </div>
-            {/if}
-            <div class="row-actions">
+              <select
+                aria-label={`Add ${event.name} to album`}
+                onchange={(e) => {
+                  eventAlbumChoice = {
+                    ...eventAlbumChoice,
+                    [event.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
+                  };
+                }}
+              >
+                {#each albumOptions as a (a.id)}
+                  <option
+                    value={a.id}
+                    selected={(eventAlbumChoice[event.id] ?? albumOptions[0]?.id) === a.id}
+                  >{a.name}</option>
+                {/each}
+              </select>
               <button
                 class="tiny"
-                disabled={trip.assetCount === 0}
-                aria-label={`Share pack for trip ${trip.name}`}
-                title="Memory video + Day-organized best + offline gallery for family"
-                onclick={() => openSharePack({ kind: "trip", trip })}
-              >＋ Share pack…</button>
+                disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                onclick={() => void addEventToAlbum(event.id)}
+              >
+                {eventAlbumBusy === event.id ? "Adding…" : "＋ Album"}
+              </button>
+              <button
+                class="tiny"
+                disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
+                title="Balanced best across the event — favorites, named people, videos mixed in"
+                onclick={() => void addEventPicks(event.id)}
+              >
+                {eventAlbumBusy === event.id ? "Adding…" : "＋ Best 12"}
+              </button>
+            {/if}
+            <button
+              class="tiny"
+              disabled={event.assetCount === 0}
+              aria-label={`Share pack for ${event.name}`}
+              title="Memory video + Day-organized best + offline gallery for family"
+              onclick={() => openSharePack({ kind: "event", event })}
+            >Share pack…</button>
+          </div>
+          {#if highlightBusy === `e${event.id}` && exportProgress?.job === highlightJob}
+            <p class="hint" role="status">
+              {#if (exportProgress?.total ?? 0) > 0}
+                <progress
+                  max={exportProgress.total}
+                  value={exportProgress.done}
+                  aria-label={exportProgress.label}
+                ></progress>
+              {/if}
+              {exportProgress.label || "Exporting…"}
+            </p>
+          {/if}
+          {#if highlightResult && highlightKey === `e${event.id}`}
+            <p class="hint">
+              Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
+              · {highlightResult.photos} photo{highlightResult.photos === 1 ? "" : "s"}{#if highlightResult.videosIncluded > 0} · {highlightResult.videosIncluded} video clip{highlightResult.videosIncluded === 1 ? "" : "s"}{/if}
+              {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
+              <br />{highlightResult.output}
+            </p>
+            <div class="row-actions">
+              <button
+                type="button"
+                class="tiny"
+                title="Watch the highlight video"
+                aria-label="Watch highlight video"
+                onclick={watchHighlight}
+              >▶ Watch</button>
             </div>
-          </article>
-        {/each}
-      {/if}
-      {#if events.length}
+          {/if}
+          {#if exportResult && exportKey === `e${event.id}`}
+            <p class="hint">
+              Exported {exportResult.exported} to {exportResult.dir}
+              {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
+            </p>
+          {/if}
+          {#if openEventId === event.id}
+            <div class="stop-photos">{@render eventMembersGrid(event)}</div>
+          {/if}
+        </article>
+      {/snippet}
+      {#if trips.length}
+        <div class="trips-head">
+          <h3 class="sub">Trips · {trips.length}</h3>
+          <div class="seg trip-filter" role="group" aria-label="Filter trips by kind">
+            <button
+              type="button"
+              class="ghost"
+              class:on={tripKindFilter === "all"}
+              aria-pressed={tripKindFilter === "all"}
+              onclick={() => (tripKindFilter = "all")}
+            >All ({trips.length})</button>
+            <button
+              type="button"
+              class="ghost"
+              class:on={tripKindFilter === "trip"}
+              aria-pressed={tripKindFilter === "trip"}
+              onclick={() => (tripKindFilter = "trip")}
+            >Trips ({tripKindCounts.trip})</button>
+            <button
+              type="button"
+              class="ghost"
+              class:on={tripKindFilter === "routine"}
+              aria-pressed={tripKindFilter === "routine"}
+              onclick={() => (tripKindFilter = "routine")}
+            >Routine ({tripKindCounts.routine})</button>
+          </div>
+        </div>
+        <div class="timeline">
+          {#each groupTripsByMonth(filteredTrips) as g (g.month)}
+            <h3 class="sub timeline-month">{monthLabel(g.month)}</h3>
+            {#each g.trips as trip (trip.id)}
+              {@const stops = tripStops(trip)}
+              {@const open = isTripOpen(trip)}
+              {@const badge = tripBadge(trip)}
+              <article class="group trip-card" class:routine={trip.kind === "routine"}>
+                <header>
+                  <div class="trip-head-left">
+                    <span class="trip-title" title={`${trip.stopCount} stops`}>{trip.name}</span>
+                    <span
+                      class="chip static"
+                      title={badge.title}
+                    >{badge.label}</span>
+                  </div>
+                  <span class="waste">{fmtDateSpan(trip.startedAt, trip.endedAt)}</span>
+                </header>
+                <p class="story">{trip.summary}</p>
+                <p class="meta trip-stats">
+                  <span>
+                    {trip.dayCount} day{trip.dayCount === 1 ? "" : "s"} ·
+                    {trip.stopCount} stop{trip.stopCount === 1 ? "" : "s"} ·
+                    {trip.assetCount} asset{trip.assetCount === 1 ? "" : "s"}
+                  </span>
+                  {#each trip.places as place (place)}
+                    <span class="chip static">{place}</span>
+                  {/each}
+                  {#each trip.topPeople as person (person.name)}
+                    <span class="chip static" title={`${person.faces} faces`}>{person.name} ×{person.faces}</span>
+                  {/each}
+                </p>
+                <div class="row-actions">
+                  <button
+                    class="tiny"
+                    aria-expanded={open}
+                    aria-label={open ? `Hide stops of ${trip.name}` : `Show stops of ${trip.name}`}
+                    onclick={() => toggleTrip(trip)}
+                  >
+                    {open ? `Hide stops (${stops.length})` : `Show stops (${stops.length})`}
+                  </button>
+                  {#if albumOptions.length > 0}
+                    <select
+                      aria-label={`Add ${trip.name} to album`}
+                      onchange={(e) => {
+                        tripAlbumChoice = {
+                          ...tripAlbumChoice,
+                          [trip.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
+                        };
+                      }}
+                    >
+                      {#each albumOptions as a (a.id)}
+                        <option
+                          value={a.id}
+                          selected={(tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) === a.id}
+                        >{a.name}</option>
+                      {/each}
+                    </select>
+                    <button
+                      class="tiny"
+                      disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
+                      aria-label={`Add trip ${trip.name} to album`}
+                      title={`Add trip ${trip.name} to album`}
+                      onclick={() => void addTripToAlbum(trip)}
+                    >
+                      {tripAlbumBusy === trip.id ? "Adding…" : "＋ Album"}
+                    </button>
+                    <button
+                      class="tiny"
+                      disabled={trip.assetCount === 0 || (tripAlbumChoice[trip.id] ?? albumOptions[0]?.id) == null || tripAlbumBusy !== null}
+                      aria-label={`Curate best 24 from trip ${trip.name}`}
+                      title="Balanced best across every day and stop — favorites, named people, videos mixed in"
+                      onclick={() => void addTripPicks(trip)}
+                    >
+                      {tripAlbumBusy === trip.id ? "Adding…" : "＋ Best 24"}
+                    </button>
+                  {/if}
+                  <button
+                    class="tiny"
+                    disabled={trip.assetCount === 0}
+                    aria-label={`Share pack for trip ${trip.name}`}
+                    title="Memory video + Day-organized best + offline gallery for family"
+                    onclick={() => openSharePack({ kind: "trip", trip })}
+                  >＋ Share pack…</button>
+                </div>
+                {#if open}
+                  {#if stops.length > 0}
+                    <ol class="stop-list">
+                      {#each stops as stop, idx (stop.id)}
+                        <li class="stop-item">
+                          {@render stopCard(stop, `Day ${idx + 1}`)}
+                        </li>
+                      {/each}
+                    </ol>
+                  {:else}
+                    <p class="hint">This trip's stops aren't in the loaded event list.</p>
+                  {/if}
+                {/if}
+              </article>
+            {/each}
+          {/each}
+        </div>
+      {:else if events.length}
         <div class="timeline">
           {#each groupEventsByMonth(events) as g (g.month)}
             <h3 class="sub timeline-month">{monthLabel(g.month)}</h3>
             {#each g.events as event (event.id)}
-          <article class="group event-card">
-            <header>
-              <button class="ename" title="Click to show photos" onclick={() => toggleEvent(event)}>{event.name}</button>
-              <span class="waste">
-                {new Date(event.startedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-                – {new Date(event.endedAt * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-              </span>
-            </header>
-            <p class="meta">
-              {event.assetCount} asset{event.assetCount === 1 ? "" : "s"} ·
-              {event.faceCount} face{event.faceCount === 1 ? "" : "s"} ·
-              {event.place ?? (event.latitude !== null && event.longitude !== null
-                ? `${event.latitude.toFixed(4)}, ${event.longitude.toFixed(4)}`
-                : "no location")}
-            </p>
-            <div class="row-actions">
-              <button class="tiny" onclick={() => toggleEvent(event)}>
-                {openEventId === event.id ? "Hide photos" : "Show photos"}
-              </button>
-              <button class="tiny" onclick={() => void doRename(event)}>Rename</button>
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "drive")}>
-                {exportBusy === `e${event.id}-drive` ? "Copying…" : "For Google Drive"}
-              </button>
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "whatsapp")}>
-                {exportBusy === `e${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
-              </button>
-              <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight({ eventId: event.id }, event.name)}>
-                {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
-              </button>
-              {#if albumOptions.length > 0}
-                <select
-                  aria-label={`Add ${event.name} to album`}
-                  onchange={(e) => {
-                    eventAlbumChoice = {
-                      ...eventAlbumChoice,
-                      [event.id]: e.currentTarget.value === "" ? null : Number(e.currentTarget.value)
-                    };
-                  }}
-                >
-                  {#each albumOptions as a (a.id)}
-                    <option
-                      value={a.id}
-                      selected={(eventAlbumChoice[event.id] ?? albumOptions[0]?.id) === a.id}
-                    >{a.name}</option>
-                  {/each}
-                </select>
-                <button
-                  class="tiny"
-                  disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
-                  onclick={() => void addEventToAlbum(event.id)}
-                >
-                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Album"}
-                </button>
-                <button
-                  class="tiny"
-                  disabled={event.assetCount === 0 || (eventAlbumChoice[event.id] ?? albumOptions[0]?.id) == null || eventAlbumBusy !== null}
-                  title="Balanced best across the event — favorites, named people, videos mixed in"
-                  onclick={() => void addEventPicks(event.id)}
-                >
-                  {eventAlbumBusy === event.id ? "Adding…" : "＋ Best 12"}
-                </button>
-              {/if}
-            </div>
-            <div class="row-actions">
-              <button
-                class="tiny"
-                disabled={event.assetCount === 0}
-                aria-label={`Share pack for ${event.name}`}
-                title="Memory video + Day-organized best + offline gallery for family"
-                onclick={() => openSharePack({ kind: "event", event })}
-              >Share pack…</button>
-            </div>
-            {#if highlightBusy === `e${event.id}` && exportProgress?.job === highlightJob}
-              <p class="hint" role="status">
-                {#if (exportProgress?.total ?? 0) > 0}
-                  <progress
-                    max={exportProgress.total}
-                    value={exportProgress.done}
-                    aria-label={exportProgress.label}
-                  ></progress>
-                {/if}
-                {exportProgress.label || "Exporting…"}
-              </p>
-            {/if}
-            {#if highlightResult && highlightKey === `e${event.id}`}
-              <p class="hint">
-                Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
-                · {highlightResult.photos} photo{highlightResult.photos === 1 ? "" : "s"}{#if highlightResult.videosIncluded > 0} · {highlightResult.videosIncluded} video clip{highlightResult.videosIncluded === 1 ? "" : "s"}{/if}
-                {#if highlightResult.videosSkipped > 0}· {highlightResult.videosSkipped} unreadable skipped{/if}
-                <br />{highlightResult.output}
-              </p>
-              <div class="row-actions">
-                <button
-                  type="button"
-                  class="tiny"
-                  title="Watch the highlight video"
-                  aria-label="Watch highlight video"
-                  onclick={watchHighlight}
-                >▶ Watch</button>
-              </div>
-            {/if}
-            {#if exportResult && exportKey === `e${event.id}`}
-              <p class="hint">
-                Exported {exportResult.exported} to {exportResult.dir}
-                {#if exportResult.skipped > 0}· {exportResult.skipped} skipped{/if}
-              </p>
-            {/if}
-            {#if openEventId === event.id && eventMembers[event.id]?.length}
-              <div class="members">
-                {#each eventMembers[event.id] as member (member.id)}
-                  <figure>
-                    <div class="thumb small">
-                      {#if thumbs[member.path]}
-                        <img src={thumbs[member.path]} alt={member.name} loading="lazy" />
-                      {:else}
-                        <span class="placeholder">{member.kind === "video" ? "VID" : "IMG"}</span>
-                      {/if}
-                    </div>
-                    <figcaption>
-                      <span class="name" title={member.path}>{member.name}</span>
-                    </figcaption>
-                  </figure>
-                {/each}
-              </div>
-            {:else if openEventId === event.id}
-              <p class="hint">No readable photos in this event.</p>
-            {/if}
-          </article>
+              {@render stopCard(event)}
             {/each}
           {/each}
         </div>
@@ -6244,8 +6394,117 @@
   .thumb.small {
     aspect-ratio: 1;
   }
-  .event-card .meta {
-    margin: 0 0 0.5rem;
+  .event-card .meta,
+  .trip-card .meta {
+    margin: 0 0 0.45rem;
+  }
+  .trips-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0.4rem 0 0.6rem;
+  }
+  .trips-head .sub {
+    margin: 0;
+  }
+  .trip-card {
+    background: #121622;
+    border: 1px solid #262f42;
+    border-left: 3px solid #2f6bff;
+    padding: 0.75rem 0.85rem;
+  }
+  .trip-card.routine {
+    border-left-color: #465068;
+  }
+  .trip-head-left,
+  .stop-head-left {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+  .trip-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #f0f3f8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Trip card summary: the one-line deterministic narrative, set apart
+     from the metadata rows above and the stats chips below. */
+  .story {
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: #e7eaf0;
+    margin: 0 0 0.35rem;
+  }
+  /* Trip stats row: volume counts plus place/person chips, wrapping. */
+  .trip-stats {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .trip-stats > span:first-child {
+    margin-right: 0.2rem;
+  }
+  /* Routine/Away segmented filter above the trip list. */
+  .trip-filter {
+    display: flex;
+    gap: 0.3rem;
+    margin: 0;
+  }
+  /* Nested stops along an indented timeline rail inside a trip card. */
+  .stop-list {
+    list-style: none;
+    margin: 0.65rem 0 0.1rem 0.45rem;
+    padding: 0.1rem 0 0 1rem;
+    border-left: 2px solid #283248;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .stop-item {
+    position: relative;
+    list-style: none;
+  }
+  .stop-item::before {
+    content: "";
+    position: absolute;
+    left: -1.34rem;
+    top: 0.75rem;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 999px;
+    background: #2f6bff;
+    border: 2px solid #121622;
+  }
+  .trip-card.routine .stop-item::before {
+    background: #637089;
+  }
+  .stop-card {
+    background: #0d1017;
+    border-color: #1f2533;
+    margin-bottom: 0;
+    padding: 0.55rem 0.65rem;
+  }
+  .stop-step {
+    font-size: 0.66rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #8ab0ff;
+    background: rgba(47, 107, 255, 0.14);
+    border: 1px solid rgba(47, 107, 255, 0.3);
+    border-radius: 999px;
+    padding: 0.08rem 0.42rem;
+    flex: none;
+  }
+  .stop-photos {
+    margin-top: 0.5rem;
   }
   .ename {
     background: transparent;
