@@ -650,9 +650,9 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
 /// (1.10), so every hold frame below blits ~1:1 source pixels instead of
 /// resampling the full-res original 90 times. The max-zoom frame uses source
 /// pixels 1:1, so output frames match the full-res draw path in coverage —
-/// only the wasted oversampling is gone. No orientation transform: raw-pixel
-/// behavior matches the previous full-decode path. Falls back to the full
-/// decode when properties/thumbnail creation fail.
+/// only the wasted oversampling is gone. EXIF orientation is baked in via
+/// the thumbnail transform so portrait/rotated stills render as displayed.
+/// Falls back to an oriented full-size decode when cover-size creation fails.
 func coverThumbnail(_ src: CGImageSource, outW: Int, outH: Int) -> CGImage? {
     let zoomHeadroom = 1.10
     if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
@@ -665,11 +665,21 @@ func coverThumbnail(_ src: CGImageSource, outW: Int, outH: Int) -> CGImage? {
            let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [
                kCGImageSourceShouldCache: false,
                kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceCreateThumbnailWithTransform: true,
                kCGImageSourceThumbnailMaxPixelSize: maxPx as CFNumber,
            ] as CFDictionary) {
             return thumb
         }
-        // At or below cover size already: the original is the thumbnail.
+        // At or below cover size already, or cover creation failed: oriented
+        // full-size decode so EXIF-rotated stills still render as displayed.
+        if let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+            kCGImageSourceShouldCache: false,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(w, h) as CFNumber,
+        ] as CFDictionary) {
+            return thumb
+        }
     }
     return CGImageSourceCreateImageAtIndex(src, 0, nil)
 }
@@ -863,13 +873,22 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     let ciCtx = CIContext()
 
     // Center-cropped CGImage covering the 16:9 canvas from a decoded frame.
-    func canvasCrop(_ sample: CVPixelBuffer) -> CGImage? {
-        let ci = CIImage(cvPixelBuffer: sample)
-        let w = ci.extent.width, h = ci.extent.height
+    // AVAssetReader yields stored pixels; the track's preferredTransform
+    // (e.g. the 180° rotation vivo footage carries) must be applied first,
+    // or clips bake in upside-down/sideways. The crop stays centered in the
+    // transformed extent (origin-aware: 180° puts it at negative offsets).
+    func canvasCrop(_ sample: CVPixelBuffer, transform: CGAffineTransform) -> CGImage? {
+        var ci = CIImage(cvPixelBuffer: sample)
+        if !transform.isIdentity {
+            ci = ci.transformed(by: transform)
+        }
+        let ex = ci.extent
+        let w = ex.width, h = ex.height
         guard w > 0, h > 0 else { return nil }
         let scale = max(CGFloat(outW) / w, CGFloat(outH) / h)
         let crop = CGRect(
-            x: (w - CGFloat(outW) / scale) / 2, y: (h - CGFloat(outH) / scale) / 2,
+            x: ex.origin.x + (w - CGFloat(outW) / scale) / 2,
+            y: ex.origin.y + (h - CGFloat(outH) / scale) / 2,
             width: CGFloat(outW) / scale, height: CGFloat(outH) / scale)
         return ciCtx.createCGImage(ci, from: crop)
     }
@@ -901,7 +920,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
                 if pts.seconds >= take { break }
                 guard let pb = CMSampleBufferGetImageBuffer(sb),
-                      let cg = canvasCrop(pb) else { continue }
+                      let cg = canvasCrop(pb, transform: vTrack.preferredTransform) else { continue }
                 // Native sample timing (no re-quantization): dense source
                 // framerates would otherwise collapse onto identical stamps
                 // and every append would fail.
