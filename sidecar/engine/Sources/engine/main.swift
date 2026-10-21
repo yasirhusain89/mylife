@@ -646,6 +646,34 @@ func faceThumbnail(path: String, x: Double, y: Double, width: Double, height: Do
 
 // MARK: - Highlight video
 
+/// Decodes a still at canvas-cover size plus the Ken Burns zoom headroom
+/// (1.10), so every hold frame below blits ~1:1 source pixels instead of
+/// resampling the full-res original 90 times. The max-zoom frame uses source
+/// pixels 1:1, so output frames match the full-res draw path in coverage —
+/// only the wasted oversampling is gone. No orientation transform: raw-pixel
+/// behavior matches the previous full-decode path. Falls back to the full
+/// decode when properties/thumbnail creation fail.
+func coverThumbnail(_ src: CGImageSource, outW: Int, outH: Int) -> CGImage? {
+    let zoomHeadroom = 1.10
+    if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+       let w = (props[kCGImagePropertyPixelWidth as String] as? NSNumber)?.doubleValue,
+       let h = (props[kCGImagePropertyPixelHeight as String] as? NSNumber)?.doubleValue,
+       w > 0, h > 0 {
+        let cover = max(Double(outW) / w, Double(outH) / h) * zoomHeadroom
+        let maxPx = max(w * cover, h * cover)
+        if maxPx < max(w, h),
+           let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+               kCGImageSourceShouldCache: false,
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceThumbnailMaxPixelSize: maxPx as CFNumber,
+           ] as CFDictionary) {
+            return thumb
+        }
+        // At or below cover size already: the original is the thumbnail.
+    }
+    return CGImageSourceCreateImageAtIndex(src, 0, nil)
+}
+
 /// Builds a highlight MP4 from photos and video clips with AVAssetWriter.
 ///
 /// Still images expose zero AVAssetTrack instances on the macOS 26 SDK, so a
@@ -725,7 +753,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     for input in inputs {
         let url = URL(fileURLWithPath: input.path)
         if let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-           let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+           let cg = coverThumbnail(src, outW: outW, outH: outH) {
             emitCard(input.title)
             clips.append(.photo(cg))
             continue
