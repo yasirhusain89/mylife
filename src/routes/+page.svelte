@@ -604,7 +604,18 @@
   }
 
   let displayAssets = $derived.by(() => {
-    if (!highlightsMode) return sectionAssets;
+    // Structural backstop for the keyed grid: no producer may ever hand the
+    // each block a duplicated id (see loadMore). First occurrence wins so
+    // viewer indices stay stable.
+    const uniq = (list: { asset: AssetRow; index: number }[]) => {
+      const seen = new Set<number>();
+      return list.filter(({ asset }) => {
+        if (seen.has(asset.id)) return false;
+        seen.add(asset.id);
+        return true;
+      });
+    };
+    if (!highlightsMode) return uniq(sectionAssets);
     const cap = highlightCap();
     const out: { asset: AssetRow; index: number }[] = [];
     let chunk: { asset: AssetRow; index: number }[] = [];
@@ -624,7 +635,7 @@
       chunk.push(e);
     }
     flush();
-    return out;
+    return uniq(out);
   });
 
   let groupCounts = $derived.by(() => {
@@ -1056,12 +1067,41 @@
         offset: assets.length
       });
       if (next.length === 0) return;
-      assets = [...assets, ...next];
-      void loadThumbs(next);
+      // Offset windows go stale while the library mutates underneath the
+      // grid: imports prepend rows and enrich backfills capture dates, so a
+      // later page can repeat ids from an earlier one. Appending those would
+      // duplicate keys in the grid's keyed each block, and Svelte aborts the
+      // update with each_key_duplicate — a frozen grid that looks hung.
+      const seen = new Set(assets.map((a) => a.id));
+      const fresh = next.filter((a) => !seen.has(a.id));
+      if (fresh.length === 0) {
+        // Everything overlapped: the total moved under us, so resync the
+        // gate and let the next scroll settle instead of spinning.
+        try {
+          filteredTotal = await libraryCount(currentFilters());
+        } catch {
+          /* keep the stale total; a later page may still advance */
+        }
+        return;
+      }
+      assets = [...assets, ...fresh];
+      void loadThumbs(fresh);
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       loadingMore = false;
+    }
+    // Viewport fill: if the sentinel is still visible after appending (short
+    // pages, tall viewports), keep paging without waiting for another scroll
+    // transition — a stationary sentinel otherwise stalls the grid until the
+    // user scrolls away and back. Only reached when this load appended rows,
+    // so fully-overlapped pages (resync above) stop here instead of spinning.
+    if (typeof document !== "undefined") {
+      const el = document.getElementById("grid-sentinel");
+      const r = el?.getBoundingClientRect();
+      if (el && r && r.top < window.innerHeight && r.bottom > 0 && assets.length < filteredTotal) {
+        void loadMore();
+      }
     }
   }
 
@@ -2319,6 +2359,22 @@
       await renameCluster(clusterId, name);
       people = await clustersList();
       void loadPersonOptions();
+      // Same-name auto-merge: tagging two clusters identically unifies them
+      // into one person (lowest id survives, the manual-merge convention).
+      // Matching is trimmed + case-insensitive; the merge reuses the undoable
+      // path below so a mistaken tag splits back apart with Undo.
+      const norm = name.trim().toLowerCase();
+      const dups =
+        norm === ""
+          ? []
+          : people.filter(
+              (c) => c.id !== clusterId && (c.name ?? "").trim().toLowerCase() === norm
+            );
+      if (dups.length > 0) {
+        const ids = [clusterId, ...dups.map((c) => c.id)].sort((a, b) => a - b);
+        const into = await mergeIdSet(ids);
+        toast = `Merged ${ids.length} clusters named “${name.trim()}” (${people.find((c) => c.id === into)?.faceCount ?? 0} faces) — undo splits them back`;
+      }
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
@@ -2370,11 +2426,11 @@
     void refresh();
   }
 
-  async function runMerge() {
-    if (mergeSelect.size < 2) return;
-    const ids = [...mergeSelect].sort((a, b) => a - b);
+  // Merge helper: ids sorted ascending, ids[0] survives. Snapshots every
+  // absorbed cluster BEFORE merging so Undo can split the merge back apart.
+  // Shared by manual tick-merge and same-name auto-merge.
+  async function mergeIdSet(ids: number[]): Promise<number> {
     const into = ids[0];
-    // Snapshot every absorbed cluster BEFORE merging so Undo can split back.
     const snapshots: { id: number; name: string | null; faceIds: number[] }[] = [];
     for (let k = 1; k < ids.length; k++) {
       const cluster = people.find((c) => c.id === ids[k]);
@@ -2386,13 +2442,20 @@
       }
       snapshots.push({ id: ids[k], name: cluster?.name ?? null, faceIds: faces.map((f) => f.id) });
     }
+    for (let k = 1; k < ids.length; k++) await mergeClusters(ids[k], into);
+    mergeSelect = new Set();
+    people = await clustersList();
+    void loadClusterFaces();
+    void loadPersonOptions();
+    lastAction = { kind: "merge", ids: ids.slice(1), label: `merge into #${into}`, extra: { into, snapshots } };
+    return into;
+  }
+
+  async function runMerge() {
+    if (mergeSelect.size < 2) return;
+    const ids = [...mergeSelect].sort((a, b) => a - b);
     try {
-      for (let k = 1; k < ids.length; k++) await mergeClusters(ids[k], into);
-      mergeSelect = new Set();
-      people = await clustersList();
-      void loadClusterFaces();
-      void loadPersonOptions();
-      lastAction = { kind: "merge", ids: ids.slice(1), label: `merge into #${into}`, extra: { into, snapshots } };
+      const into = await mergeIdSet(ids);
       toast = `Merged into one person (${people.find((c) => c.id === into)?.faceCount ?? 0} faces)`;
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -4653,7 +4716,9 @@
         {/each}
       </div>
       <p class="hint">← → ↑ ↓ move · Enter opens · S stars{#if selectMode} · Shift+←/→ extends selection · Ctrl/⌘+A selects all · Del removes{/if}</p>
-      <div id="grid-sentinel" use:observeGridEnd aria-hidden="true"></div>
+      <div id="grid-sentinel" use:observeGridEnd aria-hidden="true">
+        {#if loadingMore}<span class="hint">Loading more…</span>{/if}
+      </div>
     {:else if !importing}
       <p class="hint">No assets yet — add a folder to build the index.</p>
     {/if}
@@ -6376,6 +6441,16 @@
     grid-template-columns: repeat(auto-fit, minmax(min(var(--grid-min, 8.5rem), 100%), 1fr));
     gap: 3px;
     margin-top: 0.6rem;
+  }
+  /* Infinite-scroll sentinel: a zero-height div never re-intersects once it
+     rests inside the viewport, silently stalling paging (needs two opens to
+     notice). A real hit area plus a loading hint keeps it transitioning and
+     visible while the next chunk is in flight. */
+  #grid-sentinel {
+    min-height: 3rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .grid .thumb {
     border-radius: 5px;

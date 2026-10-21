@@ -310,6 +310,32 @@ test("merge undo splits the clusters back apart", async ({ page }) => {
   await expect(page.getByText("2 faces")).toBeVisible();
 });
 
+test("tagging two clusters with the same name merges them", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await expect(page.getByRole("button", { name: "Cluster 1", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cluster 2", exact: true })).toBeVisible();
+  // Tag the first cluster.
+  await page.getByRole("button", { name: "Cluster 1", exact: true }).click();
+  let dialog = page.getByRole("dialog", { name: "Person name" });
+  await dialog.getByLabel("Person name").fill("Sam");
+  await dialog.getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByRole("button", { name: "Sam", exact: true })).toBeVisible();
+  // Tagging the second cluster identically merges instead of duplicating.
+  await page.getByRole("button", { name: "Cluster 2", exact: true }).click();
+  dialog = page.getByRole("dialog", { name: "Person name" });
+  await dialog.getByLabel("Person name").fill("Sam");
+  await dialog.getByRole("button", { name: "Rename" }).click();
+  await expect(page.locator(".toast")).toContainText("Merged 2 clusters named");
+  await expect(page.getByRole("button", { name: "Sam", exact: true })).toHaveCount(1);
+  await expect(page.getByText("Cluster 2")).toHaveCount(0);
+  await expect(page.getByText("6 faces", { exact: true })).toBeVisible();
+  // The auto-merge is undoable like a manual one (both keep their tags).
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByText("Split the merge back apart")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sam", exact: true })).toHaveCount(2);
+});
+
 test("a new destructive action replaces the pending undo", async ({ page }) => {
   // Flag first: Undo is pending for the flagged photo.
   await page.getByRole("tab", { name: /^Cleanup/ }).click();
@@ -895,6 +921,40 @@ test("imported batch lands in a new month entry", async ({ page }) => {
   await month.selectOption("2025-10");
   await expect(page.getByText("Showing 8 of 8")).toBeVisible();
   await expect(page.getByText("IMPORTED_100.jpg")).toBeHidden();
+});
+
+// Invariant lock for the scroll-during-import hang (each_key_duplicate):
+// offset pages shift while the library mutates, so every grid id must stay
+// unique and no key error may surface across import + paging. A mock cannot
+// interleave a mutation mid-page deterministically, so this locks the
+// invariant and the crash signature rather than the exact race.
+test("scrolling across an import never duplicates grid keys or throws", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.goto("/?web=1&pageSize=3");
+  for (let i = 0; i < 6; i++) {
+    await page.locator("#grid-sentinel").scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+    if ((await page.getByText("Showing 8 of 8").count()) > 0) break;
+  }
+  await expect(page.getByText("Showing 8 of 8")).toBeVisible();
+  // Grow the library the way an import does, then keep paging: previously
+  // the shifted windows appended repeated ids and Svelte aborted the grid.
+  await page.getByPlaceholder("…or paste a folder path").fill("/mock/import-shift");
+  await page.getByRole("button", { name: "Scan" }).click();
+  await expect(page.getByText("Showing 3 of 12")).toBeVisible();
+  for (let i = 0; i < 8; i++) {
+    await page.locator("#grid-sentinel").scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+    if ((await page.getByText("Showing 12 of 12").count()) > 0) break;
+  }
+  await expect(page.getByText("Showing 12 of 12")).toBeVisible();
+  const ids = await page
+    .locator(".grid figure button[data-grid-id]")
+    .evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.gridId));
+  expect(ids.length).toBeGreaterThan(0);
+  expect(new Set(ids).size).toBe(ids.length);
+  expect(errors.join("\n")).not.toContain("each_key_duplicate");
 });
 
 test("rescanning the same root does not duplicate history", async ({ page }) => {
