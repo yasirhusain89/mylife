@@ -60,7 +60,12 @@ import type {
  * this module when `?web=1` (or VITE_FOTOFLOW_WEB=1) is set.
  */
 
-type DialogOptions = { title?: string; directory?: boolean; multiple?: boolean };
+type DialogOptions = {
+  title?: string;
+  directory?: boolean;
+  multiple?: boolean;
+  filters?: { name: string; extensions: string[] }[];
+};
 
 function svgThumb(label: string): string {
   const svg =
@@ -1276,6 +1281,7 @@ export async function exportHighlight(
   _source: { eventId?: number; albumId?: number },
   _name?: string,
   job?: string,
+  opts?: { maxSeconds?: number; musicPath?: string },
 ): Promise<HighlightResult> {
   const key = job ?? "";
   const total = 4;
@@ -1286,7 +1292,14 @@ export async function exportHighlight(
     await sleep(90);
   }
   emitExport({ job: key, phase: "done", done: 1, total: 1, label: "" });
-  return { output: "/tmp/highlight.mp4", bytes: 587_000, seconds: 9, photos: 3, videosIncluded: 1, videosSkipped: 0 };
+  return {
+    output: "/tmp/highlight.mp4",
+    bytes: 587_000,
+    seconds: opts?.maxSeconds ?? 9,
+    photos: 3,
+    videosIncluded: 1,
+    videosSkipped: 0
+  };
 }
 
 /** Scripted-export progress fan-out: the mock plays a slow export through
@@ -1316,8 +1329,11 @@ export function onQualityProgress(_cb: (p: CleanupProgress) => void): Promise<()
   return Promise.resolve(() => {});
 }
 
-export async function open(_opts: DialogOptions = {}): Promise<string | null> {
-  return "/mock/picked-folder";
+export async function open(opts: DialogOptions = {}): Promise<string | null> {
+  // Folder pickers (import, exports, share packs) get the standard mock
+  // destination; a file picker (highlight music) gets a music-looking path
+  // so e2e can exercise the choose-and-clear flow.
+  return opts.directory === false ? "/mock/picked-music.mp3" : "/mock/picked-folder";
 }
 
 export interface SysInfo {

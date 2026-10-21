@@ -157,7 +157,12 @@ export const engineSysInfo: typeof realEngine.engineSysInfo = WEB
   : realEngine.engineSysInfo;
 
 /** Folder picker: mock path in web mode, Tauri dialog in the app. */
-export function open(opts?: { title?: string; directory?: boolean; multiple?: boolean }): Promise<string | null> {
+export function open(opts?: {
+  title?: string;
+  directory?: boolean;
+  multiple?: boolean;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
   if (WEB) return mock.open(opts);
   return tauriOpen(opts ?? {}) as Promise<string | null>;
 }

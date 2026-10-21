@@ -891,12 +891,15 @@ export function exportHighlight(
   source: { eventId?: number; albumId?: number },
   name?: string,
   job?: string,
+  opts?: { maxSeconds?: number; musicPath?: string },
 ): Promise<HighlightResult> {
   return invoke("export_highlight", {
     eventId: source.eventId ?? null,
     albumId: source.albumId ?? null,
     name,
-    job: job ?? ""
+    job: job ?? "",
+    maxSeconds: opts?.maxSeconds ?? null,
+    musicPath: opts?.musicPath ?? null
   });
 }
 

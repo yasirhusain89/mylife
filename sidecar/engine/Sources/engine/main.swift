@@ -694,12 +694,14 @@ func coverThumbnail(_ src: CGImageSource, outW: Int, outH: Int) -> CGImage? {
 /// directly instead (3s per photo at 30fps, H.264) with a slow Ken Burns
 /// zoom-in and upward drift. Video clips are decoded with AVAssetReader and
 /// their frames drawn onto the same 1920x1080 canvas (up to 3s per clip).
-/// Video-only: no audio track (camera-audio mixing is deferred — any
-/// audio-track interaction poisons video decoding of the same file
-/// in-process on macOS 26). Inputs carry optional day-boundary chapter
-/// titles, rendered as dark title cards. The timeline is capped at
-/// maxSeconds. Files that decode as neither photo nor video count as skipped.
-func makeHighlight(inputs: [(path: String, title: String?)], output: String, maxSeconds: Double) throws -> [String: Any] {
+/// Video-only frames on a 1920x1080 canvas: photos Ken Burns for 3s, video
+/// clips decode up to 3s with AVAssetReader, optional day-boundary title
+/// cards. Audio is one AAC track assembled at 44.1k mono: camera audio via
+/// ExtAudioFile (never an AVAssetReader audio output — those poison video
+/// decode on macOS 26), silence for stills/cards, and optional user music
+/// looped underneath at a fixed gain. Inputs carry optional titles; the
+/// timeline is capped at maxSeconds. Undecodable files count as skipped.
+func makeHighlight(inputs: [(path: String, title: String?)], output: String, maxSeconds: Double, musicPath: String?) throws -> [String: Any] {
     let cap = max(1.0, maxSeconds)
 
     // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
@@ -821,13 +823,86 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     guard writer.canAdd(vInput) else { throw EngineError(message: "cannot add video input") }
     writer.add(vInput)
 
+    // Optional user music. ExtAudioFile is the proven-safe path (same as
+    // camera audio); an unreadable file degrades to no music rather than
+    // failing the export. `defer` disposes the reader on every exit.
+    func openExtAudio(_ path: String) -> ExtAudioFileRef? {
+        var fref: ExtAudioFileRef?
+        guard ExtAudioFileOpenURL(URL(fileURLWithPath: path) as CFURL, &fref) == noErr,
+              let f = fref else { return nil }
+        var client = AudioStreamBasicDescription(mSampleRate: audioRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4,
+            mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+        guard ExtAudioFileSetProperty(f, kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client) == noErr else {
+            ExtAudioFileDispose(f)
+            return nil
+        }
+        return f
+    }
+    var musicRef: ExtAudioFileRef? = musicPath.flatMap(openExtAudio)
+    defer { if let f = musicRef { ExtAudioFileDispose(f) } }
+
+    // Exactly `seconds` of music PCM (mono 44.1k float). The track loops when
+    // it is shorter than the story, so every segment has music, and seeking
+    // to frame 0 restarts it from the top.
+    func musicPCM(_ seconds: Double) -> Data {
+        guard let f = musicRef else { return Data() }
+        let want = Int(audioRate * seconds)
+        guard want > 0 else { return Data() }
+        var out = Data()
+        out.reserveCapacity(want * 4)
+        let chunk: UInt32 = 4096
+        let buf = malloc(Int(chunk) * 4)!
+        defer { free(buf) }
+        var total = 0
+        while total < want {
+            var abl = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                mNumberChannels: 1, mDataByteSize: chunk * 4, mData: buf))
+            var nframes: UInt32 = min(chunk, UInt32(want - total))
+            guard ExtAudioFileRead(f, &nframes, &abl) == noErr else { break }
+            if nframes == 0 {
+                guard ExtAudioFileSeek(f, 0) == noErr else { break }
+                continue
+            }
+            out.append(contentsOf: UnsafeRawBufferPointer(start: buf, count: Int(nframes) * 4))
+            total += Int(nframes)
+        }
+        if total < want {
+            out.append(Data(count: (want - total) * 4))
+        }
+        return out
+    }
+
+    // Sums music into a segment's PCM (both mono float32) at a fixed gain,
+    // clamped so camera audio at native level plus music cannot wrap.
+    func mixPCM(_ base: Data, music: Data, gain: Float) -> Data {
+        guard !music.isEmpty else { return base }
+        var out = base
+        out.withUnsafeMutableBytes { dst in
+            music.withUnsafeBytes { src in
+                let n = Swift.min(dst.count, src.count) / 4
+                let d = dst.bindMemory(to: Float.self)
+                let s = src.bindMemory(to: Float.self)
+                for i in 0..<n {
+                    d[i] = Swift.max(-1, Swift.min(1, d[i] + s[i] * gain))
+                }
+            }
+        }
+        return out
+    }
+
     // Camera audio, prototype: one AAC track fed from ExtAudioFile PCM (the
     // /tmp/audio_mix-proven path — video-only AVAssetReader + ExtAudioFile
-    // reads, never a reader audio output). Added only when at least one clip
-    // carries audio; otherwise the export stays exactly as before.
-    let wantAudio = clips.contains {
+    // reads, never a reader audio output). Added when any clip carries audio
+    // or the user supplied music; otherwise the export stays video-only.
+    let hasCameraAudio = clips.contains {
         if case .video(_, _, _, let h) = $0 { h } else { false }
     }
+    let wantAudio = hasCameraAudio || musicRef != nil
+    // Music sits under camera audio; alone it can ride higher without
+    // competing with speech. A full duck/level pass stays a follow-up.
+    let musicGain: Float = hasCameraAudio ? 0.35 : 0.6
     var aInput: AVAssetWriterInput? = nil
     var audioFmt: CMAudioFormatDescription? = nil
     if wantAudio {
@@ -855,6 +930,12 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
 
     func silencePCM(_ seconds: Double) -> Data {
         Data(count: max(0, Int(audioRate * seconds)) * 4)
+    }
+
+    // Segment PCM with the music bed mixed in (identity without music).
+    func segmentAudio(_ base: Data, seconds: Double) -> Data {
+        guard musicRef != nil else { return base }
+        return mixPCM(base, music: musicPCM(seconds), gain: musicGain)
     }
 
     // PCM for up to `seconds` of a clip, converted to mono 44.1k float by
@@ -928,13 +1009,6 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         }
     }
 
-    // Video-only by design (for now): any audio-track interaction — even a
-    // bare tracks(.audio) query with no reader — poisons later video decoding
-    // of the same file in-process on macOS 26 (observed across 5 probes: 0
-    // audio calls → 90/90 frames; ≥1 audio call → stall at 42–43 frames).
-    // Camera-audio mixing is deferred until audio can be extracted off the
-    // AVAssetReader path (e.g. ExtAudioFile) or on the main thread.
-
     guard writer.startWriting() else {
         throw EngineError(message: "writer start failed: \(writer.error.map(String.init(describing:)) ?? "unknown")")
     }
@@ -1002,8 +1076,84 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     var audioFrames: Int64 = 0
     var clipErrors: [String] = []
     var cursor = CMTime.zero
-    var audioCursor = CMTime.zero
     let ciCtx = CIContext()
+
+    // The story's complete audio bed, built before any video is appended so
+    // that pump exhaustion below always means "the bed is done", never "the
+    // next segment's audio starts later". Segment spans mirror the clip
+    // loop's math exactly. Music continues across segments (musicPCM loops
+    // the track); a video that later fails to decode keeps its audio span
+    // because the video cursor advances by `take` regardless.
+    var storyAudio = Data()
+    if audioActive {
+        var planCursor = CMTime.zero
+        for clip in clips {
+            if planCursor.seconds >= cap { break }
+            switch clip {
+            case .photo, .titlecard:
+                let budget = Int((cap - planCursor.seconds) * Double(fps))
+                let total = min(framesPerPhoto, budget)
+                let span = Double(total) / Double(fps)
+                storyAudio.append(segmentAudio(silencePCM(span), seconds: span))
+                planCursor = CMTimeAdd(planCursor, CMTime(value: Int64(total), timescale: CMTimeScale(fps)))
+            case .video(let path, _, _, let hasAudio):
+                let take = min(secondsPerClip, cap - planCursor.seconds)
+                guard take > 0 else { break }
+                storyAudio.append(segmentAudio(hasAudio ? clipPCM(path, seconds: take) : silencePCM(take), seconds: take))
+                planCursor = CMTimeAdd(planCursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
+            }
+        }
+    }
+
+    // AVAssetWriter's video input goes not-ready when it wants the audio
+    // input to catch up; waiting on video alone deadlocks. Worse, once the
+    // bed is exhausted the writer still refuses video until the *audio
+    // input is closed* — probed: an engine-style feed stalled 30s at the
+    // bed's end and resumed only after markAsFinished; the file then
+    // completed with both streams at full length. So: pump the bed while
+    // video is not ready, and when the bed runs out, close the audio input
+    // once (aInput-ready guarded) and keep waiting.
+    var pendingOffset = 0
+    var audioClosed = false
+
+    func pumpPendingAudio() throws {
+        guard audioActive, pendingOffset < storyAudio.count else { return }
+        let bytes = Swift.min(4096 * 4, storyAudio.count - pendingOffset)
+        let sub = storyAudio.subdata(in: pendingOffset..<(pendingOffset + bytes))
+        let pts = CMTime(value: Int64(pendingOffset / 4), timescale: 44100)
+        try appendAudioPCM(sub, at: pts)
+        pendingOffset += bytes
+        audioFrames = Int64(pendingOffset / 4)
+    }
+
+    // Waits for video input readiness, pumping the audio bed meanwhile.
+    func waitVideoReady(_ what: String) throws {
+        var spins = 0
+        while !vInput.isReadyForMoreMediaData {
+            try pumpPendingAudio()
+            if pendingOffset < storyAudio.count { continue }
+            if audioActive, !audioClosed, aInput?.isReadyForMoreMediaData == true {
+                aInput?.markAsFinished()
+                audioClosed = true
+            }
+            if writer.status == .failed || writer.status == .cancelled {
+                throw EngineError(message: "highlight writer failed at \(what): \(writer.error.map(String.init(describing:)) ?? "unknown")")
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+            spins += 1
+            if spins > 3000 {
+                throw EngineError(message: "highlight writer stalled at \(what) (30s without accepting data, status \(writer.status.rawValue), pending=\(pendingOffset)/\(storyAudio.count), frame=\(frame), audioFrames=\(audioFrames))")
+            }
+        }
+    }
+
+    // Writes whatever is left of the bed once every frame is appended.
+    func drainPendingAudio() throws {
+        guard audioActive, !audioClosed else { return }
+        while pendingOffset < storyAudio.count {
+            try pumpPendingAudio()
+        }
+    }
 
     // Center-cropped CGImage covering the 16:9 canvas from a decoded frame.
     // AVAssetReader yields stored pixels; the track's preferredTransform
@@ -1027,9 +1177,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     }
 
     // Streams one video clip (up to `take` seconds) onto the timeline:
-    // decoded frames drawn on the canvas. Returns false when the clip
-    // contributed no frames.
-    func appendClip(asset: AVURLAsset, vTrack: AVAssetTrack, take: Double) throws -> Bool {
+    // decoded frames drawn on the canvas. `pump` keeps the writer's other
+    // (audio) input fed while video is not ready — see waitVideoReady.
+    // Returns false when the clip contributed no frames.
+    func appendClip(asset: AVURLAsset, vTrack: AVAssetTrack, take: Double, pump: () throws -> Void) throws -> Bool {
         // The asset and video track arrive from classification: no tracks()
         // calls in here (see the Clip comment — re-querying races on macOS
         // 26, and any audio-track interaction poisons video decoding).
@@ -1058,7 +1209,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 // framerates would otherwise collapse onto identical stamps
                 // and every append would fail.
                 let t = CMTimeAdd(cursor, pts)
-            try waitReady(vInput, what: "clip video frame")
+                try pump()
                 let out = try makePixelBuffer(cg, index: frame)
                 adaptor.append(out, withPresentationTime: t)
                 frame += 1
@@ -1080,9 +1231,8 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         case .photo(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
             let total = min(framesPerPhoto, budget)
-            let spanStart = cursor
             for j in 0..<total {
-                try waitReady(vInput, what: "photo frame")
+                try waitVideoReady("photo frame")
                 // Ken Burns: ease 1.00→1.10 zoom with a gentle upward drift
                 // across the hold so stills feel like slow camera moves.
                 let t = total > 1 ? Double(j) / Double(total - 1) : 0
@@ -1092,41 +1242,23 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             photos += 1
-            if audioActive {
-                // Stills are silent by design; explicit silence keeps the
-                // audio cursor glued to the video cursor.
-                let span = (cursor - spanStart).seconds
-                try appendAudioPCM(silencePCM(span), at: audioCursor)
-                audioFrames += Int64(audioRate * span)
-                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: span, preferredTimescale: 44100))
-            }
         case .titlecard(let image):
             let budget = Int((cap - cursor.seconds) * Double(fps))
-            let spanStart = cursor
-            for _ in 0..<min(framesPerPhoto, budget) {
-                try waitReady(vInput, what: "title card")
+            let total = min(framesPerPhoto, budget)
+            for _ in 0..<total {
+                try waitVideoReady("title card")
                 let pb = try makePixelBuffer(image, index: frame)
                 adaptor.append(pb, withPresentationTime: cursor)
                 frame += 1
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
             }
             cards += 1
-            if audioActive {
-                let span = (cursor - spanStart).seconds
-                try appendAudioPCM(silencePCM(span), at: audioCursor)
-                audioFrames += Int64(audioRate * span)
-                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: span, preferredTimescale: 44100))
-            }
         case .video(let path, let asset, let vTrack, let hasAudio):
             let take = min(secondsPerClip, cap - cursor.seconds)
-            // Audio must never outrun video: a stalled/skipped clip gets
-            // silence for its span (the waitReady cap turns the pool stall
-            // into a loud skip instead of a hang).
-            var wroteVideo = false
             do {
-                if try appendClip(asset: asset, vTrack: vTrack, take: take) {
+                if try appendClip(asset: asset, vTrack: vTrack, take: take, pump: { try waitVideoReady("clip video frame") }) {
                     videosIncluded += 1
-                    wroteVideo = true
+                    if hasAudio && audioActive { audioClips += 1 }
                 } else {
                     skipped += 1
                 }
@@ -1136,18 +1268,6 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
                 // file from a pipeline stall without guessing.
                 clipErrors.append("\((path as NSString).lastPathComponent): \(error)")
             }
-            if audioActive {
-                let pcm: Data
-                if hasAudio && wroteVideo {
-                    pcm = clipPCM(path, seconds: take)
-                    audioClips += 1
-                } else {
-                    pcm = silencePCM(take)
-                }
-                try appendAudioPCM(pcm, at: audioCursor)
-                audioFrames += Int64(pcm.count / 4)
-                audioCursor = CMTimeAdd(audioCursor, CMTime(seconds: take, preferredTimescale: 44100))
-            }
             cursor = CMTimeAdd(cursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
         }
         doneClips += 1
@@ -1155,8 +1275,9 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             "done": doneClips, "total": totalClips,
         ]))
     }
+    try drainPendingAudio()
     vInput.markAsFinished()
-    aInput?.markAsFinished()
+    if !audioClosed { aInput?.markAsFinished() }
     let sem = DispatchSemaphore(value: 0)
     writer.finishWriting { sem.signal() }
     sem.wait()
@@ -1175,6 +1296,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         "videoFrames": videoFrames,
         "audioClips": audioClips,
         "audioFrames": audioFrames,
+        "musicIncluded": musicRef != nil,
         "clipErrors": clipErrors,
     ]
 }
@@ -2133,6 +2255,7 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
     case "make_highlight":
         guard let output = str("output") else { throw EngineError(message: "make_highlight requires 'output'") }
         let maxSeconds = dbl("maxSeconds", 60)
+        let musicPath = str("musicPath")
         // Story clips (path + optional day-boundary title); legacy "paths"
         // arrays still accepted and render untitled.
         var inputs: [(path: String, title: String?)] = []
@@ -2148,7 +2271,9 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         guard !inputs.isEmpty else {
             throw EngineError(message: "make_highlight requires 'clips' or a non-empty 'paths' array")
         }
-        return try background { try makeHighlight(inputs: inputs, output: output, maxSeconds: maxSeconds) }
+        return try background {
+            try makeHighlight(inputs: inputs, output: output, maxSeconds: maxSeconds, musicPath: musicPath)
+        }
 
     case "face_thumb":
         guard let path = str("path") else { throw EngineError(message: "face_thumb requires 'path'") }

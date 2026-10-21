@@ -103,9 +103,11 @@ Gate for any behavior change: `check` + `cargo test --lib` + `test:e2e`
   names (`name_manual` provenance; backfill keeps hand-renamed labels). Open: LLM narratives
   (no on-device LLM ships; downloads banned).
 - **P5 Highlight videos — partial.** Shipped: camera-audio mixing via
-  ExtAudioFile-fed AAC (native levels; silence fallback; A/V-mismatch guard
-  drops camera audio on stalled clips). Open: diversity-picked shots, Ken Burns pans, transitions, narration,
-  export presets.
+  ExtAudioFile-fed AAC (native levels; silence fallback), user length control
+  (10–300s; clip budget scales ~3s/clip) and a looped user-music bed
+  (gain 0.35 under camera audio / 0.6 alone). Open: diversity-picked shots,
+  Ken Burns pans, transitions, narration, ducking/level automation, export
+  presets.
 - **P6 Audience distribution — partial.** Open: redaction policies, watermarks,
   faces allowlists, selection budgets, Mail.app attach.
 
@@ -150,6 +152,14 @@ instant-as-you-type latency.
   (concurrency measured ~no gain — serial is optimal, don't re-try).
 - Highlight stills decode at cover × 1.10 headroom (`coverThumbnail`);
   per-op costs: photo recode ~0.12s, 4K-min video ~6s.
+- **`AVAssetWriter` with an audio input wedges the video input when the
+  audio bed runs out**: `isReadyForMoreMediaData` on video never recovers
+  and no feed order fixes it (probed: stills+music stalled 30s at frame
+  36–83 across video-first, interleaved, and greedy-ahead feeds). The
+  release is `markAsFinished()` on the audio input once its bed is fully
+  written — the writer then completes with both streams at full length.
+  Engine builds the story's whole bed up front (`storyAudio`), pumps it
+  while video is not ready, and closes audio at bed end.
 
 ## Product decisions (locked)
 
@@ -203,8 +213,8 @@ all green → commit → push → restart `pnpm tauri dev`.
 
 ## Next tracks (unstarted)
 
-- Camera-audio mixing: `ExtAudioFile` path verified — next is prototype
-  `makeHighlight` with audio `AVAssetWriterInput` fed from `ExtAudioFile` PCM.
+- Highlight audio polish: ducking/level automation under user music
+  (current fixed gains 0.35 with camera audio / 0.6 alone).
 - People review queue — shipped one-by-one in the People tab: near-duplicate
   cluster pairs + lone faces in the 0.55–0.75 bridge band, dismissals in
   `review_decisions` (face-id keyed, stable across re-clusters), Undo on

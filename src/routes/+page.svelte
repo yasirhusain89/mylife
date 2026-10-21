@@ -2495,6 +2495,11 @@
   let highlightBusy = $state<string | null>(null);
   let highlightResult = $state<HighlightResult | null>(null);
   let highlightKey = $state<string | null>(null);
+  // Highlight dialog: length + music chosen before the render starts.
+  let highlightDialog = $state<{ eventId?: number; albumId?: number; name: string } | null>(null);
+  let highlightLength = $state<"auto" | "30" | "60" | "90" | "120">("auto");
+  let highlightMusic = $state<string | null>(null);
+  let highlightPicking = $state(false);
   // Per-run export job keys echoed back on every "export-progress" event;
   // exportProgress only ever shows the active run's phase.
   let highlightJob = $state<string | null>(null);
@@ -2530,14 +2535,41 @@
     }
   }
 
-  async function makeHighlight(src: { eventId?: number; albumId?: number }, name: string) {
+  function openHighlight(src: { eventId?: number; albumId?: number }, name: string) {
+    highlightDialog = { ...src, name };
+    highlightLength = "auto";
+    highlightMusic = null;
+  }
+
+  async function pickHighlightMusic() {
+    highlightPicking = true;
+    try {
+      const picked = await open({
+        directory: false,
+        multiple: false,
+        title: "Choose background music",
+        filters: [{ name: "Audio", extensions: ["mp3", "m4a", "aac", "wav", "aiff", "aif", "caf", "flac"] }],
+      });
+      if (typeof picked === "string" && picked !== "") highlightMusic = picked;
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      highlightPicking = false;
+    }
+  }
+
+  async function makeHighlight(
+    src: { eventId?: number; albumId?: number },
+    name: string,
+    opts: { maxSeconds?: number; musicPath?: string } = {},
+  ) {
     const key = sourceKey(src);
     highlightBusy = key;
     highlightResult = null;
     highlightKey = key;
     highlightJob = `highlight:${key}`;
     try {
-      highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase(), highlightJob);
+      highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase(), highlightJob, opts);
       toast = "Highlight video exported";
     } catch (e) {
       error = friendlyError(e);
@@ -5703,7 +5735,7 @@
             <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ eventId: event.id }, event.name, "whatsapp")}>
               {exportBusy === `e${event.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
             </button>
-            <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => void makeHighlight({ eventId: event.id }, event.name)}>
+            <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => openHighlight({ eventId: event.id }, event.name)}>
               {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
             </button>
             {#if albumOptions.length > 0}
@@ -5961,7 +5993,7 @@
               <button class="tiny" disabled={album.assetCount === 0 || exportBusy !== null} onclick={() => void runExport({ albumId: album.id }, album.name, "whatsapp")}>
                 {exportBusy === `a${album.id}-whatsapp` ? "Compressing…" : "For WhatsApp"}
               </button>
-              <button class="tiny" disabled={album.assetCount === 0 || highlightBusy !== null} onclick={() => void makeHighlight({ albumId: album.id }, album.name)}>
+              <button class="tiny" disabled={album.assetCount === 0 || highlightBusy !== null} onclick={() => openHighlight({ albumId: album.id }, album.name)}>
                 {highlightBusy === `a${album.id}` ? "Exporting…" : "Highlight video"}
               </button>
               <button
@@ -6337,6 +6369,62 @@
             </p>
           {/if}
         {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if highlightDialog}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget && highlightBusy === null) highlightDialog = null; }}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-label="Highlight video" tabindex={-1} use:dialogFocus={() => { if (highlightBusy === null) highlightDialog = null; }}>
+        <h3>Highlight video for “{highlightDialog.name}”</h3>
+        <p class="hint">Pick the length and an optional music track; the best shots are chosen automatically.</p>
+        <label class="mode">
+          Length
+          <select bind:value={highlightLength} disabled={highlightBusy !== null} aria-label="Highlight length">
+            <option value="auto">Auto</option>
+            <option value="30">30 seconds</option>
+            <option value="60">60 seconds</option>
+            <option value="90">90 seconds</option>
+            <option value="120">2 minutes</option>
+          </select>
+        </label>
+        <div class="path-entry">
+          <input
+            type="text"
+            placeholder="No music — add a track…"
+            aria-label="Highlight music"
+            value={highlightMusic ?? ""}
+            readonly
+            disabled={highlightBusy !== null}
+          />
+          <button type="button" class="ghost" disabled={highlightBusy !== null || highlightPicking} onclick={() => void pickHighlightMusic()}>
+            {highlightPicking ? "Choosing…" : "Choose music…"}
+          </button>
+          {#if highlightMusic}
+            <button type="button" class="ghost" disabled={highlightBusy !== null} aria-label="Clear music" onclick={() => (highlightMusic = null)}>Clear</button>
+          {/if}
+        </div>
+        <div class="dialog-actions">
+          <button class="ghost" disabled={highlightBusy !== null} onclick={() => (highlightDialog = null)}>Cancel</button>
+          <button
+            disabled={highlightBusy !== null}
+            onclick={() => {
+              const d = highlightDialog;
+              if (!d) return;
+              highlightDialog = null;
+              void makeHighlight(
+                d.eventId != null ? { eventId: d.eventId } : { albumId: d.albumId },
+                d.name,
+                {
+                  ...(highlightLength === "auto" ? {} : { maxSeconds: Number(highlightLength) }),
+                  ...(highlightMusic ? { musicPath: highlightMusic } : {}),
+                },
+              );
+            }}
+          >Make video</button>
+        </div>
       </div>
     </div>
   {/if}

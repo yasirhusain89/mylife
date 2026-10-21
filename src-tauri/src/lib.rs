@@ -2419,6 +2419,16 @@ pub struct HighlightResult {
 /// Story budget: 3s per clip; 16 curated clips leave headroom for day cards.
 const HIGHLIGHT_CLIP_BUDGET: i64 = 16;
 
+/// Clip budget for a story. `None` (Auto) preserves the shipped plan; an
+/// explicit length scales the pick count so a long video still covers the
+/// timeline (~3s per clip) without unbounded curation work.
+fn highlight_clip_budget(max_seconds: Option<f64>) -> i64 {
+    match max_seconds {
+        Some(s) => ((s / 3.0).ceil() as i64).clamp(1, 40),
+        None => HIGHLIGHT_CLIP_BUDGET,
+    }
+}
+
 /// (id, path) rows with capture times and per-asset places attached.
 fn items_for_ids(
     conn: &rusqlite::Connection,
@@ -2476,6 +2486,7 @@ fn filter_to_picks(
 fn plan_event_clips(
     conn: &rusqlite::Connection,
     eid: i64,
+    budget: i64,
 ) -> Result<Vec<db::HighlightClip>, String> {
     let place: Option<String> = conn
         .query_row("SELECT place FROM events WHERE id = ?1", params![eid], |r| {
@@ -2484,8 +2495,8 @@ fn plan_event_clips(
         .map_err(|e| format!("highlight event: {e}"))?;
     let members = db::event_assets(conn, eid)?;
     let ids_paths: Vec<(i64, String)> = members.into_iter().map(|m| (m.id, m.path)).collect();
-    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
-        let picks = db::curate_picks(conn, &[eid], HIGHLIGHT_CLIP_BUDGET)?;
+    let chosen: Vec<(i64, String)> = if ids_paths.len() > budget as usize {
+        let picks = db::curate_picks(conn, &[eid], budget)?;
         filter_to_picks(&ids_paths, &picks)
     } else {
         ids_paths.clone()
@@ -2499,10 +2510,11 @@ fn plan_event_clips(
 fn plan_album_clips(
     conn: &rusqlite::Connection,
     aid: i64,
+    budget: i64,
 ) -> Result<Vec<db::HighlightClip>, String> {
     let members = db::album_assets(conn, aid)?;
     let ids_paths: Vec<(i64, String)> = members.into_iter().map(|m| (m.id, m.path)).collect();
-    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
+    let chosen: Vec<(i64, String)> = if ids_paths.len() > budget as usize {
         let member_ids: Vec<i64> = ids_paths.iter().map(|(id, _)| *id).collect();
         let json = serde_json::to_string(&member_ids).map_err(|e| e.to_string())?;
         let mut stmt = conn
@@ -2520,13 +2532,12 @@ fn plan_album_clips(
         }
         if eids.is_empty() {
             // Unclustered members: first budget slice, chronological.
-            ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+            ids_paths.into_iter().take(budget as usize).collect()
         } else {
-            let picks =
-                db::curate_picks_constrained(conn, &eids, Some(&member_ids), HIGHLIGHT_CLIP_BUDGET)?;
+            let picks = db::curate_picks_constrained(conn, &eids, Some(&member_ids), budget)?;
             let got = filter_to_picks(&ids_paths, &picks);
             if got.is_empty() {
-                ids_paths.into_iter().take(HIGHLIGHT_CLIP_BUDGET as usize).collect()
+                ids_paths.into_iter().take(budget as usize).collect()
             } else {
                 got
             }
@@ -2556,16 +2567,21 @@ fn emit_export(app: &tauri::AppHandle, job: &str, phase: &str, done: i64, total:
     );
 }
 
-/// Renders story clips to one MP4. Titled stories breathe (90s cap when
-/// chapters exist, else 60s). Engine per-clip progress forwards as the
-/// `rendering` phase; stills land ~1/sec while a heavy video clip holds
-/// `done` still, then it jumps — an honest unit count, not wall time.
+/// Renders story clips to one MP4. Length: an explicit `max_seconds`
+/// (clamped 10–300) or the shipped default (titled stories breathe — 90s
+/// cap when chapters exist, else 60s). `music_path` mixes a user track
+/// under the story (engine degrades to no music on an unreadable file).
+/// Engine per-clip progress forwards as the `rendering` phase; stills land
+/// ~1/sec while a heavy video clip holds `done` still, then it jumps — an
+/// honest unit count, not wall time.
 fn render_story(
     engine_state: &engine::EngineState,
     app: &tauri::AppHandle,
     job: &str,
     clips: &[db::HighlightClip],
     output: &std::path::Path,
+    max_seconds: Option<f64>,
+    music_path: Option<&str>,
 ) -> Result<StoryRender, String> {
     if clips.is_empty() {
         return Err("no photos or videos in this event for a highlight video".into());
@@ -2573,6 +2589,9 @@ fn render_story(
     let total = clips.len() as i64;
     emit_export(app, job, "rendering", 0, total, "Starting memory video…");
     let titled = clips.iter().any(|c| c.title.is_some());
+    let cap = max_seconds
+        .unwrap_or(if titled { 90.0 } else { 60.0 })
+        .clamp(10.0, 300.0);
     let mut on_event = |name: &str, data: &Value| {
         if name == "progress" {
             let done = data.get("done").and_then(Value::as_i64).unwrap_or(0);
@@ -2580,14 +2599,18 @@ fn render_story(
             emit_export(app, job, "rendering", done, n, &format!("Rendering clip {done} of {n}…"));
         }
     };
+    let mut params = json!({
+        "clips": clips,
+        "output": output.to_string_lossy(),
+        "maxSeconds": cap,
+    });
+    if let Some(music) = music_path {
+        params["musicPath"] = json!(music);
+    }
     let reply = engine::call_with_events(
         engine_state,
         "make_highlight",
-        Some(json!({
-            "clips": clips,
-            "output": output.to_string_lossy(),
-            "maxSeconds": if titled { 90 } else { 60 },
-        })),
+        Some(params),
         Duration::from_secs(600),
         &mut on_event,
     )?;
@@ -2615,19 +2638,27 @@ async fn export_highlight(
     paths: Option<Vec<String>>,
     name: Option<String>,
     job: String,
+    max_seconds: Option<f64>,
+    music_path: Option<String>,
 ) -> Result<HighlightResult, String> {
+    if let Some(music) = &music_path {
+        if !std::path::Path::new(music).is_file() {
+            return Err(format!("music file not found: {music}"));
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
         emit_export(&app, &job, "planning", 0, 0, "Planning story…");
+        let budget = highlight_clip_budget(max_seconds);
         let clips: Vec<db::HighlightClip> = match (paths, event_id, album_id) {
             (Some(p), _, _) => p
                 .into_iter()
                 .map(|path| db::HighlightClip { path, title: None })
                 .collect(),
-            (None, Some(eid), _) => plan_event_clips(&conn, eid)?,
-            (None, None, Some(aid)) => plan_album_clips(&conn, aid)?,
+            (None, Some(eid), _) => plan_event_clips(&conn, eid, budget)?,
+            (None, None, Some(aid)) => plan_album_clips(&conn, aid, budget)?,
             (None, None, None) => {
                 return Err("export_highlight needs paths, event_id or album_id".into())
             }
@@ -2649,7 +2680,15 @@ async fn export_highlight(
         }
 
         let engine_state = app.state::<engine::EngineState>();
-        let render = render_story(&engine_state, &app, &job, &clips, &output)?;
+        let render = render_story(
+            &engine_state,
+            &app,
+            &job,
+            &clips,
+            &output,
+            max_seconds,
+            music_path.as_deref(),
+        )?;
         emit_export(&app, &job, "done", 1, 1, "");
 
         Ok(HighlightResult {
@@ -3023,7 +3062,7 @@ fn build_share_pack(
     );
     let video_path = root.join(&video_name);
     let clips = db::highlight_plan(picked);
-    let render = render_story(&engine_state, app, job, &clips, &video_path)?;
+    let render = render_story(&engine_state, app, job, &clips, &video_path, None, None)?;
     bytes += render.bytes;
 
     // 6. Offline gallery.
@@ -4164,6 +4203,18 @@ mod tests {
         assert!(path.exists(), "engine binary missing; run pnpm build:engine");
         unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
         engine::new_state()
+    }
+
+    /// Auto keeps the shipped 16-clip plan; explicit lengths scale the pick
+    /// count (~3s per clip) and clamp so curation stays bounded.
+    #[test]
+    fn highlight_budget_scales_with_explicit_length() {
+        assert_eq!(highlight_clip_budget(None), HIGHLIGHT_CLIP_BUDGET);
+        assert_eq!(highlight_clip_budget(Some(30.0)), 10);
+        assert_eq!(highlight_clip_budget(Some(60.0)), 20);
+        assert_eq!(highlight_clip_budget(Some(120.0)), 40);
+        assert_eq!(highlight_clip_budget(Some(600.0)), 40);
+        assert_eq!(highlight_clip_budget(Some(1.0)), 1);
     }
 
     /// The model-download unpack path: hash mismatch rejects, a good archive

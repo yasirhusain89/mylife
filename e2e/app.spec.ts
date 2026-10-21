@@ -799,6 +799,7 @@ test("highlight video reports photos and clips", async ({ page }) => {
   await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Highlight video" }).click();
+  await page.getByRole("dialog", { name: "Highlight video" }).getByRole("button", { name: "Make video" }).click();
   await expect(page.getByText("3 photos")).toBeVisible();
   await expect(page.getByText("1 video clip")).toBeVisible();
   // Watch opens the exported file in the viewer (web preview: poster hint).
@@ -808,10 +809,24 @@ test("highlight video reports photos and clips", async ({ page }) => {
   await expect(viewer.getByText("Video playback needs the desktop app")).toBeVisible();
 });
 
+test("highlight dialog passes length and music to the export", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Highlight video" }).click();
+  const dialog = page.getByRole("dialog", { name: "Highlight video" });
+  await expect(dialog.getByLabel("Highlight music")).toHaveValue("");
+  await dialog.getByLabel("Highlight length").selectOption("30");
+  await dialog.getByRole("button", { name: "Choose music…" }).click();
+  await expect(dialog.getByLabel("Highlight music")).toHaveValue("/mock/picked-music.mp3");
+  await dialog.getByRole("button", { name: "Make video" }).click();
+  await expect(page.getByText(/Highlight: 30\.0s/)).toBeVisible();
+});
+
 test("highlight export shows determinate progress while rendering", async ({ page }) => {
   await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
   await page.getByRole("button", { name: "Highlight video" }).first().click();
+  await page.getByRole("dialog", { name: "Highlight video" }).getByRole("button", { name: "Make video" }).click();
   // Scoped to the busy card: the completion toast shares role=status.
   const card = page.locator("article.event-card", {
     has: page.getByRole("button", { name: "Exporting…" }),
