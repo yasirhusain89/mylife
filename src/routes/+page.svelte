@@ -2707,6 +2707,45 @@
   let reviewQueue = $state<ReviewCandidate[]>([]);
   let reviewWorking = $state(false);
 
+  const SKIPPED_REVIEW_KEY = "fotoflow-skipped-review";
+
+  function loadSkippedReview(): Set<string> {
+    try {
+      if (typeof localStorage === "undefined") return new Set();
+      const raw = localStorage.getItem(SKIPPED_REVIEW_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(arr)) return new Set();
+      return new Set(arr.filter((k) => typeof k === "string"));
+    } catch {
+      return new Set();
+    }
+  }
+
+  function saveSkippedReview(keys: Set<string>) {
+    try {
+      localStorage.setItem(SKIPPED_REVIEW_KEY, JSON.stringify([...keys]));
+    } catch {
+      /* storage unavailable: skips just don't persist */
+    }
+  }
+
+  let skippedReview = $state(loadSkippedReview());
+
+  /** Face-id pair key, mirroring the dismissal key (stable across re-clusters). */
+  function peopleReviewKey(c: ReviewCandidate): string {
+    const [a, b] = [c.faceA.id, c.faceB.id].sort((x, y) => x - y);
+    return `${c.kind}:${a}:${b}`;
+  }
+
+  /** Skipped pairs sink to the end so they only resurface once everything
+   *  else is reviewed — skipping never loses a pair, it just defers it. */
+  function orderReview(queue: ReviewCandidate[]): ReviewCandidate[] {
+    return [
+      ...queue.filter((c) => !skippedReview.has(peopleReviewKey(c))),
+      ...queue.filter((c) => skippedReview.has(peopleReviewKey(c))),
+    ];
+  }
+
   function reviewBandLabel(d: number): string {
     if (d < 0.6) return "very close";
     if (d < 0.7) return "possible match";
@@ -2730,7 +2769,7 @@
 
   async function loadReview() {
     try {
-      reviewQueue = await reviewCandidates();
+      reviewQueue = orderReview(await reviewCandidates());
       const top = reviewQueue[0];
       if (top) {
         void loadFaceThumb(top.faceA as FaceRow);
@@ -2762,7 +2801,7 @@
         lastAction = { kind: "assign", ids: [top.faceA.id], label: "face", extra: { faceId: top.faceA.id, clusterId: into } };
         toast = "Attached that face to this person";
       }
-      reviewQueue = await reviewCandidates();
+      reviewQueue = orderReview(await reviewCandidates());
       const next = reviewQueue[0];
       if (next) {
         void loadFaceThumb(next.faceA as FaceRow);
@@ -2781,7 +2820,7 @@
     reviewWorking = true;
     try {
       await dismissReviewCandidate(top.faceA.id, top.faceB.id);
-      reviewQueue = await reviewCandidates();
+      reviewQueue = orderReview(await reviewCandidates());
       if (reviewQueue.length === 0) toast = "Review queue clear — nice";
       const next = reviewQueue[0];
       if (next) {
@@ -2796,11 +2835,16 @@
   }
 
   function skipReview() {
-    if (reviewQueue.length < 2) return;
-    reviewQueue = [...reviewQueue.slice(1), reviewQueue[0]];
     const top = reviewQueue[0];
-    void loadFaceThumb(top.faceA as FaceRow);
-    void loadFaceThumb(top.faceB as FaceRow);
+    if (!top) return;
+    skippedReview = new Set(skippedReview).add(peopleReviewKey(top));
+    saveSkippedReview(skippedReview);
+    reviewQueue = orderReview(reviewQueue);
+    const next = reviewQueue[0];
+    if (next) {
+      void loadFaceThumb(next.faceA as FaceRow);
+      void loadFaceThumb(next.faceB as FaceRow);
+    }
   }
 
   function doRenameCluster(cluster: FaceClusterRow) {
@@ -5406,6 +5450,9 @@
             <header>
               <span class="cluster-head">Needs a look ({reviewQueue.length} left)</span>
               <span class="waste">{reviewBandLabel(top.distance)}</span>
+              {#if skippedReview.has(peopleReviewKey(top))}
+                <span class="waste">skipped before — last in line</span>
+              {/if}
             </header>
             <p class="hint">
               {#if top.kind === "merge"}
@@ -5425,7 +5472,7 @@
                 </div>
                 <figcaption><span class="name" title={clusterTitle(top.clusterA)}>{clusterLabel(top.clusterA)}</span></figcaption>
               </figure>
-              <span class="hint" aria-hidden="true">{top.kind === "merge" ? "↔" : "→"}</span>
+              <span class="versus" aria-hidden="true">{top.kind === "merge" ? "↔" : "→"}</span>
               <figure>
                 <div class="thumb small">
                   {#if thumbs[`face:${top.faceB.id}`]}
@@ -5444,9 +5491,7 @@
               <button class="ghost" onclick={() => void rejectReview()} disabled={reviewWorking}>
                 Different people
               </button>
-              {#if reviewQueue.length > 1}
-                <button class="ghost" onclick={skipReview} disabled={reviewWorking}>Skip</button>
-              {/if}
+              <button class="ghost" onclick={skipReview} disabled={reviewWorking}>Skip</button>
             </div>
           </article>
         {/if}
@@ -7001,6 +7046,14 @@
     border: 1px solid transparent;
     border-radius: 8px;
     padding: 0.25rem;
+  }
+  .members .versus {
+    /* Grid items stretch to the full column height (thumb + caption), which
+       parked the arrow at the top; center it on the faces instead. */
+    align-self: center;
+    justify-self: center;
+    font-size: 1.15rem;
+    color: #7b8496;
   }
   .members figure.keeper {
     border-color: #2f6bff;

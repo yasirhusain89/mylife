@@ -303,6 +303,14 @@ test("unassign undo reattaches the face", async ({ page }) => {
   await expect(page.getByText("4 faces")).toBeVisible();
 });
 
+test("skipped review pairs sink with a seen-before marker", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  await expect(page.getByText("Needs a look (")).toBeVisible();
+  await page.getByRole("button", { name: "Skip", exact: true }).click();
+  await expect(page.getByText("skipped before")).toBeVisible();
+});
+
 test("merge undo splits the clusters back apart", async ({ page }) => {
   await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();
