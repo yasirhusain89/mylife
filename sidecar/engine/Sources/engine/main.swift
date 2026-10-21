@@ -668,12 +668,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     let secondsPerClip = 3.0
     let framesPerPhoto = Int(secondsPerPhoto * Double(fps))
 
-    // Chapter title card: dark still with a centered caption, rendered into
-    // its own top-down bitmap first so it takes exactly the same orientation
-    // path as photos below (whatever that is, cards match it by
-    // construction). AppKit text runs in a flipped context so the caption
-    // reads upright in the top-down bitmap. Lives up here because
-    // classification (below) already renders cards.
+    // Title cards share the photo bitmap path (row 0 = frame top, as the
+    // photo probe proves), so text draws in the context's native space:
+    // flipped:false. flipped:true double-flips and stood every caption
+    // on its head (OCR read "18 April 2026" as "asoS linqA 8r").
     func titleCardImage(_ text: String) -> CGImage? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard
@@ -702,7 +700,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             y: (CGFloat(outH) - textSize.height) / 2,
             width: textSize.width, height: textSize.height)
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
         s.draw(in: rect, withAttributes: attrs)
         NSGraphicsContext.restoreGraphicsState()
         return ctx.makeImage()
