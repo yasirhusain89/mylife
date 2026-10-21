@@ -1440,6 +1440,13 @@ test("settings manages search models: remove then re-enable", async ({ page }) =
   await expect(card.getByText("Ready")).toBeVisible();
 });
 
+test("search runs as you type after a pause", async ({ page }) => {
+  await page.getByRole("tab", { name: "Search", exact: true }).click();
+  await page.getByLabel("Describe a photo to find").fill("VID_20261007");
+  // No click: the debounced input path must produce the same ranked view.
+  await expect(page.getByText("2 matches for “VID_20261007”")).toBeVisible();
+});
+
 test("semantic search finds a photo by name fragment", async ({ page }) => {
   await page.getByRole("tab", { name: "Search", exact: true }).click();
   await page.getByLabel("Describe a photo to find").fill("IMG_20261007_185817");

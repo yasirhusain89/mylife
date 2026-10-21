@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (17, include_str!("../migrations/017_event_name_manual.sql")),
     (18, include_str!("../migrations/018_review_decisions.sql")),
     (19, include_str!("../migrations/019_clip_vectors.sql")),
+    (20, include_str!("../migrations/020_embed_attempts.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -4109,6 +4110,10 @@ pub fn similar_to(conn: &Connection, asset_id: i64, model: &str, limit: i64) -> 
 /// L2-normalized at encode time; cosine() stays robust to the rest.
 pub const CLIP_DIM: i64 = 512;
 
+/// A file that fails this many times is dropped from the backfill candidate
+/// set. Retrying a corrupt file forever is what hung the first version.
+pub const EMBED_MAX_ATTEMPTS: i64 = 3;
+
 /// Inserts or replaces one asset's CLIP photo vector. Idempotent: the row is
 /// overwritten, never duplicated.
 pub fn save_clip_vector(conn: &Connection, asset_id: i64, vec: &[f32]) -> Result<(), String> {
@@ -4128,18 +4133,22 @@ pub fn save_clip_vector(conn: &Connection, asset_id: i64, vec: &[f32]) -> Result
 }
 
 /// Readable images with no CLIP vector yet, for the embed backfill.
-/// Failures leave no row, so they are retried on the next pass.
+/// Failures leave no row, so `embed_attempts` bounds the retries — without
+/// it one broken file would be offered on every pass forever.
 pub fn clip_photo_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT a.id, a.path FROM assets a
               WHERE a.kind = 'image' AND a.missing = 0
                 AND NOT EXISTS (SELECT 1 FROM clip_vectors v WHERE v.asset_id = a.id)
+                AND NOT EXISTS (SELECT 1 FROM embed_attempts e
+                                 WHERE e.asset_id = a.id AND e.kind = 'clip-image'
+                                   AND e.attempts >= ?2)
               ORDER BY a.id LIMIT ?1",
         )
         .map_err(|e| format!("prepare clip candidates: {e}"))?;
     let rows = stmt
-        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params![limit, EMBED_MAX_ATTEMPTS], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| format!("query clip candidates: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
@@ -4155,17 +4164,63 @@ pub fn keyframe_candidates(conn: &Connection, limit: i64) -> Result<Vec<(i64, St
             "SELECT a.id, a.path FROM assets a
               WHERE a.kind = 'video' AND a.missing = 0
                 AND NOT EXISTS (SELECT 1 FROM video_keyframes k WHERE k.asset_id = a.id)
+                AND NOT EXISTS (SELECT 1 FROM embed_attempts e
+                                 WHERE e.asset_id = a.id AND e.kind = 'clip-video'
+                                   AND e.attempts >= ?2)
               ORDER BY a.id LIMIT ?1",
         )
         .map_err(|e| format!("prepare keyframe candidates: {e}"))?;
     let rows = stmt
-        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params![limit, EMBED_MAX_ATTEMPTS], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| format!("query keyframe candidates: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(|e| format!("keyframe candidate row: {e}"))?);
     }
     Ok(out)
+}
+
+/// Record the outcome of one semantic-embed attempt: success clears the
+/// counter (the vector row is the success marker), failure increments it so
+/// the candidate query eventually gives up on an undecodable file.
+pub fn record_clip_embed(
+    conn: &Connection,
+    asset_id: i64,
+    kind: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    match error {
+        None => {
+            conn.execute(
+                "DELETE FROM embed_attempts WHERE asset_id = ?1 AND kind = ?2",
+                params![asset_id, kind],
+            )
+            .map_err(|e| format!("clear embed attempt: {e}"))?;
+        }
+        Some(msg) => {
+            conn.execute(
+                "INSERT INTO embed_attempts (asset_id, kind, attempts, last_error, updated_at)
+                 VALUES (?1, ?2, 1, ?3, datetime('now'))
+                 ON CONFLICT(asset_id, kind) DO UPDATE SET
+                   attempts = attempts + 1,
+                   last_error = excluded.last_error,
+                   updated_at = excluded.updated_at",
+                params![asset_id, kind, msg],
+            )
+            .map_err(|e| format!("record embed attempt: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Clears retry counters for semantic search so a user-initiated reindex
+/// retries previously failed files (e.g. after reconnecting a volume).
+pub fn reset_clip_attempts(conn: &Connection) -> Result<usize, String> {
+    conn.execute(
+        "DELETE FROM embed_attempts WHERE kind IN ('clip-image', 'clip-video')",
+        [],
+    )
+    .map_err(|e| format!("reset clip attempts: {e}"))
 }
 
 /// Replaces one video's keyframe rows (t, vector). Re-embedding is
@@ -4735,10 +4790,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 19, "user_version tracks the highest applied migration");
+        assert_eq!(v, 20, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -6695,6 +6750,24 @@ mod tests {
         let cands = keyframe_candidates(&conn, 10).unwrap();
         assert_eq!(cands.len(), 1, "moment-less video returns, got: {cands:?}");
         assert_eq!(cands[0].0, vid);
+
+        // Retry bound: a file that never decodes must stop being offered,
+        // otherwise the backfill loop spins forever on it (the P0 hang).
+        for _ in 0..EMBED_MAX_ATTEMPTS {
+            assert_eq!(keyframe_candidates(&conn, 10).unwrap().len(), 1);
+            record_clip_embed(&conn, vid, "clip-video", Some("decode failed")).unwrap();
+        }
+        assert!(
+            keyframe_candidates(&conn, 10).unwrap().is_empty(),
+            "exhausted video leaves the queue"
+        );
+        assert!(
+            clip_photo_candidates(&conn, 10).unwrap().is_empty(),
+            "photo retry bound is independent of the video one"
+        );
+        // User-initiated reindex retries it again.
+        reset_clip_attempts(&conn).unwrap();
+        assert_eq!(keyframe_candidates(&conn, 10).unwrap().len(), 1, "reset re-offers the file");
     }
 
     #[test]

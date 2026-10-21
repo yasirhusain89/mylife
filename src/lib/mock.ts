@@ -858,9 +858,20 @@ export function onClipDownloadProgress(_cb: (p: ClipDownloadProgress) => void): 
   return Promise.resolve(() => {});
 }
 
+let clipEmbedded = false;
+
 export async function embedClipBackfill(): Promise<{ embedded: number; failed: number }> {
+  if (clipEmbedded) return { embedded: 0, failed: 0 };
+  clipEmbedded = true;
   return { embedded: assets.length, failed: 0 };
 }
+
+export async function reindexClip(): Promise<{ embedded: number; failed: number }> {
+  clipEmbedded = true;
+  return { embedded: assets.length, failed: 0 };
+}
+
+export async function cancelClipBackfill(): Promise<void> {}
 
 /** Scripted semantic search: substring match on seeded file names, ranked by
  *  match position — deterministic for e2e, no vectors involved. */

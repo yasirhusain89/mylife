@@ -10,6 +10,7 @@ use rusqlite::params;
 use serde_json::{Value, json};
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
@@ -1023,11 +1024,24 @@ async fn remove_clip_models(app: tauri::AppHandle) -> Result<ClipModelsStatus, S
     Ok(ClipModelsStatus { ready: false, bytes_total: CLIP_IMAGE_ZIP_BYTES + CLIP_TEXT_ZIP_BYTES, bytes_on_disk: 0 })
 }
 
+/// Cooperative cancel for the semantic embed backfill. Set by the UI; the
+/// loop checks it between files and returns early. Reset at the start of
+/// every backfill run so a stale cancel cannot skip a fresh one.
+static CLIP_CANCEL: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+fn cancel_clip_backfill() {
+    CLIP_CANCEL.store(true, Ordering::SeqCst);
+}
+
 /// Backfills CLIP photo vectors (images) and keyframe moments (videos) for
 /// rows missing them. One engine round-trip per file; a single bad file
-/// never aborts, and failures leave no row so the next pass retries them.
-/// Progress reuses the `embed-progress` channel ({processed, embedded,
-/// failed}) so the Library header shows one honest bar for both encoders.
+/// never aborts, and `embed_attempts` bounds retries so an undecodable file
+/// cannot keep the loop alive.
+///
+/// The DB lock is taken **per file**, never across an engine call: holding
+/// the global connection for a whole-library pass froze every other command
+/// (and, because `search_text` is sync, the main thread too).
 #[tauri::command]
 async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -1038,20 +1052,30 @@ async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, Stri
             return Err("CLIP models are not downloaded yet".into());
         }
         let model_dir = model_dir.to_string_lossy().into_owned();
-        let conn = app.state::<DbState>();
-        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        CLIP_CANCEL.store(false, Ordering::SeqCst);
+        let db = app.state::<DbState>().inner().clone();
         let engine_state = app.state::<engine::EngineState>();
         let (mut embedded, mut failed) = (0i64, 0i64);
         let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
         loop {
-            let batch: Vec<(i64, String)> = db::clip_photo_candidates(&conn, 20)?
-                .into_iter()
-                .filter(|(id, _)| !attempted.contains(id))
-                .collect();
+            if CLIP_CANCEL.load(Ordering::SeqCst) {
+                break;
+            }
+            let batch: Vec<(i64, String)> = {
+                let conn = db.lock().map_err(|_| "database lock poisoned")?;
+                db::clip_photo_candidates(&conn, 20)?
+                    .into_iter()
+                    .filter(|(id, _)| !attempted.contains(id))
+                    .collect()
+            };
             if batch.is_empty() {
                 break;
             }
             for (id, path) in &batch {
+                if CLIP_CANCEL.load(Ordering::SeqCst) {
+                    break;
+                }
                 attempted.insert(*id);
                 let reply = engine::call_blocking(
                     &engine_state,
@@ -1066,12 +1090,21 @@ async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, Stri
                     .and_then(Value::as_str)
                     .and_then(|b| b64_decode(b).ok())
                     .and_then(|bytes| db::bytes_to_floats(&bytes));
-                match vector {
-                    Some(vec) => match db::save_clip_vector(&conn, *id, &vec) {
-                        Ok(()) => embedded += 1,
-                        Err(_) => failed += 1,
-                    },
-                    None => failed += 1,
+                let conn = db.lock().map_err(|_| "database lock poisoned")?;
+                let outcome = match vector {
+                    Some(vec) => db::save_clip_vector(&conn, *id, &vec)
+                        .map_err(|e| format!("save clip vector: {e}")),
+                    None => Err("image encode returned no vector".to_string()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        let _ = db::record_clip_embed(&conn, *id, "clip-image", None);
+                        embedded += 1;
+                    }
+                    Err(e) => {
+                        let _ = db::record_clip_embed(&conn, *id, "clip-image", Some(&e));
+                        failed += 1;
+                    }
                 }
             }
             let _ = app.emit(
@@ -1079,16 +1112,35 @@ async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, Stri
                 json!({ "processed": embedded + failed, "embedded": embedded, "failed": failed }),
             );
         }
+
         loop {
-            let batch = db::keyframe_candidates(&conn, 5)?;
+            if CLIP_CANCEL.load(Ordering::SeqCst) {
+                break;
+            }
+            let batch: Vec<(i64, String)> = {
+                let conn = db.lock().map_err(|_| "database lock poisoned")?;
+                db::keyframe_candidates(&conn, 5)?
+                    .into_iter()
+                    .filter(|(id, _)| !attempted.contains(id))
+                    .collect()
+            };
             if batch.is_empty() {
                 break;
             }
             for (id, path) in &batch {
+                if CLIP_CANCEL.load(Ordering::SeqCst) {
+                    break;
+                }
+                attempted.insert(*id);
                 let reply = engine::call_with_events(
                     &engine_state,
                     "clip_keyframes",
-                    Some(json!({ "path": path, "modelDir": model_dir, "everySeconds": 2.0, "maxFrames": 12 })),
+                    Some(json!({
+                        "path": path,
+                        "modelDir": model_dir,
+                        "everySeconds": 10.0,
+                        "maxFrames": 60,
+                    })),
                     Duration::from_secs(600),
                     &mut |_, _| {},
                 );
@@ -1101,14 +1153,23 @@ async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, Stri
                         Some((t, vec))
                     }).collect()
                 });
-                match frames {
+                let conn = db.lock().map_err(|_| "database lock poisoned")?;
+                let outcome = match frames {
                     Some(frames) if !frames.is_empty() => {
-                        match db::save_keyframes(&conn, *id, &frames) {
-                            Ok(()) => embedded += 1,
-                            Err(_) => failed += 1,
-                        }
+                        db::save_keyframes(&conn, *id, &frames)
+                            .map_err(|e| format!("save keyframes: {e}"))
                     }
-                    _ => failed += 1,
+                    _ => Err("keyframe extraction returned no frames".to_string()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        let _ = db::record_clip_embed(&conn, *id, "clip-video", None);
+                        embedded += 1;
+                    }
+                    Err(e) => {
+                        let _ = db::record_clip_embed(&conn, *id, "clip-video", Some(&e));
+                        failed += 1;
+                    }
                 }
             }
             let _ = app.emit(
@@ -1122,35 +1183,53 @@ async fn embed_clip_backfill(app: tauri::AppHandle) -> Result<EmbedSummary, Stri
     .map_err(|e| format!("clip embed join failed: {e}"))?
 }
 
+/// Clears retry counters, then backfills again. This is the user-facing
+/// "reindex" path: files that gave up (unmounted volume, locked file) get a
+/// fresh set of attempts.
+#[tauri::command]
+async fn reindex_clip(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
+    {
+        let db = app.state::<DbState>();
+        let conn = db.lock().map_err(|_| "database lock poisoned")?;
+        db::reset_clip_attempts(&conn)?;
+    }
+    embed_clip_backfill(app).await
+}
+
 /// Text search over photos and video moments: the query is embedded by the
 /// engine (Swift BPE + CoreML, verified parity with the Python tokenizer),
 /// then cosine-ranked against stored vectors in one pass.
 #[tauri::command]
-fn search_text(
-    conn: tauri::State<'_, DbState>,
+async fn search_text(
     app: tauri::AppHandle,
-    engine_state: tauri::State<'_, engine::EngineState>,
     text: String,
     limit: Option<i64>,
 ) -> Result<Vec<db::SearchHit>, String> {
     if text.trim().is_empty() {
         return Err("empty search text".into());
     }
-    let model_dir = clip_model_dir(&app)?;
-    let reply = engine::call_blocking(
-        &engine_state,
-        "clip_encode_text",
-        Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy() })),
-        Duration::from_secs(120),
-    )?;
-    let query = reply
-        .get("vector")
-        .and_then(Value::as_str)
-        .and_then(|b| b64_decode(b).ok())
-        .and_then(|bytes| db::bytes_to_floats(&bytes))
-        .ok_or("text encode returned no vector")?;
-    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
-    db::search_clip(&conn, &query, limit.unwrap_or(50).clamp(1, 200))
+    tauri::async_runtime::spawn_blocking(move || {
+        let model_dir = clip_model_dir(&app)?;
+        let engine_state = app.state::<engine::EngineState>();
+        let reply = engine::call_blocking(
+            &engine_state,
+            "clip_encode_text",
+            Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy() })),
+            Duration::from_secs(120),
+        )?;
+        let query = reply
+            .get("vector")
+            .and_then(Value::as_str)
+            .and_then(|b| b64_decode(b).ok())
+            .and_then(|bytes| db::bytes_to_floats(&bytes))
+            .ok_or("text encode returned no vector")?;
+        // Lock only for the scan; the engine call above stays outside it.
+        let db = app.state::<DbState>();
+        let conn = db.lock().map_err(|_| "database lock poisoned")?;
+        db::search_clip(&conn, &query, limit.unwrap_or(50).clamp(1, 200))
+    })
+    .await
+    .map_err(|e| format!("clip search join failed: {e}"))?
 }
 
 // MARK: - Post-import pipeline
@@ -3880,6 +3959,8 @@ pub fn run() {
             clip_models_present,
             download_clip_models,
             embed_clip_backfill,
+            reindex_clip,
+            cancel_clip_backfill,
             remove_clip_models,
             search_text,
             scene_tags,

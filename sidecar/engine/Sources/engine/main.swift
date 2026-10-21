@@ -1761,8 +1761,12 @@ func clipEncodeImage(path: String, modelDir: String) throws -> [String: Any] {
 }
 
 /// Evenly spaced keyframe embeddings for video search: decode at `every`
-/// seconds (up to `maxFrames`), embed each with the image tower. Tolerated
-/// (non-exact) seeks keep this fast; timestamps come from the actual frame.
+/// seconds (up to `maxFrames`), embed each with the image tower. The step is
+/// widened when the clip is longer than `every * maxFrames`, so the sample
+/// covers the **whole** duration instead of only the opening seconds (the
+/// first cut indexed 24s of every clip and made the rest unfindable).
+/// Tolerated (non-exact) seeks keep this fast; timestamps come from the
+/// actual frame.
 func clipKeyframes(path: String, modelDir: String, every: Double, maxFrames: Int) throws -> [String: Any] {
     let asset = AVURLAsset(url: URL(fileURLWithPath: path))
     let dur = asset.duration.seconds
@@ -1772,11 +1776,13 @@ func clipKeyframes(path: String, modelDir: String, every: Double, maxFrames: Int
     gen.appliesPreferredTrackTransform = true
     gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
     gen.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+    let target = max(1, maxFrames)
+    let step = max(0.5, max(every, dur / Double(target)))
     var times: [CMTime] = []
     var t = 0.0
-    while t < dur && times.count < max(1, maxFrames) {
+    while t < dur && times.count < target {
         times.append(CMTime(seconds: t, preferredTimescale: 600))
-        t += max(0.5, every)
+        t += step
     }
     var frames: [[String: Any]] = []
     for (i, time) in times.enumerated() {

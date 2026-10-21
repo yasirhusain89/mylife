@@ -93,6 +93,8 @@
     downloadClipModels,
     onClipDownloadProgress,
     embedClipBackfill,
+    reindexClip,
+    cancelClipBackfill,
     removeClipModels,
     searchText as searchClipText,
     type SearchHit,
@@ -1815,9 +1817,24 @@
   let semanticLoading = $state(false);
   let clipReady = $state<boolean | null>(null);
   let clipWorking = $state(false);
+  let clipIndexing = $state(false);
   let clipDl = $state<{ name: string; received: number; total: number } | null>(null);
   let clipModels = $state<ClipModelsStatus | null>(null);
   let confirmRemoveModels = $state(false);
+  let searchAgain = false;
+  let semanticTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Relative confidence split: CLIP cosine has no meaningful absolute zero,
+   *  so "strong" means near the query's own best score, with a floor that
+   *  keeps a nonsense query from looking confident. */
+  function splitHits(rows: SearchHit[]): { strong: SearchHit[]; weak: SearchHit[] } {
+    if (rows.length === 0) return { strong: [], weak: [] };
+    const cutoff = Math.max(0.2, rows[0].score - 0.05);
+    return {
+      strong: rows.filter((r) => r.score >= cutoff),
+      weak: rows.filter((r) => r.score < cutoff),
+    };
+  }
 
   function fmtClock(t: number): string {
     const m = Math.floor(t / 60);
@@ -1866,9 +1883,13 @@
         (await off)();
       }
       if (!clipReady) throw new Error("model download finished but models are not ready");
+      clipDl = null;
       toast = "Search models ready — embedding your library…";
-      const summary = await embedClipBackfill();
-      toast = `Search ready: ${summary.embedded} embedded${summary.failed > 0 ? `, ${summary.failed} failed` : ""}`;
+      clipIndexing = true;
+      const summary = await embedClipBackfill().finally(() => {
+        clipIndexing = false;
+      });
+      toast = `Search ready: ${summary.embedded} indexed${summary.failed > 0 ? `, ${summary.failed} skipped` : ""}`;
       if (semanticQuery.trim() !== "") await runSemanticSearch();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1878,9 +1899,66 @@
     }
   }
 
+  /** User-initiated rebuild: clears the give-up counters so files that failed
+   *  once (ejected volume, locked file) get another chance. */
+  async function reindexSearch() {
+    if (clipIndexing) return;
+    clipIndexing = true;
+    try {
+      const summary = await reindexClip();
+      toast = `Search index rebuilt: ${summary.embedded} indexed${summary.failed > 0 ? `, ${summary.failed} skipped` : ""}`;
+      clipModels = await clipModelsPresent();
+      if (semanticQuery.trim() !== "") await runSemanticSearch();
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      clipIndexing = false;
+    }
+  }
+
+  async function stopSearchIndexing() {
+    try {
+      await cancelClipBackfill();
+    } catch {
+      /* cooperative cancel: the flag is best-effort */
+    }
+  }
+
+  /** Background top-up after an import — the index must not go stale, and a
+   *  failed pass must never surface as an import error. Silent on purpose:
+   *  the import toast is the user's confirmation, and search progress has its
+   *  own status line. */
+  async function indexNewImports() {
+    if (clipIndexing || clipWorking) return;
+    clipIndexing = true;
+    try {
+      await embedClipBackfill();
+    } catch {
+      /* non-fatal: existing vectors still search fine */
+    } finally {
+      clipIndexing = false;
+    }
+  }
+
+  /** Debounced as-you-type: 3+ chars, half a second of quiet. */
+  function scheduleSemanticSearch() {
+    if (semanticTimer) clearTimeout(semanticTimer);
+    const q = semanticQuery.trim();
+    if (q.length < 3) return;
+    semanticTimer = setTimeout(() => {
+      semanticTimer = null;
+      void runSemanticSearch();
+    }, 450);
+  }
+
   async function runSemanticSearch() {
     const q = semanticQuery.trim();
-    if (q === "" || semanticLoading) return;
+    if (q === "") return;
+    if (semanticLoading) {
+      // A newer query arrived mid-flight; rerun for it when this one lands.
+      searchAgain = true;
+      return;
+    }
     semanticLoading = true;
     embedState = null;
     semantic = { query: q, rows: [] };
@@ -1891,18 +1969,14 @@
         semantic = null;
         return;
       }
-      let rows: SearchHit[];
-      try {
-        rows = await searchClipText(q, 50);
-      } catch (e) {
-        // First run on a library embedded before CLIP existed: backfill
-        // once (progress shown), then retry.
-        if (!/no '.*' vector|not downloaded|no clip/i.test(String(e))) throw e;
-        const summary = await embedClipBackfill();
-        rows = await searchClipText(q, 50);
-        toast = `Embedded ${summary.embedded} for search`;
-      }
+      // Always top up the index first: imports after setup would otherwise be
+      // silently unsearchable. Cheap no-op when everything is embedded.
+      const summary = await embedClipBackfill();
+      const rows = await searchClipText(q, 50);
       semantic = { query: q, rows };
+      if (summary.embedded > 0) {
+        toast = `Indexed ${summary.embedded} new item${summary.embedded === 1 ? "" : "s"} for search`;
+      }
       void loadThumbs(rows.map((m) => ({ path: m.path }) as AssetRow));
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
@@ -1910,12 +1984,18 @@
     } finally {
       semanticLoading = false;
       embedState = null;
+      if (searchAgain) {
+        searchAgain = false;
+        if (semanticQuery.trim() !== q) void runSemanticSearch();
+      }
     }
   }
 
-  function openSearchHit(index: number) {
+  function openSearchHit(hit: SearchHit) {
     const s = semantic;
-    if (!s || index < 0 || index >= s.rows.length) return;
+    if (!s) return;
+    const index = s.rows.indexOf(hit);
+    if (index < 0) return;
     const rows: AssetRow[] = s.rows.map((hit) => {
       const row = assets.find((a) => a.id === hit.assetId);
       if (row) return row;
@@ -2183,6 +2263,7 @@
       };
       await refresh();
       void runPipeline();
+      if (clipReady === true) void indexNewImports();
     } catch (e) {
       error = friendlyError(e);
     } finally {
@@ -4250,7 +4331,7 @@
         if (tagging) tagState = p;
       }),
       onEmbedProgress((p) => {
-        if (similarLoading || semanticLoading) embedState = p;
+        if (clipIndexing || similarLoading || semanticLoading) embedState = p;
       }),
       onPipelineProgress((p) => {
         if (pipelining) pipelineState = p;
@@ -4390,6 +4471,7 @@
           placeholder="Describe a photo… (“a red rock desert”)"
           aria-label="Describe a photo to find"
           bind:value={semanticQuery}
+          oninput={scheduleSemanticSearch}
         />
         <button type="submit" disabled={semanticLoading || semanticQuery.trim() === ""}>
           {semanticLoading ? "Searching…" : "Search"}
@@ -4402,19 +4484,30 @@
           >Clear</button>
         {/if}
       </form>
-      {#if semanticLoading}
-        <p class="hint">
+      {#if clipIndexing}
+        <p class="hint" role="status">
           {#if embedState}
-            First run: embedding library for search… {embedState.processed} processed
+            Indexing for search… {embedState.processed} done
+            {#if embedState.failed > 0} · {embedState.failed} skipped{/if}
+          {:else}
+            Preparing the search index…
+          {/if}
+          <button class="tiny ghost" onclick={() => void stopSearchIndexing()}>Stop</button>
+        </p>
+      {:else if semanticLoading}
+        <p class="hint" role="status">
+          {#if embedState}
+            Indexing new items for search… {embedState.processed} done
           {:else}
             Searching photos and video moments…
           {/if}
         </p>
       {:else if semantic}
-        {#if semantic.rows.length}
-          <p class="hint">{semantic.rows.length} match{semantic.rows.length === 1 ? "" : "es"} for “{semantic.query}”</p>
+        {@const parts = splitHits(semantic.rows)}
+        {#if parts.strong.length}
+          <p class="hint">{parts.strong.length} match{parts.strong.length === 1 ? "" : "es"} for “{semantic.query}”</p>
           <div class="members">
-            {#each semantic.rows as m, i (m.assetId)}
+            {#each parts.strong as m (m.assetId)}
               <figure>
                 <div class="thumb small">
                   {#if thumbs[m.path]}
@@ -4428,7 +4521,7 @@
                     type="button"
                     class="tiny ghost"
                     title={m.kind === "video" ? `Jump to ${fmtClock(m.tSeconds ?? 0)}` : "Open photo"}
-                    onclick={() => openSearchHit(i)}
+                    onclick={() => openSearchHit(m)}
                   >
                     <span class="name" title={m.path}>{m.name}</span>
                     {#if m.kind === "video" && m.tSeconds != null}
@@ -4441,8 +4534,48 @@
             {/each}
           </div>
         {:else}
-          <p class="hint">No matches for “{semantic.query}” — try different words.</p>
+          <p class="hint">
+            No strong matches for “{semantic.query}” — nothing in the library is close to that
+            description. {parts.weak.length} weak candidate{parts.weak.length === 1 ? "" : "s"} below.
+          </p>
         {/if}
+        {#if parts.weak.length}
+          <details>
+            <summary class="hint">Show {parts.weak.length} weaker match{parts.weak.length === 1 ? "" : "es"}</summary>
+            <div class="members">
+              {#each parts.weak as m (m.assetId)}
+                <figure>
+                  <div class="thumb small">
+                    {#if thumbs[m.path]}
+                      <img src={thumbs[m.path]} alt={m.name} loading="lazy" />
+                    {:else}
+                      <span class="placeholder">IMG</span>
+                    {/if}
+                  </div>
+                  <figcaption>
+                    <button
+                      type="button"
+                      class="tiny ghost"
+                      title={m.kind === "video" ? `Jump to ${fmtClock(m.tSeconds ?? 0)}` : "Open photo"}
+                      onclick={() => openSearchHit(m)}
+                    >
+                      <span class="name" title={m.path}>{m.name}</span>
+                      {#if m.kind === "video" && m.tSeconds != null}
+                        <span class="meta">▶ {fmtClock(m.tSeconds)}</span>
+                      {/if}
+                      <span class="meta">{Math.round(m.score * 100)}% match</span>
+                    </button>
+                  </figcaption>
+                </figure>
+              {/each}
+            </div>
+          </details>
+        {/if}
+      {:else}
+        <p class="hint">
+          Type 3+ characters to search as you go, or press Search. Try a subject,
+          a place, or a feeling — “waves at dusk”, “birthday cake”.
+        </p>
       {/if}
     {/if}
   </section>
@@ -5952,6 +6085,9 @@
           class="ghost"
           onclick={() => { tab = "search"; void loadClipReady(); }}
         >Open Search</button>
+        <button class="ghost" onclick={() => void reindexSearch()} disabled={clipIndexing}>
+          Refresh index
+        </button>
         {#if !confirmRemoveModels}
           <button class="ghost" onclick={() => (confirmRemoveModels = true)}>Remove models…</button>
         {:else}
@@ -5967,6 +6103,17 @@
       <p class="hint">
         Downloading search models ({clipDl.name}):
         {Math.round(clipDl.received / 1048576)} of {Math.round(clipDl.total / 1048576)} MB…
+      </p>
+    {/if}
+    {#if clipIndexing}
+      <p class="hint" role="status">
+        {#if embedState}
+          Indexing library for search… {embedState.processed} done
+          {#if embedState.failed > 0} · {embedState.failed} skipped{/if}
+        {:else}
+          Preparing the search index…
+        {/if}
+        <button class="tiny ghost" onclick={() => void stopSearchIndexing()}>Stop</button>
       </p>
     {/if}
   </section>

@@ -613,6 +613,14 @@ export function embedClipBackfill(): Promise<{ embedded: number; failed: number 
   return invoke("embed_clip_backfill");
 }
 
+export function reindexClip(): Promise<{ embedded: number; failed: number }> {
+  return invoke("reindex_clip");
+}
+
+export function cancelClipBackfill(): Promise<void> {
+  return invoke("cancel_clip_backfill");
+}
+
 export function removeClipModels(): Promise<ClipModelsStatus> {
   return invoke("remove_clip_models");
 }
