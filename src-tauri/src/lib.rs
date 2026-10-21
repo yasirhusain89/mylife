@@ -906,14 +906,30 @@ fn clip_model_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> 
         .join("clip-vit-b32"))
 }
 
-/// Locates the CLIP BPE vocab. Tauri copies the sidecar binary WITHOUT its
-/// sibling files, so the engine cannot rely on "next to the binary": in dev
-/// it runs from `target/debug/` and in prod from `Contents/MacOS/`, neither
-/// of which carries the vocab. Candidates, first readable file wins:
-/// bundled resource (prod), dev staging dir, engine binary dir (probes).
-fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
+/// Model dir for code paths without an `AppHandle` (`--serve`): the desktop
+/// app writes there, so headless reads the same models. `FOTOFLOW_CLIP_MODEL_DIR`
+/// overrides for tests and non-standard homes.
+pub(crate) fn headless_clip_model_dir() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("FOTOFLOW_CLIP_MODEL_DIR") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or("HOME not set; set FOTOFLOW_CLIP_MODEL_DIR to the CLIP model dir")?;
+    Ok(std::path::PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("com.yasihusain.fotoflow")
+        .join("models")
+        .join("clip-vit-b32"))
+}
+
+/// Every place the BPE vocab can live. Tauri copies the sidecar binary
+/// WITHOUT its sibling files, so "next to the engine" is only a last resort:
+/// in dev the app runs from `target/debug/` and in prod from `Contents/MacOS/`,
+/// neither of which carries the vocab. First readable file wins.
+fn clip_vocab_candidates(resource_dir: Option<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(res) = app.path().resource_dir() {
+    if let Some(res) = resource_dir {
         tried.push(res.join("clip_bpe_vocab.txt.gz"));
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -921,6 +937,8 @@ fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
             // Dev layout: <repo>/src-tauri/target/debug/fotoflow, vocab
             // staged at <repo>/src-tauri/binaries/ by build-engine.sh.
             tried.push(dir.join("../../binaries/clip_bpe_vocab.txt.gz"));
+            // Bundled layout: Contents/MacOS/fotoflow -> Contents/Resources.
+            tried.push(dir.join("../Resources/clip_bpe_vocab.txt.gz"));
         }
     }
     if let Some(engine) = engine::engine_path() {
@@ -928,17 +946,37 @@ fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
             tried.push(dir.join("clip_bpe_vocab.txt.gz"));
         }
     }
-    for cand in &tried {
+    tried
+}
+
+fn find_vocab(candidates: &[std::path::PathBuf]) -> Result<String, String> {
+    for cand in candidates {
         if cand.is_file() {
             return Ok(cand.to_string_lossy().into_owned());
         }
     }
-    let tried = tried
+    let tried = candidates
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!("CLIP vocab missing (tried {tried}). Run: pnpm build:engine"))
+}
+
+fn clip_vocab_path(app: &tauri::AppHandle) -> Result<String, String> {
+    find_vocab(&clip_vocab_candidates(app.path().resource_dir().ok()))
+}
+
+/// Vocab locator for `--serve` (no `AppHandle`/resource dir). The bundled
+/// `../Resources` candidate covers a `--serve` launch from the .app.
+pub(crate) fn headless_clip_vocab_path() -> Result<String, String> {
+    if let Ok(p) = std::env::var("FOTOFLOW_CLIP_VOCAB") {
+        if !std::path::Path::new(&p).is_file() {
+            return Err(format!("FOTOFLOW_CLIP_VOCAB is not a file: {p}"));
+        }
+        return Ok(p);
+    }
+    find_vocab(&clip_vocab_candidates(None))
 }
 
 #[derive(Serialize)]
@@ -1244,36 +1282,49 @@ async fn reindex_clip(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
 
 /// Text search over photos and video moments: the query is embedded by the
 /// engine (Swift BPE + CoreML, verified parity with the Python tokenizer),
-/// then cosine-ranked against stored vectors in one pass.
+/// then cosine-ranked against stored vectors in one pass. Shared by the
+/// Tauri command and the localhost `GET /api/search` route; the engine call
+/// runs outside the DB lock either way.
+pub(crate) fn search_clip_text(
+    db: &DbState,
+    engine_state: &engine::EngineState,
+    text: &str,
+    limit: i64,
+    model_dir: &std::path::Path,
+    vocab_path: &str,
+) -> Result<Vec<db::SearchHit>, String> {
+    if text.trim().is_empty() {
+        return Err("empty search text".into());
+    }
+    let reply = engine::call_blocking(
+        engine_state,
+        "clip_encode_text",
+        Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy(), "vocabPath": vocab_path })),
+        Duration::from_secs(120),
+    )?;
+    let query = reply
+        .get("vector")
+        .and_then(Value::as_str)
+        .and_then(|b| b64_decode(b).ok())
+        .and_then(|bytes| db::bytes_to_floats(&bytes))
+        .ok_or("text encode returned no vector")?;
+    // Lock only for the scan; the engine call above stays outside it.
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    db::search_clip(&conn, &query, limit.clamp(1, 200))
+}
+
 #[tauri::command]
 async fn search_text(
     app: tauri::AppHandle,
     text: String,
     limit: Option<i64>,
 ) -> Result<Vec<db::SearchHit>, String> {
-    if text.trim().is_empty() {
-        return Err("empty search text".into());
-    }
     tauri::async_runtime::spawn_blocking(move || {
         let model_dir = clip_model_dir(&app)?;
         let vocab_path = clip_vocab_path(&app)?;
-        let engine_state = app.state::<engine::EngineState>();
-        let reply = engine::call_blocking(
-            &engine_state,
-            "clip_encode_text",
-            Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy(), "vocabPath": vocab_path })),
-            Duration::from_secs(120),
-        )?;
-        let query = reply
-            .get("vector")
-            .and_then(Value::as_str)
-            .and_then(|b| b64_decode(b).ok())
-            .and_then(|bytes| db::bytes_to_floats(&bytes))
-            .ok_or("text encode returned no vector")?;
-        // Lock only for the scan; the engine call above stays outside it.
-        let db = app.state::<DbState>();
-        let conn = db.lock().map_err(|_| "database lock poisoned")?;
-        db::search_clip(&conn, &query, limit.unwrap_or(50).clamp(1, 200))
+        let db = app.state::<DbState>().inner().clone();
+        let engine_state = app.state::<engine::EngineState>().inner().clone();
+        search_clip_text(&db, &engine_state, &text, limit.unwrap_or(50), &model_dir, &vocab_path)
     })
     .await
     .map_err(|e| format!("clip search join failed: {e}"))?

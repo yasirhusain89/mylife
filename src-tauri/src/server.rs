@@ -2,9 +2,11 @@
 //! served over HTTP so the web UI and Playwright exercise the real
 //! database instead of the in-memory mock.
 //!
-//! Thin slice: reads only (no imports, no engine calls, no progress
-//! streams). Every response reuses the exact structs the Tauri commands
-//! return, so the JSON shapes are identical by construction.
+//! Thin slice: reads plus a small write set (imports, favorites, albums,
+//! tags), no progress streams. `GET /api/search` is the one GET that calls
+//! the engine (CLIP text encode); it answers 503 until models are installed.
+//! Every response reuses the exact structs the Tauri commands return, so the
+//! JSON shapes are identical by construction.
 //!
 //! Bound to 127.0.0.1 only; permissive CORS is safe on loopback and lets
 //! the Vite dev server (another loopback port) call it from a browser.
@@ -87,6 +89,51 @@ fn library_query(p: &LibraryParams, offset: Option<i64>, limit: Option<i64>) -> 
 
 async fn ping() -> Response {
     (cors(), Json(serde_json::json!({ "pong": true }))).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SearchParams {
+    q: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Semantic search over photos and video moments. Same encode + scan as the
+/// Tauri `search_text` command; the engine call runs on a blocking thread and
+/// never holds the DB lock.
+async fn search(State(state): State<ApiState>, Query(p): Query<SearchParams>) -> Response {
+    let text = p.q.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            cors(),
+            Json(serde_json::json!({ "error": "empty search text" })),
+        )
+            .into_response();
+    }
+    let (model_dir, vocab_path) =
+        match (crate::headless_clip_model_dir(), crate::headless_clip_vocab_path()) {
+            (Ok(m), Ok(v)) => (m, v),
+            (Err(e), _) | (_, Err(e)) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    cors(),
+                    Json(serde_json::json!({ "error": e })),
+                )
+                    .into_response()
+            }
+        };
+    let limit = p.limit.unwrap_or(50);
+    let task_state = state.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        crate::search_clip_text(&task_state.db, &task_state.engine, &text, limit, &model_dir, &vocab_path)
+    })
+    .await;
+    match task {
+        Ok(Ok(hits)) => (cors(), Json(hits)).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(format!("clip search join failed: {e}")),
+    }
 }
 
 async fn library_list(State(state): State<ApiState>, Query(p): Query<LibraryParams>) -> Response {
@@ -253,6 +300,7 @@ async fn tags(State(state): State<ApiState>) -> Response {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/ping", get(ping))
+        .route("/api/search", get(search))
         .route("/api/library", get(library_list))
         .route("/api/library/count", get(library_count))
         .route("/api/library/months", get(library_months))
@@ -708,6 +756,121 @@ mod tests {
                 .is_err());
 
             let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// Test engine pointing at the staged sidecar (same convention as the
+    /// import test); `FOTOFLOW_ENGINE_PATH` is also what the vocab resolver
+    /// probes last.
+    fn engine_state() -> crate::engine::EngineState {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let bin = if cfg!(target_arch = "aarch64") {
+            "engine-aarch64-apple-darwin"
+        } else {
+            "engine-x86_64-apple-darwin"
+        };
+        let path = std::path::Path::new(&dir).join("binaries").join(bin);
+        assert!(path.exists(), "engine binary missing; run pnpm build:engine");
+        unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
+        crate::engine::new_state()
+    }
+
+    #[test]
+    fn search_route_validates_and_ranks_stored_vectors() {
+        // The text-encode half needs the CLIP models, a desktop install
+        // artefact: without them the route's 503 path is asserted instead.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {            let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            seed_demo(&conn).unwrap();
+            let state = ApiState {
+                db: Arc::new(Mutex::new(conn)),
+                engine: crate::engine::new_state(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+
+            // Empty query is a client error, never an empty result set.
+            let empty = ureq::get(&format!("{base}/api/search?q=%20")).call();
+            assert!(
+                matches!(empty, Err(ureq::Error::StatusCode(400))),
+                "blank q must be 400, got {empty:?}"
+            );
+
+            let models = crate::headless_clip_model_dir().unwrap_or_default();
+            let vocab = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries")
+                .join("clip_bpe_vocab.txt.gz");
+            if !models.join("CLIPText.mlmodelc").is_dir() || !vocab.is_file() {
+                eprintln!(
+                    "skip search ranking: CLIP models ({}) or vocab ({}) not installed",
+                    models.display(),
+                    vocab.display()
+                );
+                return;
+            }
+            unsafe { std::env::set_var("FOTOFLOW_CLIP_VOCAB", &vocab) };
+
+            // Encode a query, store its vector on one seeded photo and the
+            // negated vector on another: ranking is then unambiguous.
+            let engine = engine_state();
+            let reply = crate::engine::call_blocking(
+                &engine,
+                "clip_encode_text",
+                Some(serde_json::json!({
+                    "text": "a red fox in snow",
+                    "modelDir": models.to_string_lossy(),
+                    "vocabPath": vocab.to_string_lossy(),
+                })),
+                std::time::Duration::from_secs(120),
+            )
+            .expect("clip_encode_text");
+            let query = reply
+                .get("vector")
+                .and_then(|v| v.as_str())
+                .and_then(|b| crate::b64_decode(b).ok())
+                .and_then(|bytes| crate::db::bytes_to_floats(&bytes))
+                .expect("query vector");
+
+            let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            seed_demo(&conn).unwrap();
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM assets ORDER BY id LIMIT 2")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            crate::db::save_clip_vector(&conn, ids[0], &query).unwrap();
+            let negated: Vec<f32> = query.iter().map(|v| -v).collect();
+            crate::db::save_clip_vector(&conn, ids[1], &negated).unwrap();
+            let state = ApiState {
+                db: Arc::new(Mutex::new(conn)),
+                engine: crate::engine::new_state(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let search_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+
+            let hits: Vec<serde_json::Value> = ureq::get(&format!(
+                "{search_base}/api/search?q=a%20red%20fox%20in%20snow&limit=5"
+            ))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+            assert_eq!(hits.len(), 2, "both stored vectors rank, got {hits:?}");
+            assert_eq!(hits[0].get("assetId"), Some(&serde_json::json!(ids[0])));
+            assert!(
+                hits[0].get("score").and_then(|s| s.as_f64()).unwrap_or(0.0) > 0.999,
+                "the exact vector scores 1.0, got {hits:?}"
+            );
+            assert_eq!(hits[1].get("assetId"), Some(&serde_json::json!(ids[1])));
+            assert_eq!(hits[0].get("tSeconds"), Some(&serde_json::Value::Null));
+            assert!(hits[0].get("name").and_then(|n| n.as_str()).is_some());
         });
     }
 }

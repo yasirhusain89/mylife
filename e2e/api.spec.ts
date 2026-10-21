@@ -49,6 +49,15 @@ test("root-assets lists every id under /photos", async ({ page }) => {
   expect(ids).toHaveLength(8);
 });
 
+test("search route rejects a blank query with the error envelope", async ({ page }) => {
+  const r = await page.evaluate(async (base) => {
+    const res = await fetch(`${base}/api/search?q=%20`);
+    return { status: res.status, body: (await res.json()) as { error?: string } };
+  }, API!);
+  expect(r.status).toBe(400);
+  expect(r.body.error).toBe("empty search text");
+});
+
 test("favorite persists and the favorites filter shows it", async ({ page }) => {
   const name = "IMG_20261007_185817.jpg";
   // Reset via HTTP so a stale DB file can't leave the star pre-set, then

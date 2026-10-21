@@ -11,6 +11,7 @@ import type {
   RemoveRootSummary,
   ScanRoot,
   SceneTagCount,
+  SearchHit,
   TagScenesSummary,
   TripRow
 } from "./library";
@@ -162,6 +163,11 @@ export function albumsList(): Promise<AlbumRow[]> {
 
 export function sceneTags(): Promise<SceneTagCount[]> {
   return getJson<SceneTagCount[]>("/api/tags");
+}
+
+/** Semantic search (server-side CLIP text encode; 503 until models exist). */
+export function searchText(text: string, limit = 50): Promise<SearchHit[]> {
+  return getJson<SearchHit[]>("/api/search", { q: text, limit });
 }
 
 /**
