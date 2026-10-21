@@ -779,9 +779,11 @@ pub struct EmbedSummary {
 /// Backfills Vision feature-print vectors for readable images missing one.
 /// One engine round-trip per batch of 100; a single bad file never aborts.
 /// One attempt per asset per invocation: failures stay vector-less (and are
-/// retried on the next call) instead of spinning the loop.
+/// retried on the next call) instead of spinning the loop. Locks per batch,
+/// never across engine calls, so the UI stays usable while a library-wide
+/// backfill runs.
 pub fn run_embed_library(
-    conn: &rusqlite::Connection,
+    db: &DbState,
     engine_state: &engine::EngineState,
     mut on_progress: impl FnMut(i64, i64),
 ) -> Result<EmbedSummary, String> {
@@ -790,10 +792,13 @@ pub fn run_embed_library(
     // file would be retried forever (mirrors run_enrich/run_quality).
     let mut attempted: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
-        let batch: Vec<(i64, String)> = db::embed_candidates(conn, db::VECTOR_MODEL, 100)?
-            .into_iter()
-            .filter(|(id, _)| !attempted.contains(id))
-            .collect();
+        let batch: Vec<(i64, String)> = {
+            let conn = db.lock().map_err(|_| "database lock poisoned")?;
+            db::embed_candidates(&conn, db::VECTOR_MODEL, 100)?
+                .into_iter()
+                .filter(|(id, _)| !attempted.contains(id))
+                .collect()
+        };
         if batch.is_empty() {
             break;
         }
@@ -821,25 +826,32 @@ pub fn run_embed_library(
                 batch.len()
             ));
         }
+        let mut saves: Vec<(i64, Vec<f32>, i64)> = Vec::new();
         for ((id, _), result) in batch.iter().zip(results) {
             attempted.insert(*id);
-            let vector: Option<(Vec<f32>, i64)> =
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    result
-                        .get("vector")
-                        .and_then(Value::as_str)
-                        .and_then(|b| b64_decode(b).ok())
-                        .and_then(|bytes| db::bytes_to_floats(&bytes))
-                        .zip(result.get("dim").and_then(Value::as_i64))
-                } else {
-                    None
-                };
-            match vector {
-                Some((vec, dim)) => match db::save_vector(conn, *id, db::VECTOR_MODEL, dim, &vec) {
+            if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                if let Some((vec, dim)) = result
+                    .get("vector")
+                    .and_then(Value::as_str)
+                    .and_then(|b| b64_decode(b).ok())
+                    .and_then(|bytes| db::bytes_to_floats(&bytes))
+                    .zip(result.get("dim").and_then(Value::as_i64))
+                {
+                    saves.push((*id, vec, dim));
+                    continue;
+                }
+            }
+            failed += 1;
+        }
+        // One short write lock for the whole batch; the engine call above
+        // stays outside it.
+        {
+            let conn = db.lock().map_err(|_| "database lock poisoned")?;
+            for (id, vec, dim) in saves {
+                match db::save_vector(&conn, id, db::VECTOR_MODEL, dim, &vec) {
                     Ok(()) => embedded += 1,
                     Err(_) => failed += 1,
-                },
-                None => failed += 1,
+                }
             }
         }
         on_progress(embedded, failed);
@@ -850,10 +862,9 @@ pub fn run_embed_library(
 #[tauri::command]
 async fn embed_library(app: tauri::AppHandle) -> Result<EmbedSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = app.state::<DbState>();
-        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let db = app.state::<DbState>().inner().clone();
         let engine_state = app.state::<engine::EngineState>();
-        run_embed_library(&conn, &engine_state, |embedded, failed| {
+        run_embed_library(&db, &engine_state, |embedded, failed| {
             let _ = app.emit(
                 "embed-progress",
                 json!({ "processed": embedded + failed, "embedded": embedded, "failed": failed }),
@@ -1328,7 +1339,7 @@ pub fn run_fill_cached_places(conn: &rusqlite::Connection) -> Result<i64, String
 /// Network geocoding stays on its button. A stage-level error counts once
 /// and the chain continues — one bad stage never strands the rest.
 pub fn run_post_import(
-    conn: &rusqlite::Connection,
+    db: &DbState,
     engine_state: &engine::EngineState,
     max_attempts: i64,
     mut on_stage: impl FnMut(PipelineProgress),
@@ -1338,7 +1349,11 @@ pub fn run_post_import(
         on_stage(PipelineProgress { stage: stage.to_string(), processed, total });
     };
 
-    let enriched = match run_enrich(conn, engine_state, max_attempts, |p, _, f, pend| {
+    // One short lock per stage, never one giant hold across the pipeline:
+    // the UI stays usable between stages, and the embed stage itself locks
+    // per batch (see run_embed_library).
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let enriched = match run_enrich(&conn, engine_state, max_attempts, |p, _, f, pend| {
         emit("enrich", p, p + pend);
     }) {
         Ok(s) => {
@@ -1350,8 +1365,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let hashed = match run_hash(conn, engine_state, |h, f, _| {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let hashed = match run_hash(&conn, engine_state, |h, f, _| {
         emit("hash", h + f, 0);
     }) {
         Ok((h, _, _)) => h,
@@ -1360,8 +1377,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let scored = match run_quality(conn, engine_state, 25.0, |s, _| {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let scored = match run_quality(&conn, engine_state, 25.0, |s, _| {
         emit("quality", s, 0);
     }) {
         Ok((s, _)) => s,
@@ -1370,8 +1389,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let near = match run_near_dupes(conn, engine_state, |h, f, _| {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let near = match run_near_dupes(&conn, engine_state, |h, f, _| {
         emit("near", h + f, 0);
     }) {
         Ok((_, _, groups, _)) => groups,
@@ -1380,8 +1401,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let tagged = match run_tag_scenes(conn, engine_state, |p, t, _, _| {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let tagged = match run_tag_scenes(&conn, engine_state, |p, t, _, _| {
         emit("tag", p, t);
     }) {
         Ok(s) => {
@@ -1393,8 +1416,9 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let embedded = match run_embed_library(conn, engine_state, |e, f| {
+    let embedded = match run_embed_library(db, engine_state, |e, f| {
         emit("embed", e + f, 0);
     }) {
         Ok(s) => {
@@ -1412,7 +1436,8 @@ pub fn run_post_import(
     // imports join their people (names + person tags follow in
     // run_cluster_faces). Runs after tag_scenes so scene stamps land first,
     // and before cluster_events so event face counts are fresh.
-    let faces = match run_cluster_faces(conn, engine_state, None, 0.55, |p, t, _| {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let faces = match run_cluster_faces(&conn, engine_state, None, 0.55, |p, t, _| {
         emit("faces", p, t);
     }) {
         Ok(s) => s.faces,
@@ -1421,8 +1446,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let events = match db::cluster_events(conn, 4.0, 500.0) {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let events = match db::cluster_events(&conn, 4.0, 500.0) {
         Ok((e, _)) => {
             emit("events", e, e);
             e
@@ -1432,8 +1459,10 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
-    let places = match run_fill_cached_places(conn) {
+    let conn = db.lock().map_err(|_| "database lock poisoned")?;
+    let places = match run_fill_cached_places(&conn) {
         Ok(n) => {
             emit("places", n, n);
             n
@@ -1443,6 +1472,7 @@ pub fn run_post_import(
             0
         }
     };
+    drop(conn);
 
     emit("done", 0, 0);
     Ok(PipelineSummary { enriched, hashed, scored, near, events, tagged, embedded, faces, places, failed })
@@ -1451,10 +1481,9 @@ pub fn run_post_import(
 #[tauri::command]
 async fn run_post_import_cmd(app: tauri::AppHandle) -> Result<PipelineSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = app.state::<DbState>();
-        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+        let db = app.state::<DbState>().inner().clone();
         let engine_state = app.state::<engine::EngineState>();
-        run_post_import(&conn, &engine_state, 3, |p| {
+        run_post_import(&db, &engine_state, 3, |p| {
             let _ = app.emit("pipeline-progress", p);
         })
     })
@@ -4373,13 +4402,17 @@ mod tests {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
 
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let db_path = dir.join("pipeline.db");
+        let conn = db::open(&db_path).unwrap();
         db::migrate(&conn).unwrap();
         let state = engine_state();
         run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        // The pipeline takes the shared handle (a second connection to the
+        // same file); direct assertions keep using `conn`.
+        let db: DbState = Arc::new(Mutex::new(db::open(&db_path).unwrap()));
 
         let mut stages = Vec::new();
-        let first = run_post_import(&conn, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
+        let first = run_post_import(&db, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
         assert_eq!(first.enriched, 2, "both real PNGs decode");
         assert_eq!(first.hashed, 3, "hashing reads bytes, even corrupt ones");
         assert_eq!(first.near, 1, "identical icons form one near-dupe group; corrupt bows out after retries");
@@ -4411,7 +4444,7 @@ mod tests {
             (events, groups, tags, faces)
         };
         let before = snapshot();
-        let second = run_post_import(&conn, &state, 3, |_| {}).unwrap();
+        let second = run_post_import(&db, &state, 3, |_| {}).unwrap();
         assert_eq!(snapshot(), before, "rerun creates no new rows");
         assert_eq!(second.tagged, 0, "nothing newly tagged on rerun");
     }
@@ -4426,10 +4459,14 @@ mod tests {
         std::fs::copy(&favicon, dir.join("a.png")).unwrap();
         std::fs::copy(&favicon, dir.join("b.png")).unwrap();
 
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let db_path = dir.join("faces.db");
+        let conn = db::open(&db_path).unwrap();
         db::migrate(&conn).unwrap();
         let state = engine_state();
         run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
+        // The pipeline takes the shared handle (a second connection to the
+        // same file); direct assertions keep using `conn`.
+        let db: DbState = Arc::new(Mutex::new(db::open(&db_path).unwrap()));
         // Stored paths, not the temp-dir spellings: the engine may report
         // the canonicalized form (/private/var/…) and faces join on it.
         let stored_path = |name: &str| -> String {
@@ -4499,7 +4536,7 @@ mod tests {
         // Act: the full post-import run (faces stage detects nothing new on
         // the icon, then globally regroups the stored descriptors).
         let mut stages = Vec::new();
-        let summary = run_post_import(&conn, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
+        let summary = run_post_import(&db, &state, 3, |p| stages.push(p.stage.clone())).unwrap();
         assert!(stages.contains(&"faces".to_string()), "faces stage reports progress");
         assert_eq!(summary.faces, 2, "both stored faces regroup");
 
@@ -5065,14 +5102,18 @@ mod tests {
         assert!(dim > 0, "the encoder reports a real dimension, got {dim}");
         assert_eq!(db::cosine(&v1, &v2), 1.0, "identical files embed identically");
 
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let db_path = dir.join("embed.db");
+        let conn = db::open(&db_path).unwrap();
         db::migrate(&conn).unwrap();
         run_import(&conn, &state, dir.to_str().unwrap(), true, |_| {}, |_| {}).unwrap();
-        let summary = run_embed_library(&conn, &state, |_, _| {}).unwrap();
+        // The backfill takes the shared handle (a second connection to the
+        // same file); direct assertions keep using `conn`.
+        let db: DbState = Arc::new(Mutex::new(db::open(&db_path).unwrap()));
+        let summary = run_embed_library(&db, &state, |_, _| {}).unwrap();
         assert_eq!((summary.embedded, summary.failed), (3, 0), "all three images embed");
 
         // A rerun finds no candidates: embedding is idempotent.
-        let again = run_embed_library(&conn, &state, |_, _| {}).unwrap();
+        let again = run_embed_library(&db, &state, |_, _| {}).unwrap();
         assert_eq!((again.embedded, again.failed), (0, 0));
 
         let qid: i64 = conn
