@@ -2050,18 +2050,41 @@ struct StoryRender {
     videos_skipped: i64,
 }
 
+/// Foreground progress for long exports ("export-progress" events). A `total`
+/// of 0 means indeterminate: the phase label is the whole signal. Consumers
+/// filter on `job`, so concurrent exports never cross-talk.
+fn emit_export(app: &tauri::AppHandle, job: &str, phase: &str, done: i64, total: i64, label: &str) {
+    let _ = app.emit(
+        "export-progress",
+        json!({ "job": job, "phase": phase, "done": done, "total": total, "label": label }),
+    );
+}
+
 /// Renders story clips to one MP4. Titled stories breathe (90s cap when
-/// chapters exist, else 60s).
+/// chapters exist, else 60s). Engine per-clip progress forwards as the
+/// `rendering` phase; stills land ~1/sec while a heavy video clip holds
+/// `done` still, then it jumps — an honest unit count, not wall time.
 fn render_story(
     engine_state: &engine::EngineState,
+    app: &tauri::AppHandle,
+    job: &str,
     clips: &[db::HighlightClip],
     output: &std::path::Path,
 ) -> Result<StoryRender, String> {
     if clips.is_empty() {
         return Err("no photos or videos in this event for a highlight video".into());
     }
+    let total = clips.len() as i64;
+    emit_export(app, job, "rendering", 0, total, "Starting memory video…");
     let titled = clips.iter().any(|c| c.title.is_some());
-    let reply = engine::call_blocking(
+    let mut on_event = |name: &str, data: &Value| {
+        if name == "progress" {
+            let done = data.get("done").and_then(Value::as_i64).unwrap_or(0);
+            let n = data.get("total").and_then(Value::as_i64).unwrap_or(total);
+            emit_export(app, job, "rendering", done, n, &format!("Rendering clip {done} of {n}…"));
+        }
+    };
+    let reply = engine::call_with_events(
         engine_state,
         "make_highlight",
         Some(json!({
@@ -2070,6 +2093,7 @@ fn render_story(
             "maxSeconds": if titled { 90 } else { 60 },
         })),
         Duration::from_secs(600),
+        &mut on_event,
     )?;
     Ok(StoryRender {
         bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
@@ -2094,11 +2118,13 @@ async fn export_highlight(
     album_id: Option<i64>,
     paths: Option<Vec<String>>,
     name: Option<String>,
+    job: String,
 ) -> Result<HighlightResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
 
+        emit_export(&app, &job, "planning", 0, 0, "Planning story…");
         let clips: Vec<db::HighlightClip> = match (paths, event_id, album_id) {
             (Some(p), _, _) => p
                 .into_iter()
@@ -2127,7 +2153,8 @@ async fn export_highlight(
         }
 
         let engine_state = app.state::<engine::EngineState>();
-        let render = render_story(&engine_state, &clips, &output)?;
+        let render = render_story(&engine_state, &app, &job, &clips, &output)?;
+        emit_export(&app, &job, "done", 1, 1, "");
 
         Ok(HighlightResult {
             output: output.to_string_lossy().to_string(),
@@ -2182,6 +2209,7 @@ async fn export_share_pack(
     mode: String,
     strip_gps: bool,
     dest_dir: String,
+    job: String,
 ) -> Result<SharePackSummary, String> {
     if mode != "drive" && mode != "compact" {
         return Err(format!("unknown export mode '{mode}'"));
@@ -2190,7 +2218,7 @@ async fn export_share_pack(
         let conn = app.state::<DbState>();
         let conn = conn.lock().map_err(|_| "database lock poisoned")?;
         let engine_state = app.state::<engine::EngineState>();
-        build_share_pack(&conn, &engine_state, event_ids, album_id, name, mode, strip_gps, dest_dir)
+        build_share_pack(&conn, &engine_state, &app, &job, event_ids, album_id, name, mode, strip_gps, dest_dir)
     })
     .await
     .map_err(|e| format!("share pack task join failed: {e}"))?
@@ -2202,6 +2230,8 @@ const SHARE_PACK_BUDGET: i64 = 60;
 fn build_share_pack(
     conn: &rusqlite::Connection,
     engine_state: &engine::EngineState,
+    app: &tauri::AppHandle,
+    job: &str,
     event_ids: Option<Vec<i64>>,
     album_id: Option<i64>,
     name: String,
@@ -2328,15 +2358,22 @@ fn build_share_pack(
     }
 
     // 4. Media: copy, recode, or strip per pick. One bad file skips
-    // instead of aborting the family pack.
+    // instead of aborting the family pack. `packed` counts finished units
+    // (exported + skipped) through a Cell so the `fail` closure and the
+    // success sites can all advance it without borrow fights.
+    let pack_total = picked.len() as i64;
+    let packed = std::cell::Cell::new(0i64);
+    emit_export(app, job, "packing", 0, pack_total, "Starting pack…");
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut exported, mut skipped, mut bytes) = (0i64, 0i64, 0i64);
     let mut first_err: Option<String> = None;
-    let mut fail = |msg: String| {
+    let mut fail = |msg: String, label: &str| {
         skipped += 1;
+        packed.set(packed.get() + 1);
         if first_err.is_none() {
             first_err = Some(msg);
         }
+        emit_export(app, job, "packing", packed.get(), pack_total, label);
     };
     struct PackedFile {
         rel: String,
@@ -2349,21 +2386,21 @@ fn build_share_pack(
         if let Err(e) = std::fs::create_dir_all(&dir) {
             let msg = format!("create {dir:?}: {e}");
             for _ in idxs {
-                fail(msg.clone());
+                fail(msg.clone(), "Creating folders…");
             }
             continue;
         }
         for &i in idxs {
             let it = &picked[i];
             let src = std::path::Path::new(&it.path);
-            if !src.exists() {
-                fail(format!("missing file: {}", it.path));
-                continue;
-            }
             let orig = src
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| format!("photo-{i}"));
+            if !src.exists() {
+                fail(format!("missing file: {}", it.path), &orig);
+                continue;
+            }
             let stem = orig.rsplit_once('.').map(|(s, _)| s).unwrap_or(&orig);
             let orig_ext = orig
                 .rsplit_once('.')
@@ -2381,13 +2418,15 @@ fn build_share_pack(
                     Ok(_) => {
                         bytes += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
                         exported += 1;
+                        packed.set(packed.get() + 1);
+                        emit_export(app, job, "packing", packed.get(), pack_total, &orig);
                         by_folder.entry(folder.clone()).or_default().push(PackedFile {
                             rel: put(dest),
                             caption: orig.clone(),
                             kind: it.kind.clone(),
                         });
                     }
-                    Err(e) => fail(format!("copy {}: {e}", it.path)),
+                    Err(e) => fail(format!("copy {}: {e}", it.path), &orig),
                 }
                 continue;
             }
@@ -2411,13 +2450,15 @@ fn build_share_pack(
                     Ok(reply) => {
                         bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
                         exported += 1;
+                        packed.set(packed.get() + 1);
+                        emit_export(app, job, "packing", packed.get(), pack_total, &orig);
                         by_folder.entry(folder.clone()).or_default().push(PackedFile {
                             rel: put(dest),
                             caption: orig.clone(),
                             kind: it.kind.clone(),
                         });
                     }
-                    Err(e) => fail(format!("strip {}: {e}", it.path)),
+                    Err(e) => fail(format!("strip {}: {e}", it.path), &orig),
                 }
                 continue;
             }
@@ -2436,13 +2477,15 @@ fn build_share_pack(
                     Ok(reply) => {
                         bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
                         exported += 1;
+                        packed.set(packed.get() + 1);
+                        emit_export(app, job, "packing", packed.get(), pack_total, &orig);
                         by_folder.entry(folder.clone()).or_default().push(PackedFile {
                             rel: put(dest),
                             caption: orig.clone(),
                             kind: it.kind.clone(),
                         });
                     }
-                    Err(e) => fail(format!("compress {}: {e}", it.path)),
+                    Err(e) => fail(format!("compress {}: {e}", it.path), &orig),
                 }
             } else {
                 let dest = dir.join(unique_bundle_name(&mut used_names, &exists, &stem, "jpg"));
@@ -2460,13 +2503,15 @@ fn build_share_pack(
                     Ok(reply) => {
                         bytes += reply.get("bytes").and_then(Value::as_i64).unwrap_or(0);
                         exported += 1;
+                        packed.set(packed.get() + 1);
+                        emit_export(app, job, "packing", packed.get(), pack_total, &orig);
                         by_folder.entry(folder.clone()).or_default().push(PackedFile {
                             rel: put(dest),
                             caption: orig.clone(),
                             kind: it.kind.clone(),
                         });
                     }
-                    Err(e) => fail(format!("compress {}: {e}", it.path)),
+                    Err(e) => fail(format!("compress {}: {e}", it.path), &orig),
                 }
             }
         }
@@ -2482,10 +2527,11 @@ fn build_share_pack(
     );
     let video_path = root.join(&video_name);
     let clips = db::highlight_plan(picked);
-    let render = render_story(&engine_state, &clips, &video_path)?;
+    let render = render_story(&engine_state, app, job, &clips, &video_path)?;
     bytes += render.bytes;
 
     // 6. Offline gallery.
+    emit_export(app, job, "gallery", 0, 0, "Writing gallery…");
     let days: Vec<db::ShareDay> = by_folder
         .into_iter()
         .map(|(folder, files)| {
@@ -2505,6 +2551,7 @@ fn build_share_pack(
         .collect();
     let html = db::share_index_html(&title, &video_name, render.seconds, &days, exported);
     std::fs::write(root.join("index.html"), html).map_err(|e| format!("write gallery: {e}"))?;
+    emit_export(app, job, "done", 1, 1, "");
 
     Ok(SharePackSummary {
         dir: root.to_string_lossy().to_string(),

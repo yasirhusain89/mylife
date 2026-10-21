@@ -889,6 +889,11 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         return wroteAny
     }
 
+        // Per-clip progress for the host (same "progress" channel as scan):
+    // photos land ~1/sec; a heavy video clip holds `done` still, then it
+    // jumps — the count is honest about finished units, not wall time.
+    let totalClips = clips.count
+    var doneClips = 0
     for clip in clips {
         if cursor.seconds >= cap { break }
         switch clip {
@@ -932,6 +937,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             }
             cursor = CMTimeAdd(cursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
         }
+        doneClips += 1
+        write(makeEvent(id: requestID, event: "progress", data: [
+            "done": doneClips, "total": totalClips,
+        ]))
     }
     vInput.markAsFinished()
     let sem = DispatchSemaphore(value: 0)

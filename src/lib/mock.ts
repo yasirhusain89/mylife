@@ -43,6 +43,7 @@ import type {
   TagScenesSummary,
   ClusterProgress,
   TrashEntry,
+  ExportProgress,
 } from "./library";
 
 /**
@@ -1026,8 +1027,21 @@ export async function exportSharePack(
   _mode: "drive" | "compact",
   _stripGps: boolean,
   destDir: string,
+  job: string,
 ): Promise<SharePackSummary> {
   const dir = `${destDir}/${eventName}-share`;
+  const total = 8;
+  emitExport({ job, phase: "packing", done: 0, total, label: "Starting pack…" });
+  for (let done = 1; done <= total; done += 1) {
+    await sleep(90);
+    emitExport({ job, phase: "packing", done, total, label: `Packing file ${done} of ${total}…` });
+  }
+  await sleep(90);
+  emitExport({ job, phase: "rendering", done: 2, total: 4, label: "Rendering clip 2 of 4…" });
+  await sleep(90);
+  emitExport({ job, phase: "gallery", done: 0, total: 0, label: "Writing gallery…" });
+  await sleep(60);
+  emitExport({ job, phase: "done", done: 1, total: 1, label: "" });
   return {
     dir,
     video: `${dir}/${eventName}-memory.mp4`,
@@ -1058,8 +1072,37 @@ export function onIngestProgress(_cb: (p: IngestProgress) => void): Promise<() =
 export async function exportHighlight(
   _source: { eventId?: number; albumId?: number },
   _name?: string,
+  job?: string,
 ): Promise<HighlightResult> {
+  const key = job ?? "";
+  const total = 4;
+  emitExport({ job: key, phase: "planning", done: 0, total: 0, label: "Planning story…" });
+  await sleep(90);
+  for (let done = 1; done <= total; done += 1) {
+    emitExport({ job: key, phase: "rendering", done, total, label: `Rendering clip ${done} of ${total}…` });
+    await sleep(90);
+  }
+  emitExport({ job: key, phase: "done", done: 1, total: 1, label: "" });
   return { output: "/tmp/highlight.mp4", bytes: 587_000, seconds: 9, photos: 3, videosIncluded: 1, videosSkipped: 0 };
+}
+
+/** Scripted-export progress fan-out: the mock plays a slow export through
+ * the real `onExportProgress` subscription path so e2e can assert the UI. */
+let exportListener: ((p: ExportProgress) => void) | null = null;
+
+export function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
+  exportListener = cb;
+  return Promise.resolve(() => {
+    if (exportListener === cb) exportListener = null;
+  });
+}
+
+function emitExport(p: ExportProgress): void {
+  exportListener?.(p);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function onHashProgress(_cb: (p: CleanupProgress) => void): Promise<() => void> {

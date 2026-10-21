@@ -36,6 +36,10 @@
     type HighlightResult,
     type SharePackSummary,
     exportSharePack,
+    onExportProgress,
+    type ExportProgress,
+    revealInDir,
+    openExternal,
     ingestCopy,
     onIngestProgress,
     type IngestProgress,
@@ -2176,6 +2180,11 @@
   let highlightBusy = $state<string | null>(null);
   let highlightResult = $state<HighlightResult | null>(null);
   let highlightKey = $state<string | null>(null);
+  // Per-run export job keys echoed back on every "export-progress" event;
+  // exportProgress only ever shows the active run's phase.
+  let highlightJob = $state<string | null>(null);
+  let shareJob = $state<string | null>(null);
+  let exportProgress = $state<ExportProgress | null>(null);
 
   let exportBusy = $state<string | null>(null);
   let exportResult = $state<ExportSummary | null>(null);
@@ -2211,13 +2220,15 @@
     highlightBusy = key;
     highlightResult = null;
     highlightKey = key;
+    highlightJob = `highlight:${key}`;
     try {
-      highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase());
+      highlightResult = await exportHighlight(src, name.replace(/\s+/g, "-").toLowerCase(), highlightJob);
       toast = "Highlight video exported";
     } catch (e) {
       error = friendlyError(e);
     } finally {
       highlightBusy = null;
+      if (exportProgress?.job === highlightJob) exportProgress = null;
     }
   }
 
@@ -2228,6 +2239,24 @@
     if (!highlightResult) return;
     const path = highlightResult.output;
     watchPath(path, path.split("/").pop() ?? path, highlightResult.bytes, highlightResult.seconds);
+  }
+
+  // Finished-export affordances: show the pack folder in Finder, or open its
+  // offline gallery page in the default browser. No-ops outside the app.
+  async function revealExportDir(dir: string) {
+    try {
+      await revealInDir(dir);
+    } catch (e) {
+      error = friendlyError(e);
+    }
+  }
+
+  async function openPackGallery(dir: string) {
+    try {
+      await openExternal(`${dir}/index.html`);
+    } catch (e) {
+      error = friendlyError(e);
+    }
   }
 
   function watchPath(path: string, name: string, sizeBytes: number, duration: number | null) {
@@ -2297,6 +2326,12 @@
     if (!target || shareBusy || dest === "") return;
     shareBusy = true;
     shareResult = null;
+    shareJob =
+      target.kind === "album"
+        ? `share:album:${target.album.id}`
+        : target.kind === "trip"
+          ? `share:trip:${target.trip.id}`
+          : `share:event:${target.event.id}`;
     try {
       const source =
         target.kind === "album"
@@ -2304,13 +2339,14 @@
           : target.kind === "trip"
             ? { eventIds: target.trip.eventIds }
             : { eventIds: [target.event.id] };
-      shareResult = await exportSharePack(source, shareTitle(), shareMode, shareStrip, dest);
+      shareResult = await exportSharePack(source, shareTitle(), shareMode, shareStrip, dest, shareJob);
       const r = shareResult;
       toast = `Packed ${r.exported} photo${r.exported === 1 ? "" : "s"}${r.skipped > 0 ? ` · ${r.skipped} skipped` : ""} to ${r.dir}`;
     } catch (e) {
       error = friendlyError(e);
     } finally {
       shareBusy = false;
+      if (exportProgress?.job === shareJob) exportProgress = null;
     }
   }
 
@@ -3847,6 +3883,11 @@
       }),
       onPipelineProgress((p) => {
         if (pipelining) pipelineState = p;
+      }),
+      onExportProgress((p) => {
+        if (p.job === highlightJob || p.job === shareJob) {
+          exportProgress = p.phase === "done" ? null : p;
+        }
       })
     ];
     void refresh();
@@ -5052,6 +5093,18 @@
                 onclick={() => openSharePack({ kind: "event", event })}
               >Share pack…</button>
             </div>
+            {#if highlightBusy === `e${event.id}` && exportProgress?.job === highlightJob}
+              <p class="hint" role="status">
+                {#if (exportProgress?.total ?? 0) > 0}
+                  <progress
+                    max={exportProgress.total}
+                    value={exportProgress.done}
+                    aria-label={exportProgress.label}
+                  ></progress>
+                {/if}
+                {exportProgress.label || "Exporting…"}
+              </p>
+            {/if}
             {#if highlightResult && highlightKey === `e${event.id}`}
               <p class="hint">
                 Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
@@ -5147,6 +5200,18 @@
               >Share pack…</button>
               <button class="tiny danger" onclick={() => void deleteAlbum(album)}>Delete album</button>
             </div>
+            {#if highlightBusy === `a${album.id}` && exportProgress?.job === highlightJob}
+              <p class="hint" role="status">
+                {#if (exportProgress?.total ?? 0) > 0}
+                  <progress
+                    max={exportProgress.total}
+                    value={exportProgress.done}
+                    aria-label={exportProgress.label}
+                  ></progress>
+                {/if}
+                {exportProgress.label || "Exporting…"}
+              </p>
+            {/if}
             {#if highlightResult && highlightKey === `a${album.id}`}
               <p class="hint">
                 Highlight: {highlightResult.seconds.toFixed(1)}s · {fmtBytes(highlightResult.bytes)}
@@ -5374,6 +5439,16 @@
           <div class="dialog-actions">
             <button class="ghost" onclick={() => (sharePack = null)}>Close</button>
             <button
+              class="ghost"
+              title="Show the pack folder in Finder"
+              onclick={() => void revealExportDir(r.dir)}
+            >Reveal in Finder</button>
+            <button
+              class="ghost"
+              title="Open the offline gallery page in a browser"
+              onclick={() => void openPackGallery(r.dir)}
+            >Open gallery</button>
+            <button
               onclick={() => {
                 const v = r.video;
                 sharePack = null;
@@ -5419,6 +5494,18 @@
               {shareBusy ? "Packing…" : "Build share pack"}
             </button>
           </div>
+          {#if shareBusy && exportProgress?.job === shareJob}
+            <p class="hint" role="status">
+              {#if (exportProgress?.total ?? 0) > 0}
+                <progress
+                  max={exportProgress.total}
+                  value={exportProgress.done}
+                  aria-label={exportProgress.label}
+                ></progress>
+              {/if}
+              {exportProgress.label || "Packing…"}
+            </p>
+          {/if}
         {/if}
       </div>
     </div>

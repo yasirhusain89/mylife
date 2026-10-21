@@ -709,12 +709,31 @@ export type SharePackSummary = {
   bytes: number;
 };
 
+/**
+ * Long-export progress ("export-progress" events). `total` 0 = indeterminate
+ * phase (planning/gallery); otherwise an honest finished-unit count, not wall
+ * time — a heavy video holds `done` still, then it jumps. Consumers filter on
+ * `job`, the caller-chosen per-run key echoed back by the backend.
+ */
+export type ExportProgress = {
+  job: string;
+  phase: "planning" | "packing" | "rendering" | "gallery" | "done";
+  done: number;
+  total: number;
+  label: string;
+};
+
+export function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
+  return listen<ExportProgress>("export-progress", (e) => cb(e.payload));
+}
+
 export function exportSharePack(
   source: { eventIds?: number[]; albumId?: number },
   name: string,
   mode: "drive" | "compact",
   stripGps: boolean,
   destDir: string,
+  job: string,
 ): Promise<SharePackSummary> {
   return invoke("export_share_pack", {
     eventIds: source.eventIds ?? null,
@@ -722,7 +741,8 @@ export function exportSharePack(
     name,
     mode,
     stripGps,
-    destDir
+    destDir,
+    job
   });
 }
 
@@ -767,11 +787,13 @@ export function exportBundle(
 export function exportHighlight(
   source: { eventId?: number; albumId?: number },
   name?: string,
+  job?: string,
 ): Promise<HighlightResult> {
   return invoke("export_highlight", {
     eventId: source.eventId ?? null,
     albumId: source.albumId ?? null,
-    name
+    name,
+    job: job ?? ""
   });
 }
 

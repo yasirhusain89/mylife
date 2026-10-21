@@ -760,6 +760,22 @@ test("highlight video reports photos and clips", async ({ page }) => {
   await expect(viewer.getByText("Video playback needs the desktop app")).toBeVisible();
 });
 
+test("highlight export shows determinate progress while rendering", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Highlight video" }).first().click();
+  // Scoped to the busy card: the completion toast shares role=status.
+  const card = page.locator("article.event-card", {
+    has: page.getByRole("button", { name: "Exporting…" }),
+  });
+  const status = card.getByRole("status");
+  await expect(status).toBeVisible();
+  await expect(status.getByRole("progressbar")).toBeVisible();
+  await expect(status).toContainText(/Rendering clip \d+ of 4/);
+  await expect(page.getByText("3 photos")).toBeVisible();
+  await expect(status).toBeHidden();
+});
+
 test("events render as a month-grouped timeline", async ({ page }) => {
   await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();
@@ -1978,6 +1994,26 @@ test("share pack dialog builds and offers the pack video", async ({ page }) => {
   await dialog.getByRole("button", { name: "▶ Watch pack video" }).click();
   const viewer = page.getByRole("dialog", { name: /-memory\.mp4/ });
   await expect(viewer).toBeVisible();
+});
+
+test("share pack dialog shows packing progress then reveal actions", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: /Share pack for trip/ }).click();
+  const dialog = page.getByRole("dialog", { name: /Share .* with family/ });
+  await dialog.getByRole("button", { name: "Browse…" }).click();
+  await dialog.getByRole("button", { name: "Build share pack" }).click();
+  const status = dialog.getByRole("status");
+  await expect(status).toBeVisible();
+  await expect(status.getByRole("progressbar")).toBeVisible();
+  await expect(status).toContainText(/Packing file \d+ of 8/);
+  await expect(dialog.getByText(/Packed 8 photos/)).toBeVisible();
+  await expect(status).toBeHidden();
+  await expect(dialog.getByRole("button", { name: "Reveal in Finder" })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Open gallery" })).toBeVisible();
+  // Reveal is a no-op over the mock; the result stays put and error-free.
+  await dialog.getByRole("button", { name: "Reveal in Finder" }).click();
+  await expect(dialog.getByText(/Packed 8 photos/)).toBeVisible();
 });
 
 test("space saver compresses dup extras plus blurred", async ({ page }) => {

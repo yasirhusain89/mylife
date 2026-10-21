@@ -1,6 +1,7 @@
 import * as realLibrary from "./library";
 import * as realEngine from "./engine";
 import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import * as mock from "./mock";
 import * as api from "./api";
@@ -128,6 +129,7 @@ export const albumRemove = pick("albumRemove");
 export const exportBundle = pick("exportBundle");
 export const exportSharePack = pick("exportSharePack");
 export const exportHighlight = pick("exportHighlight");
+export const onExportProgress = pick("onExportProgress");
 export const ingestCopy = pick("ingestCopy");
 export const onIngestProgress = pick("onIngestProgress");
 export const addEventPicksToAlbum = pick("addEventPicksToAlbum");
@@ -148,6 +150,20 @@ export const engineSysInfo: typeof realEngine.engineSysInfo = WEB
 export function open(opts?: { title?: string; directory?: boolean; multiple?: boolean }): Promise<string | null> {
   if (WEB) return mock.open(opts);
   return tauriOpen(opts ?? {}) as Promise<string | null>;
+}
+
+/**
+ * Reveal a finished export in Finder / open its gallery page. No-ops in web
+ * and API modes (no real files behind the mock, no opener bridge over HTTP).
+ */
+export async function revealInDir(path: string): Promise<void> {
+  if (WEB || API) return;
+  await revealItemInDir(path);
+}
+
+export async function openExternal(path: string): Promise<void> {
+  if (WEB || API) return;
+  await openPath(path);
 }
 
 /**
@@ -176,6 +192,7 @@ export type {
   EnrichSummary,
   EventAssetRow,
   EventRow,
+  ExportProgress,
   ExportSummary,
   FaceClusterRow,
   FaceRow,
