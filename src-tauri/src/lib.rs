@@ -2042,31 +2042,6 @@ fn plan_album_clips(
     Ok(db::highlight_plan(items_for_ids(conn, &chosen, &places)?))
 }
 
-/// Story clips across several events (a trip): per-stop places chapter cards.
-fn plan_trip_clips(
-    conn: &rusqlite::Connection,
-    eids: &[i64],
-) -> Result<Vec<db::HighlightClip>, String> {
-    let mut ids_paths: Vec<(i64, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for eid in eids {
-        for m in db::event_assets(conn, *eid)? {
-            if seen.insert(m.id) {
-                ids_paths.push((m.id, m.path));
-            }
-        }
-    }
-    let chosen: Vec<(i64, String)> = if ids_paths.len() > HIGHLIGHT_CLIP_BUDGET as usize {
-        let picks = db::curate_picks(conn, eids, HIGHLIGHT_CLIP_BUDGET)?;
-        filter_to_picks(&ids_paths, &picks)
-    } else {
-        ids_paths.clone()
-    };
-    let ids: Vec<i64> = chosen.iter().map(|(id, _)| *id).collect();
-    let places = db::places_for_ids(conn, &ids)?;
-    Ok(db::highlight_plan(items_for_ids(conn, &chosen, &places)?))
-}
-
 struct StoryRender {
     bytes: i64,
     seconds: f64,
@@ -3591,6 +3566,7 @@ pub fn run() {
             album_remove,
             add_event_picks_to_album,
             export_highlight,
+            export_share_pack,
             export_bundle,
             ingest_copy,
             library_list,
@@ -3636,6 +3612,63 @@ mod tests {
         assert!(path.exists(), "engine binary missing; run pnpm build:engine");
         unsafe { std::env::set_var("FOTOFLOW_ENGINE_PATH", &path) };
         engine::new_state()
+    }
+
+    /// Regression guard for the Stage-4 outage ("Command export_share_pack
+    /// not found"): every #[tauri::command] must be registered in the
+    /// invoke_handler! list, otherwise the UI calls a command the binary
+    /// silently drops (dead-code warning only — no compile error).
+    #[test]
+    fn all_tauri_commands_are_registered() {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let src = std::fs::read_to_string(std::path::Path::new(&dir).join("src").join("lib.rs"))
+            .unwrap();
+        let mut commands = Vec::new();
+        let mut lines = src.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() == "#[tauri::command]" {
+                for next in lines.by_ref() {
+                    let t = next.trim();
+                    if t.is_empty() || t.starts_with("///") {
+                        continue;
+                    }
+                    if let Some(rest) = t.strip_prefix("async fn ").or_else(|| t.strip_prefix("fn ")) {
+                        let name: String =
+                            rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        if !name.is_empty() {
+                            commands.push(name);
+                        }
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        assert!(!commands.is_empty(), "parser found no commands");
+        let after = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .expect("generate_handler! list present");
+        let mut depth = 1i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            if c == '[' {
+                depth += 1;
+            } else if c == ']' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        let handler = &after[..end];
+        for cmd in &commands {
+            assert!(
+                handler.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == cmd),
+                "tauri command '{cmd}' is not registered in invoke_handler!"
+            );
+        }
     }
 
     #[test]
