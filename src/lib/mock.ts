@@ -44,6 +44,7 @@ import type {
   ClusterProgress,
   TrashEntry,
   ExportProgress,
+  ReviewCandidate,
 } from "./library";
 
 /**
@@ -609,6 +610,7 @@ export async function runFaceClustering(): Promise<{
     clusters = [];
     facesByCluster = new Map();
     clusterMembers = new Map();
+    reviewDismissed = new Set();
     return { images: 0, faces: 0, clusters: 0, missing: 0 };
   }
 
@@ -778,6 +780,59 @@ export async function facesCount(): Promise<number> {
   let total = 0;
   for (const list of facesByCluster.values()) total += list.length;
   return total;
+}
+
+// Dismissed review bridge pairs, keyed "minId-maxId".
+let reviewDismissed = new Set<string>();
+
+/** Scripted review queue: the two seeded clusters read as one merge
+ *  candidate; each detached face reads as an assign candidate. Accepting
+ *  merges/assigns through the real mock commands, so the queue drains the
+ *  same way the backend one does. */
+export async function reviewCandidates(): Promise<ReviewCandidate[]> {
+  const out: ReviewCandidate[] = [];
+  const live = clusters.filter((c) => (facesByCluster.get(c.id) ?? []).length > 0);
+  if (live.length >= 2) {
+    const [a, b] = live;
+    const fa = facesByCluster.get(a.id)![0];
+    const fb = facesByCluster.get(b.id)![0];
+    const key = `${Math.min(fa.id, fb.id)}-${Math.max(fa.id, fb.id)}`;
+    if (!reviewDismissed.has(key)) {
+      out.push({
+        kind: "merge",
+        distance: 0.62,
+        clusterA: { id: a.id, name: a.name, faceCount: a.faceCount },
+        clusterB: { id: b.id, name: b.name, faceCount: b.faceCount },
+        faceA: { id: fa.id, path: fa.path, x: fa.x, y: fa.y, width: fa.width, height: fa.height },
+        faceB: { id: fb.id, path: fb.path, x: fb.x, y: fb.y, width: fb.width, height: fb.height },
+        assignTo: null,
+      });
+    }
+  }
+  const target = live[0];
+  if (target) {
+    for (const f of unassignedFaces.values()) {
+      const key = `${Math.min(f.id, (facesByCluster.get(target.id) ?? [])[0]?.id ?? 0)}-${Math.max(f.id, (facesByCluster.get(target.id) ?? [])[0]?.id ?? 0)}`;
+      if (reviewDismissed.has(key)) continue;
+      const tb = (facesByCluster.get(target.id) ?? [])[0];
+      out.push({
+        kind: "assign",
+        distance: 0.58,
+        clusterA: { id: null, name: null, faceCount: 1 },
+        clusterB: { id: target.id, name: target.name, faceCount: target.faceCount },
+        faceA: { id: f.id, path: f.path, x: f.x, y: f.y, width: f.width, height: f.height },
+        faceB: tb
+          ? { id: tb.id, path: tb.path, x: tb.x, y: tb.y, width: tb.width, height: tb.height }
+          : { id: f.id, path: f.path, x: f.x, y: f.y, width: f.width, height: f.height },
+        assignTo: target.id,
+      });
+    }
+  }
+  return out.sort((x, y) => x.distance - y.distance);
+}
+
+export async function dismissReviewCandidate(faceA: number, faceB: number): Promise<void> {
+  reviewDismissed.add(`${Math.min(faceA, faceB)}-${Math.max(faceA, faceB)}`);
 }
 
 let sightings: PetSighting[] = [];

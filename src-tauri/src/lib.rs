@@ -1481,6 +1481,27 @@ fn faces_count(conn: tauri::State<'_, DbState>) -> Result<i64, String> {
     db::faces_count(&conn)
 }
 
+/// Ranked People-review queue: near-duplicate cluster pairs and lone faces
+/// near a cluster, closest first. Read-only; accepting uses merge_clusters /
+/// assign_face, rejecting uses dismiss_review_candidate.
+#[tauri::command]
+fn review_candidates(conn: tauri::State<'_, DbState>) -> Result<Vec<db::ReviewCandidate>, String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::review_candidates(&conn)
+}
+
+/// Records a "different people" verdict for a candidate bridge pair so it
+/// never resurfaces in the review queue.
+#[tauri::command]
+fn dismiss_review_candidate(
+    conn: tauri::State<'_, DbState>,
+    face_a: i64,
+    face_b: i64,
+) -> Result<(), String> {
+    let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+    db::record_review_decision(&conn, face_a, face_b, "separate")
+}
+
 // MARK: - Pet detection
 
 #[derive(Serialize, Clone)]
@@ -3590,6 +3611,8 @@ pub fn run() {
             clusters_list,
             faces_in_cluster,
             faces_count,
+            review_candidates,
+            dismiss_review_candidate,
             rename_cluster,
             merge_clusters,
             restore_cluster,

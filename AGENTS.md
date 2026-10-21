@@ -201,10 +201,11 @@ all green → commit → push → restart `pnpm tauri dev`.
 
 - Camera-audio mixing: `ExtAudioFile` path verified — next is prototype
   `makeHighlight` with audio `AVAssetWriterInput` fed from `ExtAudioFile` PCM.
-- People review queue: 37 detached faces with descriptors (re-run re-absorbs
-  them — confirm none was a deliberate detach first), 0 AM×T2 cross-name
-  pairs under 0.60, 2 singleton near-misses at named clusters (face 97→AM
-  0.615, face 4→T2 0.644) to adjudicate by eye, 179 faceless images awaiting
-  detection. Threshold stays 0.55 (0.60 chain-fuses AM+T2+212 unnamed into
-  one 233-group — measured 2026-10-21).
+- People review queue — shipped one-by-one in the People tab: near-duplicate
+  cluster pairs + lone faces in the 0.55–0.75 bridge band, dismissals in
+  `review_decisions` (face-id keyed, stable across re-clusters), Undo on
+  accepts. Live state 2026-10-21: 0 detached faces (a re-run re-absorbed
+  the 37), closest cross-name T2↔F3 0.692, 179 faceless images still awaiting
+  detection via the existing Check-faces flow. Threshold stays 0.55
+  (0.60 chain-fuses AM+T2+212 unnamed into one 233-group — measured).
 - Map pan/zoom smoothness check (needs human frame review).

@@ -571,6 +571,42 @@ export function facesCount(): Promise<number> {
   return invoke("faces_count");
 }
 
+export type ReviewClusterRef = {
+  id: number | null;
+  name: string | null;
+  faceCount: number;
+};
+
+export type ReviewFaceRef = {
+  id: number;
+  path: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+/** One People-review item. `merge`: two clusters that may be one person;
+ *  `assign`: a lone face that may belong to `assignTo`. `faceB` is always
+ *  the target side. */
+export type ReviewCandidate = {
+  kind: "merge" | "assign";
+  distance: number;
+  clusterA: ReviewClusterRef;
+  clusterB: ReviewClusterRef;
+  faceA: ReviewFaceRef;
+  faceB: ReviewFaceRef;
+  assignTo: number | null;
+};
+
+export function reviewCandidates(): Promise<ReviewCandidate[]> {
+  return invoke("review_candidates");
+}
+
+export function dismissReviewCandidate(faceA: number, faceB: number): Promise<void> {
+  return invoke("dismiss_review_candidate", { faceA, faceB });
+}
+
 export type EventRow = {
   id: number;
   name: string;

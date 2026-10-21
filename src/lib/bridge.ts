@@ -110,6 +110,8 @@ export const onPetError = pick("onPetError");
 export const sightingsList = pick("sightingsList");
 export const facesInCluster = pick("facesInCluster");
 export const facesCount = pick("facesCount");
+export const reviewCandidates = pick("reviewCandidates");
+export const dismissReviewCandidate = pick("dismissReviewCandidate");
 export const clusterEvents = pick("clusterEvents");
 export const eventsList = pickRead("eventsList");
 export const eventAssets = pick("eventAssets");
@@ -220,6 +222,9 @@ export type {
   SharePackSummary,
   RemoveRootSummary,
   RestoreSummary,
+  ReviewCandidate,
+  ReviewClusterRef,
+  ReviewFaceRef,
   SimilarHit,
   TagProgress,
   TagScenesSummary

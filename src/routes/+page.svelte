@@ -86,6 +86,9 @@
     onClusterProgress,
     runFaceClustering,
     verifyLibrary,
+    reviewCandidates,
+    dismissReviewCandidate,
+    type ReviewCandidate,
     type AssetRow,
     type CleanupProgress,
     type CleanupStats,
@@ -980,7 +983,7 @@
   // Session-only undo: the last destructive action (trash/flag/merge/
   // unassign). Replaced by the next destructive action, never persisted.
   type UndoAction = {
-    kind: "trash" | "flag" | "merge" | "unassign";
+    kind: "trash" | "flag" | "merge" | "unassign" | "assign";
     ids: number[];
     label: string;
     extra?: {
@@ -2462,11 +2465,114 @@
       people = await clustersList();
       void loadClusterFaces();
       void loadPersonOptions();
+      void loadReview();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
       peopleLoading = false;
     }
+  }
+
+  // People review queue: near-duplicate groups and lone faces, one at a time.
+  // Accepting merges/assigns through the existing commands (so Undo keeps
+  // working); rejecting records the bridge pair so it never resurfaces.
+  let reviewQueue = $state<ReviewCandidate[]>([]);
+  let reviewWorking = $state(false);
+
+  function reviewBandLabel(d: number): string {
+    if (d < 0.6) return "very close";
+    if (d < 0.7) return "possible match";
+    return "long shot";
+  }
+
+  function clusterLabel(c: { id: number | null; name: string | null; faceCount: number }): string {
+    if (c.name) return c.name;
+    if (c.id == null) return "This face";
+    // Deliberately not `Cluster ${id}`: bare cluster ids collide with the
+    // People cards' own labels under substring text selectors. The stable
+    // id rides along as a tooltip; counts disambiguate on sight.
+    return `Untagged group of ${c.faceCount}`;
+  }
+
+  function clusterTitle(c: { id: number | null; name: string | null; faceCount: number }): string {
+    if (c.name) return c.name;
+    if (c.id == null) return "Detached face";
+    return `Cluster ${c.id}`;
+  }
+
+  async function loadReview() {
+    try {
+      reviewQueue = await reviewCandidates();
+      const top = reviewQueue[0];
+      if (top) {
+        void loadFaceThumb(top.faceA as FaceRow);
+        void loadFaceThumb(top.faceB as FaceRow);
+      }
+    } catch {
+      reviewQueue = [];
+    }
+  }
+
+  async function acceptReview() {
+    const top = reviewQueue[0];
+    if (!top || reviewWorking) return;
+    reviewWorking = true;
+    try {
+      if (top.kind === "merge") {
+        const a = top.clusterA.id;
+        const b = top.clusterB.id;
+        if (a == null || b == null) throw new Error("review candidate is missing a cluster");
+        const into = await mergeIdSet([a, b].sort((x, y) => x - y));
+        toast = `Merged into one person (${people.find((c) => c.id === into)?.faceCount ?? 0} faces)`;
+      } else {
+        const into = top.assignTo;
+        if (into == null) throw new Error("review candidate is missing its target");
+        await assignFace(top.faceA.id, into);
+        people = await clustersList();
+        void loadClusterFaces();
+        void loadPersonOptions();
+        lastAction = { kind: "assign", ids: [top.faceA.id], label: "face", extra: { faceId: top.faceA.id, clusterId: into } };
+        toast = "Attached that face to this person";
+      }
+      reviewQueue = await reviewCandidates();
+      const next = reviewQueue[0];
+      if (next) {
+        void loadFaceThumb(next.faceA as FaceRow);
+        void loadFaceThumb(next.faceB as FaceRow);
+      }
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      reviewWorking = false;
+    }
+  }
+
+  async function rejectReview() {
+    const top = reviewQueue[0];
+    if (!top || reviewWorking) return;
+    reviewWorking = true;
+    try {
+      await dismissReviewCandidate(top.faceA.id, top.faceB.id);
+      reviewQueue = await reviewCandidates();
+      if (reviewQueue.length === 0) toast = "Review queue clear — nice";
+      const next = reviewQueue[0];
+      if (next) {
+        void loadFaceThumb(next.faceA as FaceRow);
+        void loadFaceThumb(next.faceB as FaceRow);
+      }
+    } catch (e) {
+      error = String(e).replace(/^Error: /, "");
+    } finally {
+      reviewWorking = false;
+    }
+  }
+
+  function skipReview() {
+    if (reviewQueue.length < 2) return;
+    reviewQueue = [...reviewQueue.slice(1), reviewQueue[0]];
+    const top = reviewQueue[0];
+    void loadFaceThumb(top.faceA as FaceRow);
+    void loadFaceThumb(top.faceB as FaceRow);
   }
 
   function doRenameCluster(cluster: FaceClusterRow) {
@@ -2495,6 +2601,7 @@
         const into = await mergeIdSet(ids);
         toast = `Merged ${ids.length} clusters named “${name.trim()}” (${people.find((c) => c.id === into)?.faceCount ?? 0} faces) — undo splits them back`;
       }
+      void loadReview();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     }
@@ -2567,6 +2674,7 @@
     people = await clustersList();
     void loadClusterFaces();
     void loadPersonOptions();
+    void loadReview();
     lastAction = { kind: "merge", ids: ids.slice(1), label: `merge into #${into}`, extra: { into, snapshots } };
     return into;
   }
@@ -2593,6 +2701,7 @@
       const shown = openClusterId === clusterId ? all : all.slice(0, 8);
       peopleFaces = { ...peopleFaces, [clusterId]: shown };
       void loadPersonOptions();
+      void loadReview();
       lastAction = { kind: "unassign", ids: [faceId], label: "face", extra: { faceId, clusterId } };
       toast = "Removed that face from this person";
     } catch (e) {
@@ -3137,6 +3246,7 @@
       people = await clustersList();
       void loadClusterFaces();
       void loadPersonOptions();
+      void loadReview();
     } catch (e) {
       error = String(e).replace(/^Error: /, "");
     } finally {
@@ -3853,6 +3963,18 @@
         peopleFaces = { ...peopleFaces, [clusterId]: shown };
         void loadPersonOptions();
         toast = "Reattached that face — undo complete";
+      } else if (action.kind === "assign") {
+        const faceId = action.extra?.faceId;
+        if (faceId == null) {
+          error = "Nothing to undo";
+          return;
+        }
+        await unassignFace(faceId);
+        people = await clustersList();
+        void loadClusterFaces();
+        void loadPersonOptions();
+        void loadReview();
+        toast = "Detached that face again — undo complete";
       } else {
         for (const snap of action.extra?.snapshots ?? []) {
           await restoreCluster(snap.name, snap.faceIds);
@@ -4903,6 +5025,56 @@
       {/if}
       {#if people.length}
         <p class="hint">Tick two clusters to merge them · click a name to tag it · ✕ removes a face that doesn't belong.</p>
+        {#if reviewQueue.length > 0}
+          {@const top = reviewQueue[0]}
+          <article class="group" aria-label="People review queue">
+            <header>
+              <span class="cluster-head">Needs a look ({reviewQueue.length} left)</span>
+              <span class="waste">{reviewBandLabel(top.distance)}</span>
+            </header>
+            <p class="hint">
+              {#if top.kind === "merge"}
+                One person split in two? {clusterLabel(top.clusterA)} ↔ {clusterLabel(top.clusterB)}
+              {:else}
+                Does this face belong to {clusterLabel(top.clusterB)}?
+              {/if}
+            </p>
+            <div class="members">
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[`face:${top.faceA.id}`]}
+                    <img src={thumbs[`face:${top.faceA.id}`]} alt="face from {clusterLabel(top.clusterA)}" loading="lazy" />
+                  {:else}
+                    <span class="placeholder">…</span>
+                  {/if}
+                </div>
+                <figcaption><span class="name" title={clusterTitle(top.clusterA)}>{clusterLabel(top.clusterA)}</span></figcaption>
+              </figure>
+              <span class="hint" aria-hidden="true">{top.kind === "merge" ? "↔" : "→"}</span>
+              <figure>
+                <div class="thumb small">
+                  {#if thumbs[`face:${top.faceB.id}`]}
+                    <img src={thumbs[`face:${top.faceB.id}`]} alt="face from {clusterTitle(top.clusterB)}" loading="lazy" />
+                  {:else}
+                    <span class="placeholder">…</span>
+                  {/if}
+                </div>
+                <figcaption><span class="name" title={clusterTitle(top.clusterB)}>{clusterLabel(top.clusterB)}</span></figcaption>
+              </figure>
+            </div>
+            <div class="row-actions">
+              <button onclick={() => void acceptReview()} disabled={reviewWorking}>
+                {top.kind === "merge" ? "Same person — merge" : `Yes — attach to ${clusterLabel(top.clusterB)}`}
+              </button>
+              <button class="ghost" onclick={() => void rejectReview()} disabled={reviewWorking}>
+                Different people
+              </button>
+              {#if reviewQueue.length > 1}
+                <button class="ghost" onclick={skipReview} disabled={reviewWorking}>Skip</button>
+              {/if}
+            </div>
+          </article>
+        {/if}
         {#if mergeSelect.size >= 2}
           <div class="enrich batch-bar">
             <span class="hint">{mergeSelect.size} selected</span>

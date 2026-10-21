@@ -1123,6 +1123,31 @@ test("merging clusters adds counts and drops the loser", async ({ page }) => {
   await expect(page.getByText(/Merged into one person \(6 faces\)/)).toBeVisible();
 });
 
+test("people review queue adjudicates one candidate at a time", async ({ page }) => {
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await page.getByRole("button", { name: "Find people in library" }).click();
+  // The two seeded clusters read as one merge candidate.
+  await expect(page.getByText("Needs a look (1 left)")).toBeVisible();
+  await expect(page.getByText(/One person split in two/)).toBeVisible();
+  await page.getByRole("button", { name: "Same person — merge" }).click();
+  await expect(page.getByText(/Merged into one person \(6 faces\)/)).toBeVisible();
+  await expect(page.getByText("Needs a look")).toBeHidden();
+  // Detaching a face surfaces an assign candidate for the same cluster.
+  await page.getByRole("button", { name: "Show photos" }).first().click();
+  await page.getByRole("button", { name: "Remove this face from Cluster 1" }).first().click();
+  await expect(page.getByText("Needs a look (1 left)")).toBeVisible();
+  await expect(page.getByText(/Does this face belong to/)).toBeVisible();
+  await page.getByRole("button", { name: /Yes — attach to Untagged group/ }).click();
+  await expect(page.getByText("Attached that face to this person")).toBeVisible();
+  await expect(page.getByText("Needs a look")).toBeHidden();
+  // Rejecting records the verdict instead of merging: counts stand.
+  await page.getByRole("button", { name: "Remove this face from Cluster 1" }).first().click();
+  await expect(page.getByText("Needs a look (1 left)")).toBeVisible();
+  await page.getByRole("button", { name: "Different people" }).click();
+  await expect(page.getByText("Review queue clear")).toBeVisible();
+  await expect(page.getByText("5 faces")).toBeVisible();
+});
+
 test("removing a face that doesn't belong shrinks the cluster", async ({ page }) => {
   await page.getByRole("tab", { name: "People", exact: true }).click();
   await page.getByRole("button", { name: "Find people in library" }).click();

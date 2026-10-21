@@ -24,6 +24,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (15, include_str!("../migrations/015_exposure.sql")),
     (16, include_str!("../migrations/016_trash_log.sql")),
     (17, include_str!("../migrations/017_event_name_manual.sql")),
+    (18, include_str!("../migrations/018_review_decisions.sql")),
 ];
 
 pub fn now() -> i64 {
@@ -1093,6 +1094,249 @@ pub fn restore_cluster(
     }
     tx.commit().map_err(|e| format!("restore commit: {e}"))?;
     Ok(nid)
+}
+
+// MARK: - People review queue (near-duplicate adjudication)
+
+/// Cluster pairs merge on ANY pairwise link below the union-find threshold,
+/// so every surviving pair sits at or above it. Candidates are pairs whose
+/// closest faces land inside this band: close enough to be the same person,
+/// far enough that the automatic pass split them. Cap keeps the queue
+/// one-screen reviewable instead of an all-pairs dump.
+pub const REVIEW_BAND_MIN: f64 = 0.55;
+pub const REVIEW_BAND_MAX: f64 = 0.75;
+pub const REVIEW_CANDIDATE_CAP: usize = 50;
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCluster {
+    pub id: Option<i64>,
+    pub name: Option<String>,
+    pub face_count: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewFace {
+    pub id: i64,
+    pub path: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One adjudication item. `merge`: two live clusters that may be one person
+/// (accept fuses via merge_clusters). `assign`: a lone face — a singleton
+/// cluster or a detached face — that may belong to the target cluster
+/// (accept attaches via assign_face). `face_b` always shows the target side.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCandidate {
+    pub kind: String,
+    pub distance: f64,
+    pub cluster_a: ReviewCluster,
+    pub cluster_b: ReviewCluster,
+    pub face_a: ReviewFace,
+    pub face_b: ReviewFace,
+    pub assign_to: Option<i64>,
+}
+
+fn euclidean(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    let mut sum = 0f64;
+    for i in 0..a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+/// Dismissal bridge pairs: faces the user already judged "separate".
+fn dismissed_pairs(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT face_a, face_b FROM review_decisions WHERE decision = 'separate'")
+        .map_err(|e| format!("prepare dismissed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| format!("query dismissed: {e}"))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        let (a, b) = row.map_err(|e| format!("dismissed row: {e}"))?;
+        out.insert((a.min(b), a.max(b)));
+    }
+    Ok(out)
+}
+
+/// Ranked adjudication queue: near-duplicate cluster pairs plus lone faces
+/// near a cluster, closest first, dismissed bridge pairs excluded. Detached
+/// faces (cluster NULL) are scored as singleton groups so they surface with
+/// their nearest cluster instead of hiding until the next re-cluster.
+pub fn review_candidates(conn: &Connection) -> Result<Vec<ReviewCandidate>, String> {
+    let stored = face_descriptors(conn)?;
+    if stored.len() < 2 {
+        return Ok(Vec::new());
+    }
+    // Group descriptors by cluster. Detached faces (cluster NULL) form one
+    // group each, keyed by negated face id (never a real cluster id), so a
+    // lone detached face scores against clusters instead of hiding.
+    let cluster_of: std::collections::HashMap<i64, Option<i64>> = {
+        let mut stmt = conn
+            .prepare("SELECT id, cluster_id FROM faces")
+            .map_err(|e| format!("prepare face clusters: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))
+            .map_err(|e| format!("query face clusters: {e}"))?;
+        let mut m = std::collections::HashMap::new();
+        for row in rows {
+            let (fid, cid) = row.map_err(|e| format!("face cluster row: {e}"))?;
+            m.insert(fid, cid);
+        }
+        m
+    };
+    let mut groups: std::collections::HashMap<i64, Vec<(i64, Vec<f32>)>> =
+        std::collections::HashMap::new();
+    for (fid, vec) in stored {
+        let key = cluster_of.get(&fid).copied().flatten().unwrap_or(-fid);
+        groups.entry(key).or_default().push((fid, vec));
+    }
+    let mut keys: Vec<i64> = groups.keys().cloned().collect();
+    keys.sort();
+    // Cluster metadata for labels and the assign/merge call to make.
+    let meta: std::collections::HashMap<i64, (Option<String>, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, name, face_count FROM face_clusters")
+            .map_err(|e| format!("prepare cluster meta: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map_err(|e| format!("query cluster meta: {e}"))?;
+        let mut m = std::collections::HashMap::new();
+        for row in rows {
+            let (id, name, count) = row.map_err(|e| format!("cluster meta row: {e}"))?;
+            m.insert(id, (name, count));
+        }
+        m
+    };
+    // Face geometry for the side-by-side crops.
+    let mut geom: std::collections::HashMap<i64, (String, f64, f64, f64, f64)> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, path, x, y, width, height FROM faces")
+            .map_err(|e| format!("prepare face geom: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, f64>(5)?,
+                ))
+            })
+            .map_err(|e| format!("query face geom: {e}"))?;
+        for row in rows {
+            let (id, path, x, y, w, h) = row.map_err(|e| format!("face geom row: {e}"))?;
+            geom.insert(id, (path, x, y, w, h));
+        }
+    }
+    let dismissed = dismissed_pairs(conn)?;
+    let mut out: Vec<(f64, ReviewCandidate)> = Vec::new();
+    for i in 0..keys.len() {
+        for j in (i + 1)..keys.len() {
+            let (ga, gb) = (&groups[&keys[i]], &groups[&keys[j]]);
+            let mut best = (f64::INFINITY, 0i64, 0i64);
+            for (fa, va) in ga {
+                for (fb, vb) in gb {
+                    let d = euclidean(va, vb);
+                    if d < best.0 {
+                        best = (d, *fa, *fb);
+                    }
+                }
+            }
+            if best.0 < REVIEW_BAND_MIN || best.0 >= REVIEW_BAND_MAX {
+                continue;
+            }
+            let bridge = (best.1.min(best.2), best.1.max(best.2));
+            if dismissed.contains(&bridge) {
+                continue;
+            }
+            let mk_cluster = |key: i64| -> ReviewCluster {
+                if key < 0 {
+                    return ReviewCluster { id: None, name: None, face_count: 1 };
+                }
+                let (name, count) = meta.get(&key).cloned().unwrap_or((None, 0));
+                ReviewCluster { id: Some(key), name, face_count: count }
+            };
+            let mk_face = |fid: i64| -> ReviewFace {
+                let (path, x, y, w, h) = geom.get(&fid).cloned().unwrap_or_default();
+                ReviewFace { id: fid, path, x, y, width: w, height: h }
+            };
+            let named = |key: i64| -> bool {
+                key >= 0
+                    && meta.get(&key).map(|(n, _)| n.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)).unwrap_or(false)
+            };
+            // A lone unnamed face against a cluster reads as "is this them?"
+            // (assign); two established groups read as "one person?" (merge).
+            // Detached↔detached pairs have no assign target and no merge
+            // command behind them, so they stay out of the queue.
+            let a_lone = groups[&keys[i]].len() == 1 && !named(keys[i]);
+            let b_lone = groups[&keys[j]].len() == 1 && !named(keys[j]);
+            let a_detached = keys[i] < 0;
+            let b_detached = keys[j] < 0;
+            let (kind, assign_to) = if a_detached && b_detached {
+                continue;
+            } else if a_detached || (a_lone && !b_lone) {
+                ("assign".to_string(), Some(keys[j]))
+            } else if b_detached || (b_lone && !a_lone) {
+                ("assign".to_string(), Some(keys[i]))
+            } else {
+                ("merge".to_string(), None)
+            };
+            // Assign candidates point at the target: face_b is always the
+            // target side, so the card reads left (lone face) → right (person).
+            let (ca, cb, fa, fb) = if kind == "assign" && assign_to == Some(keys[i]) {
+                (mk_cluster(keys[j]), mk_cluster(keys[i]), mk_face(best.2), mk_face(best.1))
+            } else {
+                (mk_cluster(keys[i]), mk_cluster(keys[j]), mk_face(best.1), mk_face(best.2))
+            };
+            out.push((best.0, ReviewCandidate {
+                kind,
+                distance: (best.0 * 1000.0).round() / 1000.0,
+                cluster_a: ca,
+                cluster_b: cb,
+                face_a: fa,
+                face_b: fb,
+                assign_to,
+            }));
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(REVIEW_CANDIDATE_CAP);
+    Ok(out.into_iter().map(|(_, c)| c).collect())
+}
+
+/// Records a "different people" verdict so the bridge pair never resurfaces.
+/// Pair order is normalised; unknown decisions are rejected.
+pub fn record_review_decision(conn: &Connection, face_a: i64, face_b: i64, decision: &str) -> Result<(), String> {
+    if decision != "separate" {
+        return Err(format!("unknown review decision: {decision}"));
+    }
+    if face_a == face_b {
+        return Err("a face cannot be separate from itself".into());
+    }
+    conn.execute(
+        "INSERT INTO review_decisions (face_a, face_b, decision, decided_at) VALUES (?1, ?2, 'separate', ?3)
+         ON CONFLICT (face_a, face_b) DO UPDATE SET decided_at = excluded.decided_at",
+        params![face_a.min(face_b), face_a.max(face_b), now()],
+    )
+    .map_err(|e| format!("record review decision: {e}"))?;
+    Ok(())
 }
 
 pub fn faces_in_cluster(conn: &Connection, cluster_id: i64) -> Result<Vec<FaceRow>, String> {
@@ -4311,10 +4555,10 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(migrate(&conn).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
         assert!(migrate(&conn).unwrap().is_empty(), "second call is a no-op");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 17, "user_version tracks the highest applied migration");
+        assert_eq!(v, 18, "user_version tracks the highest applied migration");
 
         // A database already at the latest version stays untouched.
         let before: i64 = conn
@@ -6158,6 +6402,69 @@ mod tests {
             .query_row("SELECT name_manual FROM events WHERE name = 'Maya''s birthday'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(flag, 1, "re-flagged as manual");
+    }
+
+    #[test]
+    fn review_candidates_rank_merge_assign_and_honor_dismissals() {
+        fn blob(v: &[f32]) -> Vec<u8> {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            b
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Named pair (bridge 0.62) + singleton near the unnamed side (0.58).
+        conn.execute("INSERT INTO face_clusters (face_count, created_at, name) VALUES (2, 1, 'Ann')", []).unwrap();
+        let a: i64 = conn.query_row("SELECT id FROM face_clusters WHERE name = 'Ann'", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO face_clusters (face_count, created_at) VALUES (2, 1)", []).unwrap();
+        let b: i64 = conn.query_row("SELECT MAX(id) FROM face_clusters", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO face_clusters (face_count, created_at) VALUES (1, 1)", []).unwrap();
+        let faces: &[(i64, &[f32])] = &[
+            (a, &[0.0, 0.0]), (a, &[0.05, 0.0]),
+            (b, &[0.66, 0.0]), (b, &[0.70, 0.0]),
+        ];
+        // Singleton cluster C holds the fifth face.
+        let c: i64 = conn.query_row("SELECT MAX(id) FROM face_clusters", [], |r| r.get(0)).unwrap();
+        for (k, (cid, v)) in faces.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at, descriptor)
+                 VALUES (?1, ?2, 0, 0, 10, 10, 0.9, 1, ?3)",
+                params![format!("/f{k}.jpg"), cid, blob(v)],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO faces (path, cluster_id, x, y, width, height, confidence, detected_at, descriptor)
+             VALUES ('/g.jpg', ?1, 0, 0, 10, 10, 0.9, 1, ?2)",
+            params![c, blob(&[1.28, 0.0])],
+        )
+        .unwrap();
+
+        let cands = review_candidates(&conn).unwrap();
+        assert_eq!(cands.len(), 2, "merge pair + singleton, got: {cands:?}");
+        assert_eq!(cands[0].kind, "assign", "closest first");
+        assert!((cands[0].distance - 0.58).abs() < 1e-3, "got {}", cands[0].distance);
+        assert_eq!(cands[0].assign_to, Some(b), "singleton points at its cluster");
+        assert_eq!(cands[1].kind, "merge");
+        assert!(record_review_decision(&conn, cands[1].face_a.id, cands[1].face_b.id, "maybe").is_err(), "unknown decision rejected");
+        assert!(record_review_decision(&conn, cands[1].face_a.id, cands[1].face_a.id, "separate").is_err(), "self-pair rejected");
+
+        // Rejecting the merge hides it; the assign survives.
+        record_review_decision(&conn, cands[1].face_a.id, cands[1].face_b.id, "separate").unwrap();
+        let cands = review_candidates(&conn).unwrap();
+        assert_eq!(cands.len(), 1, "dismissed bridge stays out, got: {cands:?}");
+        assert_eq!(cands[0].kind, "assign");
+
+        // Detaching the singleton keeps it in the queue as a detached face.
+        let lone: i64 = conn.query_row("SELECT id FROM faces WHERE path = '/g.jpg'", [], |r| r.get(0)).unwrap();
+        unassign_face(&conn, lone).unwrap();
+        let cands = review_candidates(&conn).unwrap();
+        assert_eq!(cands.len(), 1, "detached face still surfaces, got: {cands:?}");
+        assert_eq!(cands[0].kind, "assign");
+        assert_eq!(cands[0].assign_to, Some(b));
+        assert_eq!(cands[0].face_a.id, lone, "lone face reads left");
     }
 
     #[test]
