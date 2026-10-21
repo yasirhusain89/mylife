@@ -200,6 +200,8 @@ ol.steps li, ul.tight li { margin-bottom: 0.45rem; max-width: 75ch; }
   <h1>FotoFlow — End-to-End Audit, Capability Comparison &amp; Workflow Gap Report</h1>
   <p class="takeaway">
     <strong>Executive Takeaway:</strong> FotoFlow’s local-first indexing, duplicate/blur cleanup, and people clustering are fast and solid (<strong>85/85</strong> Rust tests, <strong>123/123</strong> Web E2E tests, <strong>10/10</strong> HTTP API E2E tests). However, testing against the real <strong>313-asset Moab 2026 library</strong> exposed <strong>7 critical workflow breaks</strong> that prevent fulfilling our core north-star goal: <em>pooling a trip’s photos &amp; videos, auto-selecting the best shots covering every day, place, and person, and sharing a cohesive Memory Video + handpicked album with friends and family</em>.
+    <br><br>
+    <strong>CLOSE-OUT (2026-10-20, commits <code>7448b4b → 0380fe1 → c8cb0b6 → 333ee4d</code>):</strong> Stages 1–4 shipped and verified (<strong>90</strong> cargo, <strong>125</strong> UI E2E, <strong>10</strong> API E2E, all green). Section 6 lists what closed each gap; the only deferral is camera-audio mixing (any audio-track interaction wedges video decode in-process on macOS 26 — highlight videos ship silent for now, see §6 P0.2).
   </p>
   <div class="kpi-grid" role="region" aria-label="End-to-end verification metrics">
     <div class="kpi">
@@ -576,6 +578,10 @@ ol.steps li, ul.tight li { margin-bottom: 0.45rem; max-width: 75ch; }
 
   <section aria-labelledby="sec-roadmap">
     <h2 id="sec-roadmap">6. Actionable Next Steps to Close the Gap (Ordered P0 → P2)</h2>
+
+    <div class="takeaway" role="note" aria-label="Close-out status">
+      <strong>Close-out 2026-10-20:</strong> P0.1 ✅ shipped (<code>7448b4b</code>: QuickTime date/GPS + filename fallback; 34/34 Moab videos dated, fake Apr-20 event dissolved). P0.2 ✅ shipped (<code>7448b4b</code> video-only render path + 30s stall guard; <code>c8cb0b6</code> coverage-fed chapters, Ken Burns, in-app Watch) — <em>except camera-audio mixing, deferred</em> (audio-track access wedges video decode in-process; silent reels + documented path back via off-AVAssetReader extraction). P0.3 ✅ shipped (<code>0380fe1</code> dynamic Trip → Stop hierarchy + on-demand ＋Album/＋Best; trip-radius control superseded by the two-level model per user decision). P1.1 ✅ shipped (<code>0380fe1</code> coverage-guaranteed curation: day × stop quotas, favorites, named faces, dHash veto, 20% video quota). P1.2 ✅ shipped (<code>c8cb0b6</code> chapters + Ken Burns + Watch; narration stays future). P2 ✅ shipped (<code>333ee4d</code> one-click Share Pack: memory video + Day folders + offline gallery + GPS strip). Live Moab proofs: 16-stop single trip “Grand County, Utah · Apr 17–19”; 51-file/730MB drive pack clean.
+    </div>
 
     <ol class="steps">
       <li>
