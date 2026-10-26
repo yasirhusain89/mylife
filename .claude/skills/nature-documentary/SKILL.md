@@ -78,6 +78,11 @@ Two macOS 26 wedges this probe survived (do not re-fight them):
   edits on indentation-exact context — an ambiguous anchor silently lands
   the album block inside the event card (references an undefined variable
   and svelte-check catches it only afterwards).
+- Card frames must be paced: 90 identical blits in ~90ms wedge the video
+  input permanently (cold encoder, `isReadyForMoreMediaData` never
+  recovers) — the card loop yields 5ms/frame; photo blits self-pace.
+  Symptom of a regression here is the pre-existing error string
+  "highlight writer stalled at … (30s without accepting data, status 1)".
 - e2e timing: the mock documentary render is deliberately slow
   (200 ms/clip) so the busy-card progress assertion can catch it. Don't
   speed it up; don't assert wall time.

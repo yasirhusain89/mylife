@@ -39,7 +39,8 @@ Non-functional:
   is broken**, Xcode install is a user task).
 - Dev session runs in background (`OPENCODE_ALLOW_BG=1`,
   `pnpm tauri dev > /tmp/fotoflow-dev*.log`); live app
-  `target/debug/fotoflow`, `http://127.0.0.1:1420/`.
+  `target/debug/fotoflow`, `http://127.0.0.1:1430/` (1420 belongs to the
+  mw5-advisor dev session).
 - `/Volumes/YH-SanP2TB` must be mounted for live-disk probes.
 - Never launch GUI apps/URLs; one foreground check per bash call
   (`sleep` ≤120s); kill only by exact PID, never watchdog loops.
@@ -160,6 +161,14 @@ instant-as-you-type latency.
   written — the writer then completes with both streams at full length.
   Engine builds the story's whole bed up front (`storyAudio`), pumps it
   while video is not ready, and closes audio at bed end.
+- **Burst-feeding identical frames wedges the video input**: 90 title-card
+  blits land in ~90ms, filling the input queue before a cold encoder
+  session starts draining — and the input never recovers (`isReadyForMoreMediaData`
+  false for 30s+, status writing, no writer error; probe 2026-10-26).
+  Unpaced audio pumping during the stall then deadlocks the audio input too
+  (the writer throttles audio far ahead of video, video can't advance while
+  blocked in the pump). The release is yielding 5ms per card frame — photo
+  blits self-pace through the Ken Burns redraw.
 
 ## Product decisions (locked)
 

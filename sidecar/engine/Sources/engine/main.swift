@@ -1083,7 +1083,7 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             Thread.sleep(forTimeInterval: 0.01)
             spins += 1
             if spins > 3000 {
-                throw EngineError(message: "highlight writer stalled at \(what) (30s without accepting data, status \(writer.status.rawValue))")
+                throw EngineError(message: "highlight writer stalled at \(what) (30s without accepting data, status \(writer.status.rawValue), werr=\(writer.error.map(String.init(describing:)) ?? "nil"))")
             }
         }
     }
@@ -1309,6 +1309,13 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             for _ in 0..<total {
                 try waitVideoReady("title card")
                 let pb = try makePixelBuffer(image, index: frame)
+                // Yield between card blits: 90 identical frames append in
+                // ~90ms, faster than a cold encoder session starts draining,
+                // and an overfed video input never recovers on macOS 26
+                // (album highlight stall, 2026-10-26 — inputs not-ready,
+                // status writing, no writer error). Photos self-pace through
+                // the Ken Burns redraw; cards are pixel-identical.
+                Thread.sleep(forTimeInterval: 0.005)
                 adaptor.append(pb, withPresentationTime: cursor)
                 frame += 1
                 cursor = CMTimeAdd(cursor, CMTime(value: 1, timescale: CMTimeScale(fps)))
