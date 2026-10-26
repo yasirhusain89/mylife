@@ -5,7 +5,7 @@
   "identifier": "com.yasihusain.fotoflow",
   "build": {
     "beforeDevCommand": "bash scripts/build-engine.sh && pnpm dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1430",
     "beforeBuildCommand": "bash scripts/build-engine.sh && pnpm build",
     "frontendDist": "../build"
   },

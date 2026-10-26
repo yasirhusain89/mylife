@@ -12,9 +12,10 @@ export default defineConfig(() => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  // 2. tauri expects a fixed port, fail if that port is not available.
+  // 1430: 1420 belongs to the mw5-advisor dev session on this machine.
   server: {
-    port: 1420,
+    port: 1430,
     strictPort: true,
     host: host || "127.0.0.1",
     hmr: host
