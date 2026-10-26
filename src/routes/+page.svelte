@@ -31,9 +31,11 @@
     albumRemove,
     type AlbumRow,
     exportHighlight,
+    exportDocumentary,
     exportBundle,
     type ExportSummary,
     type HighlightResult,
+    type DocumentaryResult,
     type SharePackSummary,
     exportSharePack,
     onExportProgress,
@@ -2588,6 +2590,78 @@
     watchPath(path, path.split("/").pop() ?? path, highlightResult.bytes, highlightResult.seconds);
   }
 
+  // Documentary: chaptered mini-doc (favorites seed + CLIP subject variety),
+  // rendered per aspect with a stats end card. Natural-first audio is fixed.
+  let docBusy = $state<string | null>(null);
+  let docResult = $state<DocumentaryResult | null>(null);
+  let docKey = $state<string | null>(null);
+  let docDialog = $state<{ eventId?: number; albumId?: number; name: string } | null>(null);
+  let docLength = $state<"auto" | "60" | "120" | "180" | "300" | "600">("auto");
+  let docAspectH = $state(true);
+  let docAspectV = $state(false);
+  let docMusic = $state<string | null>(null);
+  let docPicking = $state(false);
+  let docJob = $state<string | null>(null);
+
+  function openDocumentary(src: { eventId?: number; albumId?: number }, name: string) {
+    docDialog = { ...src, name };
+    docLength = "auto";
+    docAspectH = true;
+    docAspectV = false;
+    docMusic = null;
+  }
+
+  async function pickDocMusic() {
+    docPicking = true;
+    try {
+      const picked = await open({
+        directory: false,
+        multiple: false,
+        title: "Choose documentary music",
+        filters: [{ name: "Audio", extensions: ["mp3", "m4a", "aac", "wav", "aiff", "aif", "caf", "flac"] }],
+      });
+      if (typeof picked === "string" && picked !== "") docMusic = picked;
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      docPicking = false;
+    }
+  }
+
+  function docAspects(): string[] {
+    const out: string[] = [];
+    if (docAspectH) out.push("16:9");
+    if (docAspectV) out.push("9:16");
+    return out;
+  }
+
+  async function makeDocumentary(
+    src: { eventId?: number; albumId?: number },
+    name: string,
+    opts: { maxSeconds?: number; musicPath?: string; aspects?: string[] } = {},
+  ) {
+    const key = sourceKey(src);
+    docBusy = key;
+    docResult = null;
+    docKey = key;
+    docJob = `doc:${key}`;
+    try {
+      docResult = await exportDocumentary(src, name.replace(/\s+/g, "-").toLowerCase(), docJob, opts);
+      toast = "Documentary exported";
+    } catch (e) {
+      error = friendlyError(e);
+    } finally {
+      docBusy = null;
+      if (exportProgress?.job === docJob) exportProgress = null;
+    }
+  }
+
+  function watchDocumentary() {
+    if (!docResult || docResult.outputs.length === 0) return;
+    const path = docResult.outputs[0];
+    watchPath(path, path.split("/").pop() ?? path, docResult.bytes, docResult.seconds);
+  }
+
   // Finished-export affordances: show the pack folder in Finder, or open its
   // offline gallery page in the default browser. No-ops outside the app.
   async function revealExportDir(dir: string) {
@@ -4413,7 +4487,7 @@
         if (pipelining) pipelineState = p;
       }),
       onExportProgress((p) => {
-        if (p.job === highlightJob || p.job === shareJob) {
+        if (p.job === highlightJob || p.job === docJob || p.job === shareJob) {
           exportProgress = p.phase === "done" ? null : p;
         }
       })
@@ -5738,6 +5812,14 @@
             <button class="tiny" disabled={event.assetCount === 0 || exportBusy !== null} onclick={() => openHighlight({ eventId: event.id }, event.name)}>
               {highlightBusy === `e${event.id}` ? "Exporting…" : "Highlight video"}
             </button>
+            <button
+              class="tiny"
+              disabled={event.assetCount === 0 || docBusy !== null}
+              title="Chaptered nature documentary — favorites seed the cut, subjects rotate, stats end card"
+              onclick={() => openDocumentary({ eventId: event.id }, event.name)}
+            >
+              {docBusy === `e${event.id}` ? "Rendering…" : "Documentary"}
+            </button>
             {#if albumOptions.length > 0}
               <select
                 aria-label={`Add ${event.name} to album`}
@@ -5805,6 +5887,37 @@
                 title="Watch the highlight video"
                 aria-label="Watch highlight video"
                 onclick={watchHighlight}
+              >▶ Watch</button>
+              </div>
+            {/if}
+          {#if docBusy === `e${event.id}` && exportProgress?.job === docJob}
+            <p class="hint" role="status">
+              {#if (exportProgress?.total ?? 0) > 0}
+                <progress
+                  max={exportProgress.total}
+                  value={exportProgress.done}
+                  aria-label={exportProgress.label}
+                ></progress>
+              {/if}
+              {exportProgress.label || "Rendering…"}
+            </p>
+          {/if}
+          {#if docResult && docKey === `e${event.id}`}
+            <p class="hint">
+              Documentary: {docResult.seconds.toFixed(1)}s · {fmtBytes(docResult.bytes)}
+              · {docResult.photos} photo{docResult.photos === 1 ? "" : "s"}{#if docResult.videosIncluded > 0} · {docResult.videosIncluded} video clip{docResult.videosIncluded === 1 ? "" : "s"}{/if}
+              {#if docResult.videosSkipped > 0}· {docResult.videosSkipped} unreadable skipped{/if}
+              {#each docResult.outputs as out (out)}
+                <br />{out}
+              {/each}
+            </p>
+            <div class="row-actions">
+              <button
+                type="button"
+                class="tiny"
+                title="Watch the documentary"
+                aria-label="Watch documentary"
+                onclick={watchDocumentary}
               >▶ Watch</button>
             </div>
           {/if}
@@ -5998,6 +6111,14 @@
               </button>
               <button
                 class="tiny"
+                disabled={album.assetCount === 0 || docBusy !== null}
+                title="Chaptered nature documentary — favorites seed the cut, subjects rotate, stats end card"
+                onclick={() => openDocumentary({ albumId: album.id }, album.name)}
+              >
+                {docBusy === `a${album.id}` ? "Rendering…" : "Documentary"}
+              </button>
+              <button
+                class="tiny"
                 disabled={album.assetCount === 0}
                 aria-label={`Share pack for album ${album.name}`}
                 title="Memory video + Day-organized best + offline gallery for family"
@@ -6031,6 +6152,37 @@
                   title="Watch the highlight video"
                   aria-label="Watch highlight video"
                   onclick={watchHighlight}
+                >▶ Watch</button>
+              </div>
+            {/if}
+            {#if docBusy === `a${album.id}` && exportProgress?.job === docJob}
+              <p class="hint" role="status">
+                {#if (exportProgress?.total ?? 0) > 0}
+                  <progress
+                    max={exportProgress.total}
+                    value={exportProgress.done}
+                    aria-label={exportProgress.label}
+                  ></progress>
+                {/if}
+                {exportProgress.label || "Rendering…"}
+              </p>
+            {/if}
+            {#if docResult && docKey === `a${album.id}`}
+              <p class="hint">
+                Documentary: {docResult.seconds.toFixed(1)}s · {fmtBytes(docResult.bytes)}
+                · {docResult.photos} photo{docResult.photos === 1 ? "" : "s"}{#if docResult.videosIncluded > 0} · {docResult.videosIncluded} video clip{docResult.videosIncluded === 1 ? "" : "s"}{/if}
+                {#if docResult.videosSkipped > 0}· {docResult.videosSkipped} unreadable skipped{/if}
+                {#each docResult.outputs as out (out)}
+                  <br />{out}
+                {/each}
+              </p>
+              <div class="row-actions">
+                <button
+                  type="button"
+                  class="tiny"
+                  title="Watch the documentary"
+                  aria-label="Watch documentary"
+                  onclick={watchDocumentary}
                 >▶ Watch</button>
               </div>
             {/if}
@@ -6424,6 +6576,73 @@
               );
             }}
           >Make video</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if docDialog}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget && docBusy === null) docDialog = null; }}>
+      <div class="dialog" role="dialog" aria-modal="true" aria-label="Documentary video" tabindex={-1} use:dialogFocus={() => { if (docBusy === null) docDialog = null; }}>
+        <h3>Documentary for “{docDialog.name}”</h3>
+        <p class="hint">
+          Chaptered nature documentary: favorites lead, subjects rotate for variety, chapter
+          cards open each day and subject, and a stats end card closes. Camera audio plays at
+          native level; music only fills silent stretches.
+        </p>
+        <label class="mode">
+          Length
+          <select bind:value={docLength} disabled={docBusy !== null} aria-label="Documentary length">
+            <option value="auto">Auto (3 minutes)</option>
+            <option value="60">1 minute</option>
+            <option value="120">2 minutes</option>
+            <option value="180">3 minutes</option>
+            <option value="300">5 minutes</option>
+            <option value="600">10 minutes</option>
+          </select>
+        </label>
+        <fieldset class="mode">
+          <legend>Aspect</legend>
+          <label><input type="checkbox" bind:checked={docAspectH} disabled={docBusy !== null} /> 16:9 horizontal</label>
+          <label><input type="checkbox" bind:checked={docAspectV} disabled={docBusy !== null} /> 9:16 vertical</label>
+        </fieldset>
+        <div class="path-entry">
+          <input
+            type="text"
+            placeholder="No music — add a track…"
+            aria-label="Documentary music"
+            value={docMusic ?? ""}
+            readonly
+            disabled={docBusy !== null}
+          />
+          <button type="button" class="ghost" disabled={docBusy !== null || docPicking} onclick={() => void pickDocMusic()}>
+            {docPicking ? "Choosing…" : "Choose music…"}
+          </button>
+          {#if docMusic}
+            <button type="button" class="ghost" disabled={docBusy !== null} aria-label="Clear documentary music" onclick={() => (docMusic = null)}>Clear</button>
+          {/if}
+        </div>
+        <div class="dialog-actions">
+          <button class="ghost" disabled={docBusy !== null} onclick={() => (docDialog = null)}>Cancel</button>
+          <button
+            disabled={docBusy !== null || (!docAspectH && !docAspectV)}
+            onclick={() => {
+              const d = docDialog;
+              if (!d) return;
+              docDialog = null;
+              void makeDocumentary(
+                d.eventId != null ? { eventId: d.eventId } : { albumId: d.albumId },
+                d.name,
+                {
+                  ...(docLength === "auto" ? {} : { maxSeconds: Number(docLength) }),
+                  ...(docMusic ? { musicPath: docMusic } : {}),
+                  aspects: docAspects(),
+                },
+              );
+            }}
+          >Make documentary</button>
         </div>
       </div>
     </div>

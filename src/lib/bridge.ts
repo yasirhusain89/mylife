@@ -139,6 +139,7 @@ export const albumRemove = pick("albumRemove");
 export const exportBundle = pick("exportBundle");
 export const exportSharePack = pick("exportSharePack");
 export const exportHighlight = pick("exportHighlight");
+export const exportDocumentary = pick("exportDocumentary");
 export const onExportProgress = pick("onExportProgress");
 export const ingestCopy = pick("ingestCopy");
 export const onIngestProgress = pick("onIngestProgress");
@@ -207,6 +208,7 @@ export type {
   EnrichSummary,
   EventAssetRow,
   EventRow,
+  DocumentaryResult,
   ExportProgress,
   ExportSummary,
   FaceClusterRow,

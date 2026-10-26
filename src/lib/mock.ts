@@ -14,6 +14,7 @@ import type {
   EnrichSummary,
   EventRow,
   EventAssetRow,
+  DocumentaryResult,
   ExportSummary,
   FaceClusterRow,
   FaceRow,
@@ -1298,6 +1299,35 @@ export async function exportHighlight(
     seconds: opts?.maxSeconds ?? 9,
     photos: 3,
     videosIncluded: 1,
+    videosSkipped: 0
+  };
+}
+
+export async function exportDocumentary(
+  _source: { eventId?: number; albumId?: number },
+  _name?: string,
+  job?: string,
+  opts?: { maxSeconds?: number; musicPath?: string; aspects?: string[] },
+): Promise<DocumentaryResult> {
+  const key = job ?? "";
+  const total = 6;
+  emitExport({ job: key, phase: "planning", done: 0, total: 0, label: "Planning documentary…" });
+  await sleep(150);
+  for (let done = 1; done <= total; done += 1) {
+    emitExport({ job: key, phase: "rendering", done, total, label: `Rendering clip ${done} of ${total}…` });
+    // Long enough that e2e can catch the busy card mid-render.
+    await sleep(200);
+  }
+  emitExport({ job: key, phase: "done", done: 1, total: 1, label: "" });
+  const outputs = (opts?.aspects ?? ["16:9"]).map(
+    (a) => `/tmp/documentary-${a === "9:16" ? "vertical" : "horizontal"}.mp4`
+  );
+  return {
+    outputs,
+    bytes: 1_240_000 * outputs.length,
+    seconds: opts?.maxSeconds ?? 180,
+    photos: 9,
+    videosIncluded: 3,
     videosSkipped: 0
   };
 }

@@ -839,6 +839,53 @@ test("highlight export shows determinate progress while rendering", async ({ pag
   await expect(status).toBeHidden();
 });
 
+test("documentary exports with a stats end card summary", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Documentary" }).first().click();
+  await page.getByRole("dialog", { name: "Documentary video" }).getByRole("button", { name: "Make documentary" }).click();
+  await expect(page.getByText(/Documentary: 180\.0s/)).toBeVisible();
+  await expect(page.getByText("9 photos")).toBeVisible();
+  await expect(page.getByText("3 video clips")).toBeVisible();
+  await page.getByRole("button", { name: "Watch documentary" }).click();
+  const viewer = page.getByRole("dialog", { name: "documentary-horizontal.mp4" });
+  await expect(viewer).toBeVisible();
+  await expect(viewer.getByText("Video playback needs the desktop app")).toBeVisible();
+});
+
+test("documentary dialog requires an aspect and renders both when picked", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Documentary" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Documentary video" });
+  const make = dialog.getByRole("button", { name: "Make documentary" });
+  await dialog.getByLabel("16:9 horizontal").uncheck();
+  await expect(make).toBeDisabled();
+  await dialog.getByLabel("16:9 horizontal").check();
+  await dialog.getByLabel("9:16 vertical").check();
+  await dialog.getByLabel("Documentary length").selectOption("120");
+  await make.click();
+  await expect(page.getByText(/Documentary: 120\.0s/)).toBeVisible();
+  await expect(page.getByText("/tmp/documentary-horizontal.mp4")).toBeVisible();
+  await expect(page.getByText("/tmp/documentary-vertical.mp4")).toBeVisible();
+});
+
+test("documentary export shows determinate progress while rendering", async ({ page }) => {
+  await page.getByRole("tab", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Cluster events by time & place" }).click();
+  await page.getByRole("button", { name: "Documentary" }).first().click();
+  await page.getByRole("dialog", { name: "Documentary video" }).getByRole("button", { name: "Make documentary" }).click();
+  // Scoped to the busy card: the completion toast shares role=status.
+  const card = page.locator("article.event-card", {
+    has: page.getByRole("button", { name: "Rendering…" }),
+  });
+  const status = card.getByRole("status");
+  await expect(status).toBeVisible();
+  await expect(status.getByRole("progressbar")).toBeVisible();
+  await expect(status).toContainText(/Rendering clip \d+ of 6/);
+  await expect(status).toBeHidden();
+});
+
 test("events render as a month-grouped timeline", async ({ page }) => {
   await page.getByRole("tab", { name: "Events", exact: true }).click();
   await page.getByRole("button", { name: "Cluster events by time & place" }).click();

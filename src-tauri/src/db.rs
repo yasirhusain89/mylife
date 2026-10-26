@@ -2812,6 +2812,223 @@ pub fn highlight_plan(mut items: Vec<HighlightItem>) -> Vec<HighlightClip> {    
     out
 }
 
+// MARK: - Documentary plan (favorites seed → subject variety → chapters)
+
+/// One documentary candidate: story row plus curation signals and an
+/// optional CLIP subject tag (the caller resolves subjects against prompt
+/// vectors; this stays pure and unit-testable).
+pub struct DocItem {
+    pub path: String,
+    pub taken: f64,
+    pub place: Option<String>,
+    pub kind: String,
+    pub favorite: bool,
+    pub quality: Option<f64>,
+    /// Subject bucket label ("Bird", "Flower", …) when CLIP tagged it.
+    pub subject: Option<String>,
+    /// Best subject-prompt cosine; rank key within a subject bucket.
+    pub subject_score: f64,
+}
+
+/// Documentary selection stats for the closing end card.
+pub struct DocStats {
+    pub days: i64,
+    pub subjects: i64,
+    pub photos: i64,
+    pub videos: i64,
+}
+
+/// Documentary selection (pure; unit-tested below):
+/// 1. Favorites seed — favorites first, chronological (the user's eye is
+///    the best curateur; chapters still reorder by time).
+/// 2. Variety — round-robin over subject buckets ranked by subject_score,
+///    so each subject contributes a hero shot before any subject repeats.
+/// 3. Quality fill — leftovers ranked by sharpness/aesthetic score, then
+///    earliest. The plan then re-sorts chronologically and opens a chapter
+///    card at each UTC-day boundary or subject change ("Apr 18 · Bird");
+///    untagged chapters fall back to the place label.
+pub fn documentary_plan(mut items: Vec<DocItem>, budget: usize) -> (Vec<HighlightClip>, DocStats) {
+    items.sort_by(|a, b| {
+        a.taken
+            .partial_cmp(&b.taken)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.path.cmp(&b.path))
+    });
+    let budget = budget.max(1).min(items.len());
+    let mut chosen = vec![false; items.len()];
+    let mut picked: Vec<usize> = Vec::new();
+
+    for (i, it) in items.iter().enumerate() {
+        if picked.len() >= budget {
+            break;
+        }
+        if it.favorite {
+            chosen[i] = true;
+            picked.push(i);
+        }
+    }
+
+    if picked.len() < budget {
+        // Subject buckets: candidates ranked by subject_score desc, then
+        // quality, then earliest — the bucket head is that subject's hero.
+        let mut buckets: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            if let Some(s) = &it.subject {
+                match buckets.iter_mut().find(|(label, _)| label == s) {
+                    Some((_, idxs)) => idxs.push(i),
+                    None => buckets.push((s.clone(), vec![i])),
+                }
+            }
+        }
+        for (_, idxs) in buckets.iter_mut() {
+            idxs.sort_by(|&a, &b| {
+                items[b]
+                    .subject_score
+                    .partial_cmp(&items[a].subject_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(
+                        items[b]
+                            .quality
+                            .partial_cmp(&items[a].quality)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                    .then(items[a].taken.total_cmp(&items[b].taken))
+            });
+        }
+        loop {
+            let mut progressed = false;
+            for (_, idxs) in buckets.iter_mut() {
+                if picked.len() >= budget {
+                    break;
+                }
+                while let Some(&i) = idxs.first() {
+                    idxs.remove(0);
+                    if !chosen[i] {
+                        chosen[i] = true;
+                        picked.push(i);
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+            if !progressed || picked.len() >= budget {
+                break;
+            }
+        }
+    }
+
+    if picked.len() < budget {
+        let mut rest: Vec<usize> = (0..items.len()).filter(|&i| !chosen[i]).collect();
+        rest.sort_by(|&a, &b| {
+            items[b]
+                .quality
+                .partial_cmp(&items[a].quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(items[a].taken.total_cmp(&items[b].taken))
+        });
+        for i in rest {
+            if picked.len() >= budget {
+                break;
+            }
+            chosen[i] = true;
+            picked.push(i);
+        }
+    }
+
+    // items are chronological, so ascending index = ascending time.
+    picked.sort_unstable();
+    let mut out: Vec<HighlightClip> = Vec::with_capacity(picked.len());
+    let mut prev_day: Option<i64> = None;
+    let mut prev_subject: Option<String> = None;
+    let mut stats = DocStats { days: 0, subjects: 0, photos: 0, videos: 0 };
+    let mut seen_subjects: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in picked {
+        let it = &items[i];
+        let day = (it.taken / 86400.0).floor() as i64;
+        let new_day = prev_day != Some(day);
+        let new_subject = prev_subject.as_deref() != it.subject.as_deref();
+        if new_day {
+            stats.days += 1;
+        }
+        prev_day = Some(day);
+        if new_subject || new_day {
+            prev_subject = it.subject.clone();
+            let mut t = format_event_time(it.taken);
+            if let Some(s) = &it.subject {
+                t = format!("{t} · {s}");
+            } else if let Some(p) = &it.place {
+                t = format!("{t} · {p}");
+            }
+            out.push(HighlightClip { path: it.path.clone(), title: Some(t) });
+        } else {
+            out.push(HighlightClip { path: it.path.clone(), title: None });
+        }
+        if let Some(s) = &it.subject {
+            if seen_subjects.insert(s.clone()) {
+                stats.subjects += 1;
+            }
+        }
+        if it.kind == "video" {
+            stats.videos += 1;
+        } else {
+            stats.photos += 1;
+        }
+    }
+    (out, stats)
+}
+
+/// Per-asset CLIP vectors within an id set: one vector for photos, all
+/// keyframe vectors for videos. Powers documentary subject tagging — the
+/// caller cosines these against prompt vectors.
+pub fn clip_vectors_for_assets(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<Vec<f32>>>, String> {
+    let json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    let mut out: std::collections::HashMap<i64, Vec<Vec<f32>>> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.asset_id, v.vec FROM clip_vectors v
+                  JOIN assets a ON a.id = v.asset_id
+                  WHERE a.missing = 0 AND v.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(|e| format!("prepare doc photo vectors: {e}"))?;
+        let rows = stmt
+            .query_map(params![json], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("query doc photo vectors: {e}"))?;
+        for row in rows {
+            let (id, blob) = row.map_err(|e| format!("doc photo vector row: {e}"))?;
+            if let Some(v) = bytes_to_floats(&blob) {
+                out.entry(id).or_default().push(v);
+            }
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT k.asset_id, k.vec FROM video_keyframes k
+                  JOIN assets a ON a.id = k.asset_id
+                  WHERE a.missing = 0 AND k.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(|e| format!("prepare doc keyframe vectors: {e}"))?;
+        let rows = stmt
+            .query_map(params![json], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("query doc keyframe vectors: {e}"))?;
+        for row in rows {
+            let (id, blob) = row.map_err(|e| format!("doc keyframe vector row: {e}"))?;
+            if let Some(v) = bytes_to_floats(&blob) {
+                out.entry(id).or_default().push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // MARK: - Share pack (family distribution bundle)
 
 /// UTC calendar label for a capture time: ("2026-04-18", "Apr 18") for day
@@ -6925,6 +7142,90 @@ mod tests {
         assert!(clips[2].title.is_none(), "same day continues silently");
         let first = clips[0].title.as_ref().unwrap();
         assert!(first.contains("Moab"), "place rides the chapter, got: {first}");
+    }
+
+    fn doc_item(path: &str, taken: f64, subject: Option<&str>, score: f64, favorite: bool, quality: Option<f64>) -> DocItem {
+        DocItem {
+            path: path.into(),
+            taken,
+            place: Some("Moab".into()),
+            kind: "image".into(),
+            favorite,
+            quality,
+            subject: subject.map(|s| s.to_string()),
+            subject_score: score,
+        }
+    }
+
+    #[test]
+    fn documentary_plan_seeds_favorites_then_round_robins_subjects() {
+        let day = 1_700_000_000.0;
+        // Two bird shots (one favorite), two flower shots, one untagged.
+        let items = vec![
+            doc_item("/bird-hi.jpg", day, Some("Bird"), 0.40, false, Some(0.9)),
+            doc_item("/bird-fav.jpg", day + 10.0, Some("Bird"), 0.35, true, Some(0.5)),
+            doc_item("/flower-hi.jpg", day + 20.0, Some("Flower"), 0.38, false, Some(0.8)),
+            doc_item("/flower-2.jpg", day + 30.0, Some("Flower"), 0.30, false, Some(0.7)),
+            doc_item("/plain.jpg", day + 40.0, None, 0.0, false, Some(0.6)),
+        ];
+        let (clips, stats) = documentary_plan(items, 4);
+        let paths: Vec<&str> = clips.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"/bird-fav.jpg"), "favorite seeds the cut: {paths:?}");
+        assert!(paths.contains(&"/bird-hi.jpg"), "round-robin adds the bird hero");
+        assert!(paths.contains(&"/flower-hi.jpg"), "round-robin adds the flower hero");
+        assert!(!paths.contains(&"/plain.jpg"), "untagged fill only after subjects exhaust");
+        assert_eq!(paths.len(), 4);
+        assert_eq!(stats.photos, 4);
+        assert_eq!(stats.videos, 0);
+        // Chronological output regardless of pick order.
+        let taken: Vec<f64> = paths.iter().map(|p| match *p {
+            "/bird-hi.jpg" => day,
+            "/bird-fav.jpg" => day + 10.0,
+            "/flower-hi.jpg" => day + 20.0,
+            "/flower-2.jpg" => day + 30.0,
+            _ => day + 40.0,
+        }).collect();
+        let mut sorted = taken.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(taken, sorted, "chapters run chronologically");
+    }
+
+    #[test]
+    fn documentary_plan_opens_chapter_on_subject_change_within_a_day() {
+        let day = 1_700_000_000.0;
+        let items = vec![
+            doc_item("/b1.jpg", day, Some("Bird"), 0.4, false, None),
+            doc_item("/b2.jpg", day + 60.0, Some("Bird"), 0.3, false, None),
+            doc_item("/f1.jpg", day + 120.0, Some("Flower"), 0.3, false, None),
+            doc_item("/f2.jpg", day + 180.0, Some("Flower"), 0.2, false, None),
+        ];
+        let (clips, stats) = documentary_plan(items, 4);
+        let titles: Vec<Option<&String>> = clips.iter().map(|c| c.title.as_ref()).collect();
+        assert!(titles[0].is_some(), "first clip opens a chapter");
+        assert!(titles[1].is_none(), "same subject, same day: silent");
+        assert!(titles[2].is_some(), "subject change opens a chapter");
+        assert!(titles[3].is_none(), "back to silent");
+        let ch = titles[2].unwrap();
+        assert!(ch.contains("Flower"), "chapter names the subject, got: {ch}");
+        assert_eq!(stats.subjects, 2);
+        assert_eq!(stats.days, 1);
+    }
+
+    #[test]
+    fn documentary_plan_fills_by_quality_when_subjects_exhausted() {
+        let day = 1_700_000_000.0;
+        let mut items = vec![
+            doc_item("/weak.jpg", day + 300.0, None, 0.0, false, Some(0.2)),
+            doc_item("/strong.jpg", day + 400.0, None, 0.0, false, Some(0.95)),
+        ];
+        items[0].kind = "video".into();
+        let (clips, stats) = documentary_plan(items, 2);
+        let paths: Vec<&str> = clips.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["/weak.jpg", "/strong.jpg"], "chronological output");
+        assert_eq!(stats.videos, 1);
+        assert_eq!(stats.photos, 1);
+        assert_eq!(stats.days, 1);
+        assert_eq!(stats.subjects, 0, "untagged picks never inflate subjects");
     }
 
     #[test]

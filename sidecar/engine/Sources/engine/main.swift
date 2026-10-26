@@ -701,11 +701,20 @@ func coverThumbnail(_ src: CGImageSource, outW: Int, outH: Int) -> CGImage? {
 /// decode on macOS 26), silence for stills/cards, and optional user music
 /// looped underneath at a fixed gain. Inputs carry optional titles; the
 /// timeline is capped at maxSeconds. Undecodable files count as skipped.
-func makeHighlight(inputs: [(path: String, title: String?)], output: String, maxSeconds: Double, musicPath: String?) throws -> [String: Any] {
+///
+/// Documentary mode (`make_documentary`): `portrait` flips the canvas to
+/// 1080x1920; `naturalFirst` keeps camera audio at native level and fills
+/// only silent segments (stills, cards, silent clips) with music at the
+/// alone gain — music never sits under camera audio, so no ducking envelope
+/// is needed; `endCard`, when set, renders one closing stats card.
+func makeHighlight(inputs: [(path: String, title: String?)], output: String, maxSeconds: Double, musicPath: String?,
+                   portrait: Bool = false, naturalFirst: Bool = false, endCard: String? = nil) throws -> [String: Any] {
     let cap = max(1.0, maxSeconds)
 
-    // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive).
-    let outW = 1920, outH = 1080
+    // Output canvas: 1920x1080 letterboxed (16:9 works for WhatsApp and Drive);
+    // portrait renders 1080x1920 for status/reels audiences.
+    let outW = portrait ? 1080 : 1920
+    let outH = portrait ? 1920 : 1080
     let fps = 30
     let audioRate = 44100.0
     let secondsPerPhoto = 3.0
@@ -728,25 +737,67 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         ctx.setFillColor(CGColor(red: 0.055, green: 0.065, blue: 0.09, alpha: 1.0))
         ctx.fill(CGRect(x: 0, y: 0, width: outW, height: outH))
         let s = text as NSString
-        var size: CGFloat = 76
-        var attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: size, weight: .semibold),
-            .foregroundColor: NSColor(white: 0.96, alpha: 1.0),
-        ]
-        var textSize = s.size(withAttributes: attrs)
-        while textSize.width > CGFloat(outW) - 320 && size > 30 {
-            size -= 4
-            attrs[.font] = NSFont.systemFont(ofSize: size, weight: .semibold)
-            textSize = s.size(withAttributes: attrs)
-        }
-        let rect = CGRect(
-            x: (CGFloat(outW) - textSize.width) / 2,
-            y: (CGFloat(outH) - textSize.height) / 2,
-            width: textSize.width, height: textSize.height)
+        let lines = text.components(separatedBy: "\n")
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
-        s.draw(in: rect, withAttributes: attrs)
-        NSGraphicsContext.restoreGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard lines.count > 1 else {
+            var size: CGFloat = 76
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: size, weight: .semibold),
+                .foregroundColor: NSColor(white: 0.96, alpha: 1.0),
+            ]
+            var textSize = s.size(withAttributes: attrs)
+            while textSize.width > CGFloat(outW) - 320 && size > 30 {
+                size -= 4
+                attrs[.font] = NSFont.systemFont(ofSize: size, weight: .semibold)
+                textSize = s.size(withAttributes: attrs)
+            }
+            let rect = CGRect(
+                x: (CGFloat(outW) - textSize.width) / 2,
+                y: (CGFloat(outH) - textSize.height) / 2,
+                width: textSize.width, height: textSize.height)
+            s.draw(in: rect, withAttributes: attrs)
+            return ctx.makeImage()
+        }
+        // Stats card: line 1 is the headline, remaining lines stack beneath
+        // at reading size. flipped:false — same single-flip rule as above.
+        let subAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 42, weight: .regular),
+            .foregroundColor: NSColor(white: 0.85, alpha: 1.0),
+        ]
+        var headSize: CGFloat = 72
+        var headAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: headSize, weight: .semibold),
+            .foregroundColor: NSColor(white: 0.96, alpha: 1.0),
+        ]
+        let head = lines[0] as NSString
+        var headRect = head.size(withAttributes: headAttrs)
+        while headRect.width > CGFloat(outW) - 160 && headSize > 30 {
+            headSize -= 4
+            headAttrs[.font] = NSFont.systemFont(ofSize: headSize, weight: .semibold)
+            headRect = head.size(withAttributes: headAttrs)
+        }
+        var subSizes: [(line: NSString, size: CGSize)] = []
+        for raw in lines.dropFirst() {
+            let ns = raw as NSString
+            subSizes.append((line: ns, size: ns.size(withAttributes: subAttrs)))
+        }
+        let subH = subSizes.reduce(CGFloat(0)) { $0 + $1.size.height + 14 } - 14
+        let blockH = headRect.height + 26 + max(0, subH)
+        let topY = (CGFloat(outH) + blockH) / 2
+        head.draw(in: CGRect(
+            x: (CGFloat(outW) - headRect.width) / 2,
+            y: topY - headRect.height,
+            width: headRect.width, height: headRect.height), withAttributes: headAttrs)
+        var cursorY = topY - headRect.height - 26
+        for sub in subSizes where sub.size.height > 0 {
+            sub.line.draw(in: CGRect(
+                x: (CGFloat(outW) - sub.size.width) / 2,
+                y: cursorY - sub.size.height,
+                width: sub.size.width, height: sub.size.height), withAttributes: subAttrs)
+            cursorY -= sub.size.height + 14
+        }
         return ctx.makeImage()
     }
 
@@ -802,6 +853,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         }
     }
     guard !clips.isEmpty else { throw EngineError(message: "no decodable photos or videos for highlight") }
+    // Closing stats card: silent, so under a music bed it becomes the outro.
+    if let ec = endCard, let card = titleCardImage(ec) {
+        clips.append(.titlecard(card))
+    }
 
     let outURL = URL(fileURLWithPath: output)
     try? FileManager.default.removeItem(atPath: output)
@@ -901,8 +956,9 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
     }
     let wantAudio = hasCameraAudio || musicRef != nil
     // Music sits under camera audio; alone it can ride higher without
-    // competing with speech. A full duck/level pass stays a follow-up.
-    let musicGain: Float = hasCameraAudio ? 0.35 : 0.6
+    // competing with speech. naturalFirst never mixes music under camera
+    // audio at all (silent segments only), so it always uses the alone gain.
+    let musicGain: Float = naturalFirst ? 0.6 : (hasCameraAudio ? 0.35 : 0.6)
     var aInput: AVAssetWriterInput? = nil
     var audioFmt: CMAudioFormatDescription? = nil
     if wantAudio {
@@ -932,9 +988,10 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         Data(count: max(0, Int(audioRate * seconds)) * 4)
     }
 
-    // Segment PCM with the music bed mixed in (identity without music).
-    func segmentAudio(_ base: Data, seconds: Double) -> Data {
-        guard musicRef != nil else { return base }
+    // Segment PCM, music bed mixed in at `musicGain` when wanted (identity
+    // without music). naturalFirst opts camera-audio segments out entirely.
+    func segmentAudio(_ base: Data, seconds: Double, withMusic: Bool = true) -> Data {
+        guard musicRef != nil, withMusic else { return base }
         return mixPCM(base, music: musicPCM(seconds), gain: musicGain)
     }
 
@@ -1099,7 +1156,11 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
             case .video(let path, _, _, let hasAudio):
                 let take = min(secondsPerClip, cap - planCursor.seconds)
                 guard take > 0 else { break }
-                storyAudio.append(segmentAudio(hasAudio ? clipPCM(path, seconds: take) : silencePCM(take), seconds: take))
+                // naturalFirst: camera audio rides alone at native level;
+                // only silent video stretches pull the music bed.
+                storyAudio.append(segmentAudio(
+                    hasAudio ? clipPCM(path, seconds: take) : silencePCM(take),
+                    seconds: take, withMusic: !(naturalFirst && hasAudio)))
                 planCursor = CMTimeAdd(planCursor, CMTime(seconds: take, preferredTimescale: CMTimeScale(fps)))
             }
         }
@@ -1298,6 +1359,9 @@ func makeHighlight(inputs: [(path: String, title: String?)], output: String, max
         "audioFrames": audioFrames,
         "musicIncluded": musicRef != nil,
         "clipErrors": clipErrors,
+        "aspect": portrait ? "9:16" : "16:9",
+        "naturalFirst": naturalFirst,
+        "endCard": endCard != nil,
     ]
 }
 
@@ -2273,6 +2337,32 @@ func handle(cmd: String, params: [String: Any]) throws -> [String: Any] {
         }
         return try background {
             try makeHighlight(inputs: inputs, output: output, maxSeconds: maxSeconds, musicPath: musicPath)
+        }
+
+    case "make_documentary":
+        guard let output = str("output") else { throw EngineError(message: "make_documentary requires 'output'") }
+        let maxSeconds = dbl("maxSeconds", 180)
+        let musicPath = str("musicPath")
+        let portrait = (str("aspect") ?? "16:9") == "9:16"
+        let naturalFirst = params["naturalFirst"] as? Bool ?? true
+        let endCard = str("endCard")
+        // Same clip shape as make_highlight: path + optional chapter title.
+        var inputs: [(path: String, title: String?)] = []
+        if let arr = params["clips"] as? [[String: Any]] {
+            for d in arr {
+                if let p = d["path"] as? String {
+                    inputs.append((path: p, title: d["title"] as? String))
+                }
+            }
+        } else if let paths = params["paths"] as? [String] {
+            inputs = paths.map { (path: $0, title: nil) }
+        }
+        guard !inputs.isEmpty else {
+            throw EngineError(message: "make_documentary requires 'clips' or a non-empty 'paths' array")
+        }
+        return try background {
+            try makeHighlight(inputs: inputs, output: output, maxSeconds: maxSeconds, musicPath: musicPath,
+                portrait: portrait, naturalFirst: naturalFirst, endCard: endCard)
         }
 
     case "face_thumb":

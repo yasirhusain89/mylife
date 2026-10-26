@@ -912,6 +912,34 @@ export type HighlightResult = {
   videosSkipped: number;
 };
 
+// Documentary export: chaptered mini-doc per event/album (favorites seed +
+// CLIP subject variety), one render per aspect.
+export function exportDocumentary(
+  source: { eventId?: number; albumId?: number },
+  name?: string,
+  job?: string,
+  opts?: { maxSeconds?: number; musicPath?: string; aspects?: string[] },
+): Promise<DocumentaryResult> {
+  return invoke("export_documentary", {
+    eventId: source.eventId ?? null,
+    albumId: source.albumId ?? null,
+    name,
+    job: job ?? "",
+    maxSeconds: opts?.maxSeconds ?? null,
+    musicPath: opts?.musicPath ?? null,
+    aspects: opts?.aspects ?? null
+  });
+}
+
+export type DocumentaryResult = {
+  outputs: string[];
+  bytes: number;
+  seconds: number;
+  photos: number;
+  videosIncluded: number;
+  videosSkipped: number;
+};
+
 export type ExportSummary = {
   dir: string;
   exported: number;

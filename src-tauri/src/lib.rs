@@ -2712,6 +2712,361 @@ fn chrono_stamp() -> String {
     format!("{secs}")
 }
 
+// MARK: - Documentary export
+
+/// CLIP prompts per documentary subject: (prompt, chapter label). Multiple
+/// prompts per subject raise recall; the best cosine across an asset's
+/// vectors wins. Species naming arrives with the classifier phase.
+const DOC_SUBJECT_PROMPTS: &[(&str, &str)] = &[
+    ("a photo of a bird", "Bird"),
+    ("a photo of a bird flying in the sky", "Bird"),
+    ("a photo of a cat", "Cat"),
+    ("a photo of a flower close up", "Flower"),
+    ("a photo of a tree in the forest", "Tree"),
+    ("a photo of wild animal wildlife in nature", "Wildlife"),
+];
+
+/// Cosines below this read as "not this subject" for CLIP text-image
+/// similarity; keeps weak matches from mislabeling chapter cards.
+const DOC_SUBJECT_MIN_COSINE: f64 = 0.22;
+
+/// Documentary budget: ~3s per clip like stories, but chapters breathe
+/// across up to 10 minutes (200 clips).
+fn doc_clip_budget(max_seconds: Option<f64>) -> i64 {
+    match max_seconds {
+        Some(s) => ((s / 3.0).ceil() as i64).clamp(10, 200),
+        None => 60,
+    }
+}
+
+/// Member rows with curation signals (favorite, quality, capture time).
+fn doc_member_meta(
+    conn: &rusqlite::Connection,
+    members: &[db::EventAssetRow],
+) -> Result<std::collections::HashMap<i64, (bool, Option<f64>, f64)>, String> {
+    let ids: Vec<i64> = members.iter().map(|m| m.id).collect();
+    let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(favorite, 0), quality_score, COALESCE(captured_at, modified)
+             FROM assets WHERE id IN (SELECT value FROM json_each(?1))",
+        )
+        .map_err(|e| format!("prepare doc member meta: {e}"))?;
+    let rows = stmt
+        .query_map(params![json], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })
+        .map_err(|e| format!("query doc member meta: {e}"))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (id, favorite, quality, taken) = row.map_err(|e| format!("doc member row: {e}"))?;
+        out.insert(id, (favorite, quality, taken));
+    }
+    Ok(out)
+}
+
+/// Tags event/album members with CLIP subjects and builds the documentary
+/// plan. Favorites seed the cut; subjects rotate; the engine renders
+/// chapters. Falls back to the plain story curation when CLIP vectors or
+/// the text encoder are unavailable (pre-backfill libraries still export).
+fn documentary_clips(
+    conn: &rusqlite::Connection,
+    engine_state: &engine::EngineState,
+    model_dir: &std::path::Path,
+    vocab_path: &str,
+    members: Vec<db::EventAssetRow>,
+    places: std::collections::HashMap<i64, Option<String>>,
+    budget: i64,
+    fallback: impl FnOnce(&rusqlite::Connection, i64) -> Result<Vec<db::HighlightClip>, String>,
+) -> Result<(Vec<db::HighlightClip>, db::DocStats), String> {
+    let meta = doc_member_meta(conn, &members)?;
+    // Encode each prompt once; a failed encoder drops us to the fallback.
+    let mut prompts: Vec<(Vec<f32>, &'static str)> = Vec::new();
+    for (text, label) in DOC_SUBJECT_PROMPTS {
+        let reply = engine::call_blocking(
+            engine_state,
+            "clip_encode_text",
+            Some(json!({ "text": text, "modelDir": model_dir.to_string_lossy(), "vocabPath": vocab_path })),
+            Duration::from_secs(120),
+        );
+        let Ok(reply) = reply else {
+            return fallback(conn, budget).map(|c| (c, db::DocStats { days: 0, subjects: 0, photos: 0, videos: 0 }));
+        };
+        let Some(vec) = reply
+            .get("vector")
+            .and_then(Value::as_str)
+            .and_then(|b| b64_decode(b).ok())
+            .and_then(|bytes| db::bytes_to_floats(&bytes))
+        else {
+            return fallback(conn, budget).map(|c| (c, db::DocStats { days: 0, subjects: 0, photos: 0, videos: 0 }));
+        };
+        prompts.push((vec, label));
+    }
+    let ids: Vec<i64> = members.iter().map(|m| m.id).collect();
+    let vectors = db::clip_vectors_for_assets(conn, &ids)?;
+    let mut items: Vec<db::DocItem> = Vec::with_capacity(members.len());
+    for m in members {
+        let (favorite, quality, taken) = meta
+            .get(&m.id)
+            .cloned()
+            .unwrap_or((false, None, 0.0));
+        // Best (subject, cosine) across the asset's vectors and prompts.
+        let mut best: Option<(&str, f64)> = None;
+        if let Some(vecs) = vectors.get(&m.id) {
+            for v in vecs {
+                for (pv, label) in &prompts {
+                    if v.len() != pv.len() {
+                        continue;
+                    }
+                    let dot: f32 = v.iter().zip(pv.iter()).map(|(a, b)| a * b).sum();
+                    let score = dot as f64;
+                    if score >= DOC_SUBJECT_MIN_COSINE
+                        && best.map_or(true, |(_, s)| score > s)
+                    {
+                        best = Some((label, score));
+                    }
+                }
+            }
+        }
+        items.push(db::DocItem {
+            path: m.path.clone(),
+            taken,
+            place: places.get(&m.id).cloned().flatten(),
+            kind: m.kind.clone(),
+            favorite,
+            quality,
+            subject: best.map(|(l, _)| l.to_string()),
+            subject_score: best.map(|(_, s)| s).unwrap_or(0.0),
+        });
+    }
+    Ok(db::documentary_plan(items, budget.max(1) as usize))
+}
+
+/// Renders the documentary: one engine `make_documentary` call per aspect.
+/// Natural-first audio is the locked mix (camera level native; music only
+/// under silent stills/cards). Doc renders may run to 10 minutes, so the
+/// engine timeout triples the story one.
+fn render_documentary(
+    engine_state: &engine::EngineState,
+    app: &tauri::AppHandle,
+    job: &str,
+    clips: &[db::HighlightClip],
+    output: &std::path::Path,
+    max_seconds: Option<f64>,
+    music_path: Option<&str>,
+    aspect: &str,
+    end_card: &str,
+) -> Result<StoryRender, String> {
+    if clips.is_empty() {
+        return Err("no photos or videos in this scope for a documentary".into());
+    }
+    let total = clips.len() as i64;
+    emit_export(app, job, "rendering", 0, total, "Starting documentary…");
+    let cap = max_seconds.unwrap_or(180.0).clamp(60.0, 600.0);
+    let mut on_event = |name: &str, data: &Value| {
+        if name == "progress" {
+            let done = data.get("done").and_then(Value::as_i64).unwrap_or(0);
+            let n = data.get("total").and_then(Value::as_i64).unwrap_or(total);
+            emit_export(app, job, "rendering", done, n, &format!("Rendering clip {done} of {n}…"));
+        }
+    };
+    let mut params = json!({
+        "clips": clips,
+        "output": output.to_string_lossy(),
+        "maxSeconds": cap,
+        "aspect": aspect,
+        "naturalFirst": true,
+        "endCard": end_card,
+    });
+    if let Some(music) = music_path {
+        params["musicPath"] = json!(music);
+    }
+    let reply = engine::call_with_events(
+        engine_state,
+        "make_documentary",
+        Some(params),
+        Duration::from_secs(1800),
+        &mut on_event,
+    )?;
+    Ok(StoryRender {
+        bytes: reply.get("bytes").and_then(Value::as_i64).unwrap_or(0),
+        seconds: reply.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
+        photos: reply.get("photos").and_then(Value::as_i64).unwrap_or(0),
+        videos_included: reply.get("videosIncluded").and_then(Value::as_i64).unwrap_or(0),
+        videos_skipped: reply.get("videosSkipped").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentaryResult {
+    pub outputs: Vec<String>,
+    pub bytes: i64,
+    pub seconds: f64,
+    pub photos: i64,
+    pub videos_included: i64,
+    pub videos_skipped: i64,
+}
+
+/// Exports a chaptered nature documentary for an event or album: favorites
+/// seed the cut, CLIP subject buckets rotate for variety, chapters open at
+/// day boundaries and subject changes, and a stats end card closes. One
+/// render per requested aspect (16:9 / 9:16) from the same cut list.
+#[tauri::command]
+async fn export_documentary(
+    app: tauri::AppHandle,
+    event_id: Option<i64>,
+    album_id: Option<i64>,
+    name: Option<String>,
+    job: String,
+    max_seconds: Option<f64>,
+    music_path: Option<String>,
+    aspects: Option<Vec<String>>,
+) -> Result<DocumentaryResult, String> {
+    if let Some(music) = &music_path {
+        if !std::path::Path::new(music).is_file() {
+            return Err(format!("music file not found: {music}"));
+        }
+    }
+    let aspects: Vec<String> = aspects
+        .unwrap_or_else(|| vec!["16:9".into()])
+        .into_iter()
+        .filter(|a| a == "16:9" || a == "9:16")
+        .collect();
+    let aspects = if aspects.is_empty() { vec!["16:9".to_string()] } else { aspects };
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = app.state::<DbState>();
+        let conn = conn.lock().map_err(|_| "database lock poisoned")?;
+
+        emit_export(&app, &job, "planning", 0, 0, "Planning documentary…");
+        let budget = doc_clip_budget(max_seconds);
+        let engine_state = app.state::<engine::EngineState>().inner().clone();
+        let model_dir = clip_model_dir(&app).ok();
+        let vocab_path = clip_vocab_path(&app).ok();
+        let scope_title: String;
+        let (clips, stats) = match (event_id, album_id) {
+            (Some(eid), _) => {
+                let title: String = conn
+                    .query_row("SELECT COALESCE(name, '') FROM events WHERE id = ?1", params![eid], |r| r.get(0))
+                    .unwrap_or_default();
+                scope_title = title;
+                let members = db::event_assets(&conn, eid)?;
+                match (&model_dir, &vocab_path) {
+                    (Some(dir), Some(vocab)) if !members.is_empty() => {
+                        let place: Option<String> = conn
+                            .query_row("SELECT place FROM events WHERE id = ?1", params![eid], |r| r.get(0))
+                            .unwrap_or(None);
+                        let places: std::collections::HashMap<i64, Option<String>> =
+                            members.iter().map(|m| (m.id, place.clone())).collect();
+                        documentary_clips(
+                            &conn, &engine_state, dir, vocab, members, places, budget,
+                            |conn, b| plan_event_clips(conn, eid, b),
+                        )?
+                    }
+                    _ => plan_event_clips(&conn, eid, budget)
+                        .map(|c| (c, db::DocStats { days: 0, subjects: 0, photos: 0, videos: 0 }))?,
+                }
+            }
+            (None, Some(aid)) => {
+                let title: String = conn
+                    .query_row("SELECT COALESCE(name, '') FROM albums WHERE id = ?1", params![aid], |r| r.get(0))
+                    .unwrap_or_default();
+                scope_title = title;
+                let members = db::album_assets(&conn, aid)?;
+                match (&model_dir, &vocab_path) {
+                    (Some(dir), Some(vocab)) if !members.is_empty() => {
+                        let places = db::places_for_ids(
+                            &conn,
+                            &members.iter().map(|m| m.id).collect::<Vec<i64>>(),
+                        )?;
+                        documentary_clips(
+                            &conn, &engine_state, dir, vocab, members, places, budget,
+                            |conn, b| plan_album_clips(conn, aid, b),
+                        )?
+                    }
+                    _ => plan_album_clips(&conn, aid, budget)
+                        .map(|c| (c, db::DocStats { days: 0, subjects: 0, photos: 0, videos: 0 }))?,
+                }
+            }
+            (None, None) => {
+                return Err("export_documentary needs event_id or album_id".into());
+            }
+        };
+        let end_card = if stats.subjects > 0 {
+            format!(
+                "{}\n{} days · {} subjects · {} photos · {} videos",
+                scope_title, stats.days, stats.subjects, stats.photos, stats.videos
+            )
+        } else {
+            format!(
+                "{}\n{} days · {} photos · {} videos",
+                scope_title, stats.days, stats.photos, stats.videos
+            )
+        };
+        drop(conn);
+
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("exports");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create exports dir: {e}"))?;
+        let base = name.unwrap_or_else(|| format!("documentary-{}", chrono_stamp()));
+        let engine_state_ref = &engine_state;
+        let mut outputs: Vec<String> = Vec::new();
+        let mut agg = StoryRender { bytes: 0, seconds: 0.0, photos: 0, videos_included: 0, videos_skipped: 0 };
+        for (n, aspect) in aspects.iter().enumerate() {
+            let suffix = match aspect.as_str() {
+                "9:16" => "-vertical",
+                _ => "-horizontal",
+            };
+            let mut output = dir.join(format!("{base}{suffix}.mp4"));
+            let mut k = 1;
+            while output.exists() {
+                output = dir.join(format!("{base}{suffix}-{k}.mp4"));
+                k += 1;
+            }
+            if n > 0 {
+                emit_export(&app, &job, "planning", n as i64, aspects.len() as i64, &format!("Rendering {aspect}…"));
+            }
+            let render = render_documentary(
+                engine_state_ref,
+                &app,
+                &job,
+                &clips,
+                &output,
+                max_seconds,
+                music_path.as_deref(),
+                aspect,
+                &end_card,
+            )?;
+            agg.bytes += render.bytes;
+            agg.seconds = agg.seconds.max(render.seconds);
+            agg.photos = render.photos;
+            agg.videos_included = render.videos_included;
+            agg.videos_skipped = render.videos_skipped;
+            outputs.push(output.to_string_lossy().to_string());
+        }
+        emit_export(&app, &job, "done", 1, 1, "");
+
+        Ok(DocumentaryResult {
+            outputs,
+            bytes: agg.bytes,
+            seconds: agg.seconds,
+            photos: agg.photos,
+            videos_included: agg.videos_included,
+            videos_skipped: agg.videos_skipped,
+        })
+    })
+    .await
+    .map_err(|e| format!("documentary task join failed: {e}"))?
+}
+
 // MARK: - Share pack (family distribution bundle)
 
 #[derive(Serialize)]
@@ -4157,6 +4512,7 @@ pub fn run() {
             album_remove,
             add_event_picks_to_album,
             export_highlight,
+            export_documentary,
             export_share_pack,
             export_bundle,
             ingest_copy,
@@ -4215,6 +4571,17 @@ mod tests {
         assert_eq!(highlight_clip_budget(Some(120.0)), 40);
         assert_eq!(highlight_clip_budget(Some(600.0)), 40);
         assert_eq!(highlight_clip_budget(Some(1.0)), 1);
+    }
+
+    /// Documentary budgets breathe longer: 60–600s span, floor 10 clips.
+    #[test]
+    fn doc_budget_scales_with_explicit_length() {
+        assert_eq!(doc_clip_budget(None), 60);
+        assert_eq!(doc_clip_budget(Some(60.0)), 20);
+        assert_eq!(doc_clip_budget(Some(180.0)), 60);
+        assert_eq!(doc_clip_budget(Some(600.0)), 200);
+        assert_eq!(doc_clip_budget(Some(5.0)), 10, "clamped to the floor");
+        assert_eq!(doc_clip_budget(Some(3600.0)), 200, "clamped to the ceiling");
     }
 
     /// The model-download unpack path: hash mismatch rejects, a good archive
